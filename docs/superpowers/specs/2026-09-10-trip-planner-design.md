@@ -265,7 +265,7 @@ class TripState:
 | `Enum` | 成员名字符串 `"BLOCKING"` | 不用序号——重排枚举不会悄悄改变旧文件语义 |
 | `frozenset` | 排序后的 list | 排序保证同一状态的字节输出稳定，diff 才有意义 |
 | `dict[tuple, T]` | list of object | JSON 对象键只能是字符串；`routes` 因此直接定义成 `list[RouteFact]`（§5.1），键信息已在字段里 |
-| `Field[T]` | `{"value":…, "status":"INFERRED", "rationale":…}` | `status` 必须落盘，否则重载后分不清用户说的和模型猜的 |
+| `Field[T]` | `{"value":…,"origin":"MODEL","confirmed":true,"rationale":…}` | `origin` 与 `confirmed` 都必须落盘：前者是"谁给的值"，后者是"认没认"，重载后缺一个就分不清用户说的和模型猜的 |
 | 判别式联合 | 带 `"kind"` 标签：`{"kind":"Ambiguous","candidates":[…]}` | `PoiResolution` 这类联合必须显式打标，靠字段形状去猜会在字段可选时崩 |
 
 ```json
@@ -298,45 +298,61 @@ class TripState:
 
 ```python
 def advance(state, cmd: Command | None = None, emit=noop) -> Outcome:
-    # ① 等待态：命令合法性先判掉，非法一律显式拒绝，绝不静默忽略
+    # ① 校验：所有拒绝与空查询都在这里返回 —— 不改状态、不递增 revision
     if state.stage in AWAITING:
         if cmd is None:
             return _pending(state)                          # 空调用 = 重新问一遍
-        if cmd.expected_revision != state.revision:
-            return Rejected(STALE_REVISION, _pending(state))
-        if type(cmd) not in ALLOWED_COMMANDS[state.stage]:
-            return Rejected(WRONG_COMMAND_FOR_STAGE, _pending(state))
-        if isinstance(cmd, ConfirmRequirements) and missing_required(state.requirements):
-            return Rejected(MISSING_REQUIRED, _pending(state))   # 必答项没答，不放行
-        if (bad := _check_candidate(state, cmd)) is not None:
+        if (bad := _validate(state, cmd)) is not None:
             return Rejected(bad, _pending(state))
-        _apply(state, cmd, emit)                            # 只有这里能改 stage
     elif cmd is not None:
         return Rejected(WRONG_COMMAND_FOR_STAGE, _pending(state))
 
-    # ② 工作态：一路向前，直到再次需要人或结束
+    # ② 过了这道线，状态必然改变
+    if cmd is not None:
+        _apply(state, cmd, emit)                            # 只有这里能改 stage
+    outcome = _run_to_pause(state, emit)
+    state.revision += 1                                     # ★ 唯一的递增点
+    return outcome
+
+
+def _validate(state, cmd) -> RejectReason | None:
+    if cmd.expected_revision != state.revision:
+        return STALE_REVISION
+    if type(cmd) not in ALLOWED_COMMANDS[state.stage]:
+        return WRONG_COMMAND_FOR_STAGE
+    if isinstance(cmd, ConfirmRequirements) and missing_required(state.requirements):
+        return MISSING_REQUIRED
+    return _check_candidate(state, cmd)
+
+
+def _run_to_pause(state, emit) -> Outcome:
+    """工作态：一路向前，直到再次需要人或结束。不碰 revision。"""
     while True:
         match state.stage:
             case Stage.COLLECT:
                 state.requirements = collect(state.raw_request, emit)
-                return _pause(state, Stage.AWAIT_REQ_CONFIRM)
+                state.stage = Stage.AWAIT_REQ_CONFIRM
+                return _pending(state)
 
             case Stage.GENERATE:
-                state.trip_timezone = resolve_timezone(state.requirements)  # 幂等，§4.3
+                tz = _ensure_timezone(state)                # §4.3
                 angles = pick_angles(state.requirements, emit)
                 state.candidates = parallel(
                     run_slot(a, seed=state.seeds.get(a.key),
-                             reqs=state.requirements, emit=emit)
+                             reqs=state.requirements, tz=tz, emit=emit)
                     for a in angles)
-                enforce_diversity(state, emit)                 # §6.1
-                return _pause(state, Stage.AWAIT_CHOICE)
+                enforce_diversity(state, emit)              # §6.1
+                state.stage = Stage.AWAIT_CHOICE
+                return _pending(state)
 
             case Stage.REFINE:
+                tz = _ensure_timezone(state)
                 slot = state.chosen()
                 state.candidates = [run_slot(slot.angle, seed=slot.itinerary,
-                                             reqs=state.requirements,
+                                             reqs=state.requirements, tz=tz,
                                              issues=state.issues, emit=emit)]
-                return _pause(state, Stage.AWAIT_CHOICE)
+                state.stage = Stage.AWAIT_CHOICE
+                return _pending(state)
 
             case Stage.DONE:
                 return Done(state.chosen().itinerary)
@@ -349,10 +365,11 @@ ALLOWED_COMMANDS = {
     Stage.AWAIT_CHOICE:      {ChooseCandidate, GiveFeedback, AmendRequirements},
 }
 
-def _pause(state, stage) -> NeedInput:
-    state.stage = stage
-    state.revision += 1
-    return _pending(state)
+def _ensure_timezone(state) -> str:
+    """幂等：destination 变更时由 _patch_requirements 置空，这里按需重解析。"""
+    if state.trip_timezone is None:
+        state.trip_timezone = resolve_timezone(state.requirements)
+    return state.trip_timezone
 
 def _check_candidate(state, cmd) -> RejectReason | None:
     """ChooseCandidate / GiveFeedback 携带的 angle_key 必须真实且可用。"""
@@ -385,6 +402,14 @@ def _pending(state) -> NeedInput:
    真正在等的问题。
 3. **候选 key 不校验。** 任意字符串都能写进 `chosen_key`，故障延迟到 `Done` 或
    `REFINE` 取 slot 时才爆。现在在入口挡掉。
+4. **`revision` 在直接定稿路径上不递增。** 递增点原先藏在 `_pause()` 里，而
+   `ChooseCandidate → DONE` 不经过 `_pause`——两个并发请求分别选 A 和 B，都以
+   `expected=3` 提交，后者仍能覆盖前者。**依赖"所有路径碰巧都会走到 `_pause`"
+   是靠不住的**，现在递增收敛到 `advance` 里唯一一处，位于校验之后、返回之前，
+   结构上覆盖包括 DONE 在内的每一条修改路径。
+
+由此得到一条可测的不变量：**`advance` 要么拒绝（状态不变、`revision` 不变），
+要么修改（`revision` 恰好 +1）**。测试直接断言这个二分，而不是逐条路径去数。
 
 `_pending()` 是纯函数：等待态可以被反复查询而不产生副作用，这也让 driver 的
 "重新渲染一次当前问题"变成零成本操作。
@@ -404,7 +429,7 @@ class SlotLimits:
     deadline_s:         int = 600
 
 
-def run_slot(angle, seed, reqs, issues=(),
+def run_slot(angle, seed, reqs, tz, issues=(),
              limits=SlotLimits(), emit=noop) -> CandidateSlot:
     ctx = SlotContext(limits, emit)      # 记账 + 取消标记，超限抛 LimitExceeded
     itin, facts = seed, None
@@ -417,7 +442,7 @@ def run_slot(angle, seed, reqs, issues=(),
                 emit(RevisionStarted(angle, rnd))
                 itin = revise(itin, reqs, issues, ctx)
 
-            facts  = resolve(itin, reqs, provider)         # 触网，本轮唯一的 I/O
+            facts  = resolve(itin, reqs, provider, tz)     # 触网，本轮唯一的 I/O
             issues = run_rule_checks(itin, reqs, facts)    # ① 纯函数，便宜，先跑
             if not has_blocking(issues):
                 issues += run_llm_critic(itin, reqs, ctx)  # ② 贵，硬伤清完才请它
@@ -528,19 +553,19 @@ class StateRepo(Protocol):
 
 ### 4.1 需求
 
-每个字段都带**来源状态**，而不是用一个 `inferred: set[str]` 旁挂：
+每个字段都带**来源**与**确认状态**，而不是用一个 `inferred: set[str]` 旁挂：
 
 ```python
-class FieldStatus(Enum):
-    MISSING   = auto()   # 用户没说，且不敢推断 —— 必须追问
-    INFERRED  = auto()   # 模型推断，待用户确认
-    CONFIRMED = auto()   # 用户明说，或已确认过
+class Origin(Enum):
+    USER  = auto()       # 用户明说的
+    MODEL = auto()       # 模型推断的
 
 @dataclass(frozen=True)
 class Field[T]:
-    value: T | None
-    status: FieldStatus
-    rationale: str = ""              # INFERRED 时说明推断依据，直接显示在需求卡上
+    value:     T | None              # None ⇒ 尚无取值（原先的 MISSING）
+    origin:    Origin | None         # value is None 时为 None
+    confirmed: bool = False          # 用户是否已签字
+    rationale: str = ""              # origin=MODEL 时说明推断依据，显示在需求卡上
 
 @dataclass
 class Requirements:
@@ -558,16 +583,35 @@ class Requirements:
     constraints: Field[list[str]]    # 自由文本兜底："第2天下午有个电话会"
 
 REQUIRED = ("destination", "dates", "party")
+
+def missing_required(reqs) -> list[str]:
+    return [n for n in REQUIRED if getattr(reqs, n).value is None]
 ```
 
-**`REQUIRED` 三项为 MISSING 时不允许进入 GENERATE。** 拦截点在 `advance()` 的
+**为什么拆成两个字段。** 早先版本用单个 `FieldStatus` 同时表达"谁给的值"和
+"用户认没认"，于是 `ConfirmRequirements` 陷入两难：不改 status 就与
+`CONFIRMED` 的语义冲突，改成 `CONFIRMED` 又抹掉了"这个值本来是模型猜的"这个
+事实——而这正是需求卡标灰、以及后续排查"行程为什么偏了"时最需要的信息。
+两者本来就正交，拆开即可：
+
+| 场景 | `value` | `origin` | `confirmed` |
+|---|---|---|---|
+| 用户明说"10 月 2 日出发" | 有 | `USER` | 确认后 `True` |
+| 模型推断"预算按人均 3000" | 有 | `MODEL` | 确认前 `False`，确认后 `True` |
+| 目的地没说 | `None` | `None` | `False` |
+
+`ConfirmRequirements` 把所有字段的 `confirmed` 置 `True`，**不动 `origin`**。
+需求卡标灰的判据是 `origin is MODEL and not confirmed`；定稿后回看行程时，
+`origin is MODEL` 依然告诉你哪些前提是猜的。
+
+**`REQUIRED` 三项 `value is None` 时不允许进入 GENERATE。** 拦截点在 `advance()` 的
 命令校验里：`ConfirmRequirements` 遇到缺失必答项直接 `Rejected(MISSING_REQUIRED)`，
 需求卡会把缺的那几项高亮出来继续等。**不能**用"回退到 COLLECT 重新抽取"来处理——
 输入没变，抽取结果也不会变，那是个死循环。只有用户通过 `AmendRequirements` 补充了
 新信息，才值得重跑 COLLECT。
 这三项无中生有地推断出来，后果不是"猜得不准"而是"整个规划建立在虚构约束上"，
 而且下游的确定性校验会拿这份虚构去判定 BLOCKING——比不校验更糟。其余字段允许
-INFERRED，但必须在需求卡上标出并给 `rationale`，用户一眼知道该盯哪几行。
+`origin=MODEL`，但必须在需求卡上标出并给 `rationale`，用户一眼知道该盯哪几行。
 
 这正是"抽取 + 推断，一次性确认"能成立的前提：**推断的边界必须是显式的**。
 早先版本把所有字段设成必填、只用 `inferred` 旁注，等于要求模型无论如何都填个值出来。
@@ -582,7 +626,7 @@ class BudgetSpec:
 ```
 
 `includes` 不可省。"预算一万五"在包不包机票两种解读下是完全不同的行程，
-这一项缺失时按 MISSING 处理并追问，而不是默认一个。
+这一项无法确定时整个 `budget.value` 置 `None` 并追问，而不是默认一个。
 
 ### 4.2 行程
 
@@ -669,8 +713,13 @@ v1 单目的地，因此定一个行程级时区：
 trip_timezone: str | None = None      # IANA，如 "Asia/Tokyo"
 ```
 
-- **来源**：由已解析的 `destination` 反查得出（`resolve_timezone`），在进入
-  GENERATE 时确定；destination 被 patch 后重新解析，函数幂等。
+- **来源与唯一性**：由已解析的 `destination` 反查得出（`resolve_timezone`），
+  存在 `TripState.trip_timezone`，**只在这里解析一次**。`run_slot` 与 `resolve`
+  都以参数 `tz` 接收它，`FactSnapshot.trip_timezone` 只是把当时用的值抄一份下来
+  供回放核对——不是第二个解析点。让 resolver 自己去查会得到两条独立的解析路径，
+  它们迟早会不一致，而且不一致时没有任何地方会报错。
+- **失效**：`destination` 被 patch 时置 `None`，下一次进入工作态由
+  `_ensure_timezone` 重解析。
 - **语义**：`Day.date + Activity.start` 一律按 `trip_timezone` 解释为具体时刻。
   `depart_at = localize(day.date, activity.end, trip_timezone)`。
 - **抵离**：`Transfer` 存**带 offset 的 datetime**——航班时刻本来就是跨时区的，
@@ -739,7 +788,8 @@ class Ambiguous:
 class NotFound:
     query: str
 
-def resolve(itin: Itinerary, reqs: Requirements, provider) -> FactSnapshot: ...
+def resolve(itin: Itinerary, reqs: Requirements,
+            provider, tz: str) -> FactSnapshot: ...
 def run_rule_checks(itin: Itinerary, reqs: Requirements,
                     facts: FactSnapshot) -> list[Issue]: ...        # 纯函数
 ```
@@ -806,7 +856,7 @@ BLOCKING。这一点尤其要紧——规则 #4/#5 是 BLOCKING 级，用错 id 
 
 \* **依赖缺失即降级，且必须说明。** 规则 #2 在对应 route 落进 `gaps` 时给 WARNING
 （"这一段耗时未能核实"），不按 0 处理也不假装通过。规则 #3 在 `arrival` /
-`departure` 为 MISSING 时同样降级——原版声称"首末日扣掉抵离占用"，但模型里
+`departure` 无取值（`value is None`）时同样降级——原版声称"首末日扣掉抵离占用"，但模型里
 压根没有抵离时间这个字段，**它校验的是不存在的数据**。现在字段有了（§4.1），
 缺失时如实说"未提供抵离时间，首末日按整天计"，不谎称已扣除。
 
@@ -868,6 +918,7 @@ def _apply(state, cmd: Command, emit) -> None:
     """只有这里能改 stage。调用前 advance() 已校验 revision、阶段与候选 key。"""
     match cmd:
         case ConfirmRequirements():
+            state.requirements = mark_all_confirmed(state.requirements)  # origin 不变
             state.stage = Stage.GENERATE
 
         case AmendRequirements(text=text):
@@ -896,13 +947,34 @@ def _patch_requirements(state, delta, emit) -> None:
     state.requirements = apply_patch(state.requirements, delta.patch)
     emit(RequirementsPatched(delta.patch))               # 非阻塞提示，不拦流程
     state.issues = []                                    # 旧 issue 基于旧需求，作废
-    if state.chosen_key is None:                         # 尚未选定 → 三份各自重跑
-        state.seeds = ({c.angle.key: c.itinerary for c in state.candidates
-                        if c.itinerary} if delta.scale is INCREMENTAL else {})
-        state.stage = Stage.GENERATE
-    else:
-        state.stage = Stage.REFINE
+
+    if "destination" in delta.patch:
+        state.trip_timezone = None                       # ★ 置空 → 下轮重解析
+
+    if delta.scale is REWRITE:                           # ★ 旧行程整体作废
+        state.seeds = {}
+        for slot in state.candidates:
+            slot.itinerary = None                        # 逼 run_slot 重新 generate
+            slot.facts = None
+            slot.status = SlotStatus.PENDING
+    elif state.chosen_key is None:                       # 增量 + 尚未选定
+        state.seeds = {c.angle.key: c.itinerary
+                       for c in state.candidates if c.itinerary}
+
+    state.stage = Stage.GENERATE if state.chosen_key is None else Stage.REFINE
 ```
+
+**REWRITE 必须清干净选中方案，而不只是清 `seeds`。** 早先版本只在"尚未选定"
+分支里处理 seed，已选定时直接进 REFINE——于是"京都改巴黎"会拿着京都的行程当
+seed 去 refine，而 `trip_timezone` 只在 GENERATE 重算，会一路停在 `Asia/Tokyo`。
+两处都与文档声称的"REWRITE seed 置空"相矛盾。
+
+**清的是行程，不是角度。** 目的地全换了，但用户选中的切入角度（"博物馆主题"）
+通常仍然成立，而且他已经表达过这个偏好——所以保留 `slot.angle`，重新 generate。
+这也和"选定之后不回到多候选"一致：不因为换了目的地就重新甩三个方案给他。
+
+`trip_timezone` 用**置空 + 按需重解析**而不是就地重算：patch 发生在 `_apply` 阶段，
+此时不该触网；`_ensure_timezone` 在工作态需要它时才解析，两处职责不混。
 
 **`delta` 必须由调用方传入。** 早先版本 `GiveFeedback` 先 `classify_feedback` 一次，
 转手调 `_patch_requirements` 又分类一次：多烧一次 LLM 调用是小事，
@@ -1116,6 +1188,17 @@ $ trip plan "十一想去京都玩5天，两个人，预算1万5"
 正确传递；`GiveFeedback` 全程只调一次 `classify_feedback`（用计数 fake 断言）；
 **任何 `Rejected` 路径都不修改 state**（比对调用前后的序列化结果）；
 driver 的 `persisted` 只在 CAS 成功后前进（连续多轮不出现 CAS 失败）。
+
+两条覆盖全部路径的不变量，用参数化测试跑遍每个 `(stage, command)` 组合，
+而不是逐条路径手写：
+
+- **`advance` 的二分律**：返回 `Rejected` ⇒ `revision` 与序列化状态均不变；
+  否则 `revision` 恰好 +1。**`ChooseCandidate → DONE` 必须包含在内**——
+  它是唯一不经过工作态的修改路径，也正是上一版漏掉递增的地方。
+- **REWRITE 清理彻底**：`delta.scale is REWRITE` 后，所有 slot 的
+  `itinerary` / `facts` 为 `None`、`seeds` 为空；若 patch 含 `destination`，
+  `trip_timezone` 为 `None`。断言"目的地换成另一个时区的城市后，
+  新行程的 `FactSnapshot.trip_timezone` 已随之改变"。
 
 TDD 落地顺序：`models` / `wire`（往返测试先立住持久化契约）→ `rules`（纯函数，
 最直接）→ `repo`（CAS）→ `resolver` / `providers`（fixture）→ `orchestrator`
