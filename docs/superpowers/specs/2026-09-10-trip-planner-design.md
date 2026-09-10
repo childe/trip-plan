@@ -165,30 +165,53 @@ Command = ConfirmRequirements | AmendRequirements | ChooseCandidate | GiveFeedba
 
 CLI 和未来的 Web 各写一个 driver，共用同一个 `advance`：
 
+两个 driver 都遵守同一条纪律：**调 `advance` 之前记下盘上的 revision，
+之后拿它作 `expected` 提交**。`advance` 在暂停时会自增 `revision`，
+拿自增后的值去 CAS 必然失败（盘上还是旧值）。
+
 ```python
 # CLI driver —— 阻塞发生在这一层
+state = TripState.new(raw_request)
+repo.create(state)                            # 新 trip 的创建语义，独立于 CAS
+persisted = state.revision                    # 盘上是什么，初始为 0
 outcome = advance(state, emit=print_progress)
+
 while True:
     match outcome:
         case Done(itinerary):
+            repo.save_if_revision(state, persisted)
             return itinerary
         case Rejected(reason, current):
             warn(reason)                      # 如"这份候选没跑出结果，换一个"
-            outcome = current                 # 直接复用，不重新构造
+            outcome = current                 # 直接复用，不重新构造；不写盘
         case NeedInput():
-            repo.save_if_revision(state, state.revision)   # 先落盘再问人
+            assert repo.save_if_revision(state, persisted)   # 先落盘再问人
+            persisted = state.revision                       # ★ 提交后才更新
             outcome = advance(state, terminal_ask(outcome), emit=print_progress)
 
-# Web driver —— 同一个 advance，不同 driver
+# Web driver —— 同一个 advance，同一条纪律
 @app.post("/trips/{id}/input")
 def submit(id, payload):
     state = repo.load(id)
-    before = state.revision
+    persisted = state.revision                # ★ 调用前记录
     outcome = advance(state, parse_command(payload), emit=sse_push)
-    if not repo.save_if_revision(state, before):           # CAS 失败 = 有人抢先
-        return conflict(repo.load(id))                     # 让前端重新渲染
-    return outcome                            # Rejected 时前端据 current 重渲染
+    if isinstance(outcome, Rejected):
+        return outcome                        # 状态未变，无需写盘
+    if not repo.save_if_revision(state, persisted):   # CAS 失败 = 有人抢先
+        return conflict(repo.load(id))                # 让前端重新渲染
+    return outcome
 ```
+
+两条由此确立的不变量，都要有测试：
+
+- **`Rejected` ⇒ 状态未被修改。** 所有拒绝分支都在 `_apply` 之前返回，
+  因此拒绝路径永远不需要写盘。
+- **`persisted` 只在 CAS 成功后前进。** 它跟踪的是"盘上是什么"，不是"内存里是
+  什么"；把两者混为一谈正是上一版 CLI 那行必然失败的 CAS 的成因。
+
+`repo.create()` 与 `save_if_revision()` 分开：新 trip 盘上无物，没有可比较的
+revision，用 CAS 表达"创建"只能靠约定一个哨兵值，不如给它一个自己的方法——
+顺带天然防住 `run_id` 撞车（已存在则报错，不覆盖）。
 
 这个形状同时换来：可测试性（不用 mock stdin）、日志与 UI 解耦、断点续跑几乎白送。
 
@@ -224,6 +247,7 @@ class TripState:
     requirements: Requirements | None = None
     candidates: list[CandidateSlot] = field(default_factory=list)
     chosen_key: str | None = None             # 已选定的 angle.key
+    trip_timezone: str | None = None          # IANA 时区，见 §4.3
     seeds: dict[str, Itinerary] = field(default_factory=dict)   # angle.key -> 上一版
     issues: list[Issue] = field(default_factory=list)
 ```
@@ -242,6 +266,7 @@ class TripState:
 | `frozenset` | 排序后的 list | 排序保证同一状态的字节输出稳定，diff 才有意义 |
 | `dict[tuple, T]` | list of object | JSON 对象键只能是字符串；`routes` 因此直接定义成 `list[RouteFact]`（§5.1），键信息已在字段里 |
 | `Field[T]` | `{"value":…, "status":"INFERRED", "rationale":…}` | `status` 必须落盘，否则重载后分不清用户说的和模型猜的 |
+| 判别式联合 | 带 `"kind"` 标签：`{"kind":"Ambiguous","candidates":[…]}` | `PoiResolution` 这类联合必须显式打标，靠字段形状去猜会在字段可选时崩 |
 
 ```json
 {
@@ -286,18 +311,6 @@ def advance(state, cmd: Command | None = None, emit=noop) -> Outcome:
         if (bad := _check_candidate(state, cmd)) is not None:
             return Rejected(bad, _pending(state))
         _apply(state, cmd, emit)                            # 只有这里能改 stage
-
-
-def _check_candidate(state, cmd) -> RejectReason | None:
-    """ChooseCandidate / GiveFeedback 携带的 angle_key 必须真实且可用。"""
-    if not isinstance(cmd, (ChooseCandidate, GiveFeedback)):
-        return None
-    slot = state.slot(cmd.angle_key)
-    if slot is None:
-        return UNKNOWN_CANDIDATE
-    if slot.itinerary is None:            # FAILED 且没跑出任何东西
-        return UNSELECTABLE_CANDIDATE
-    return None
     elif cmd is not None:
         return Rejected(WRONG_COMMAND_FOR_STAGE, _pending(state))
 
@@ -309,6 +322,7 @@ def _check_candidate(state, cmd) -> RejectReason | None:
                 return _pause(state, Stage.AWAIT_REQ_CONFIRM)
 
             case Stage.GENERATE:
+                state.trip_timezone = resolve_timezone(state.requirements)  # 幂等，§4.3
                 angles = pick_angles(state.requirements, emit)
                 state.candidates = parallel(
                     run_slot(a, seed=state.seeds.get(a.key),
@@ -339,6 +353,17 @@ def _pause(state, stage) -> NeedInput:
     state.stage = stage
     state.revision += 1
     return _pending(state)
+
+def _check_candidate(state, cmd) -> RejectReason | None:
+    """ChooseCandidate / GiveFeedback 携带的 angle_key 必须真实且可用。"""
+    if not isinstance(cmd, (ChooseCandidate, GiveFeedback)):
+        return None
+    slot = state.slot(cmd.angle_key)
+    if slot is None:
+        return UNKNOWN_CANDIDATE
+    if slot.itinerary is None:            # FAILED 且没跑出任何东西
+        return UNSELECTABLE_CANDIDATE
+    return None
 
 def _pending(state) -> NeedInput:
     """当前等待态对应的 NeedInput —— 纯函数，可反复调用。"""
@@ -482,6 +507,8 @@ def run_agent(system_prompt, user_prompt, tools, output_schema, role, ctx) -> di
 
 ```python
 class StateRepo(Protocol):
+    def create(self, state: TripState) -> None:
+        """新建。trip_id 已存在则抛错，不覆盖。"""
     def load(self, trip_id: str) -> TripState: ...
     def save_if_revision(self, state: TripState, expected: int) -> bool:
         """仅当持久化的 revision 仍等于 expected 时写入并返回 True；
@@ -629,6 +656,30 @@ class Money:
     source:     str                  # "amap:ticket" / "llm:知识"
 ```
 
+### 4.3 时区
+
+`Day.date` 与 `Activity.start/end` 是**无时区的本地时间**——这是刻意的，
+LLM 排"上午九点到清水寺"时不该、也没法关心 UTC 偏移。但无时区的时间无法直接
+参与计算：`RouteFact.depart_at` 需要一个具体时刻去查地铁班次，跨境行程尤其如此。
+
+v1 单目的地，因此定一个行程级时区：
+
+```python
+# TripState
+trip_timezone: str | None = None      # IANA，如 "Asia/Tokyo"
+```
+
+- **来源**：由已解析的 `destination` 反查得出（`resolve_timezone`），在进入
+  GENERATE 时确定；destination 被 patch 后重新解析，函数幂等。
+- **语义**：`Day.date + Activity.start` 一律按 `trip_timezone` 解释为具体时刻。
+  `depart_at = localize(day.date, activity.end, trip_timezone)`。
+- **抵离**：`Transfer` 存**带 offset 的 datetime**——航班时刻本来就是跨时区的，
+  出发地和目的地不在同一个时区里，用本地时间表达会错。
+- **DST**：用 IANA 时区名而不是固定 offset，夏令时切换自动正确。存 `+09:00`
+  这类固定偏移在跨越切换日的行程上会算错一小时。
+
+多城市（§12.4）时这个字段要变成每日或每段一个，属于那一轮设计的一部分。
+
 `Money` 带 `confidence` 与 `source`：v1 的票价绝大多数是 `ESTIMATED / llm:知识`，
 这一点必须能在数据层面看出来，否则下游没法区分"确认过的 300 元"和"模型猜的 300 元"
 （见 §5.1 规则 #6）。`cost=None` 表示**未知**，不表示免费。
@@ -666,11 +717,13 @@ Itinerary ──resolver──▶ FactSnapshot ──validator──▶ list[Iss
 ```python
 @dataclass(frozen=True)
 class FactSnapshot:
-    poi_by_activity: dict[str, PoiResolution]   # activity.id -> 解析结果
-    routes:          list[RouteFact]            # 自带 day_id + 两端活动 ID
-    weather:         dict[str, WeatherFact]     # ISO 日期串 -> 天气
-    resolved_at:     datetime
-    gaps:            list[Gap]                  # ★ 没查到的事实，显式记录
+    poi_by_activity:   dict[str, PoiResolution] # activity.id -> 解析结果
+    constraint_pois:   dict[str, PoiResolution] # ★ must_visit / avoid 的原文 -> 解析结果
+    routes:            list[RouteFact]          # 自带 day_id + 两端活动 ID
+    weather:           dict[str, WeatherFact]   # ISO 日期串 -> 天气
+    trip_timezone:     str                      # IANA，见 §4.3
+    resolved_at:       datetime
+    gaps:              list[Gap]                # ★ 没查到的事实，显式记录
 
 PoiResolution = Resolved | Ambiguous | NotFound
 
@@ -705,9 +758,26 @@ resolver 无副作用。
 |---|---|---|
 | `AMBIGUOUS_POI` | 匹配到多个同名候选 | 依赖该 POI 的规则降级为 WARNING，列出候选让用户定夺 |
 | `POI_NOT_FOUND` | 一个都没匹配上 | 同上；规则 #4/#5 明确说"无法核实" |
+| `AMBIGUOUS_CONSTRAINT` | `must_visit`/`avoid` 的原文解析不唯一 | 规则 #4/#5 降级为 WARNING |
 | `ROUTE_UNAVAILABLE` | 路线查询失败/限流 | 规则 #2 降级，见 §5.1 |
 
-`must_visit` 与 `avoid` 的匹配一律走解析后的 POI id，不做字符串比对——
+**约束侧也必须解析，否则"按 POI id 匹配"根本无从谈起。** `must_visit` / `avoid`
+在 `Requirements` 里是用户写下的字符串，快照只解析活动是不够的——比较的两端得都
+是 id。`constraint_pois` 以约束原文为键存放解析结果，规则 #4/#5 于是变成：
+
+```
+must_visit 中每一条 c：
+    constraint_pois[c] 是 Resolved(fact)  且  fact.id ∈ {已解析活动的 poi id}
+        → 通过
+    constraint_pois[c] 是 Ambiguous / NotFound
+        → WARNING「无法核实"c"是否已安排」+ 列出候选，不给 BLOCKING
+```
+
+约束本身的歧义与活动侧同等对待：解析不出来就如实降级，不拿一个猜的 id 去判
+BLOCKING。这一点尤其要紧——规则 #4/#5 是 BLOCKING 级，用错 id 会驱动 planner
+反复修改一个本来正确的行程。
+
+`avoid` 同理，方向相反：解析成功且命中才报 BLOCKING。字符串比对一律不用——
 "清水寺"和"清水寺（京都）"是同一个地方，字符串比不出来。
 
 三个收益：
@@ -1030,7 +1100,7 @@ $ trip plan "十一想去京都玩5天，两个人，预算1万5"
 | `resolver.py` | 录制真实高德响应存 fixture，回放 | 完全 |
 | `providers/` | 同上 + 限流/超时路径必须覆盖（`ProviderError`） | 完全 |
 | `wire.py` | 往返测试：每种类型 encode→decode 等值；跨版本迁移用例 | 完全 |
-| `repo.py` | CAS 语义：`save_if_revision` 在 revision 变化后返回 False；并发两写只有一个成功 | 完全 |
+| `repo.py` | CAS 语义：`save_if_revision` 在 revision 变化后返回 False；并发两写只有一个成功；`create` 撞 id 报错不覆盖 | 完全 |
 | `orchestrator.py` | 注入 `FakeLlm` 按脚本返回 | 完全 |
 | prompts | 少量真实调用，只断言**格式**不断言**质量**，标 slow，不进 CI 默认 | 部分 |
 | 端到端 | 一个 golden case，人工看 | 靠眼 |
@@ -1043,7 +1113,9 @@ $ trip plan "十一想去京都玩5天，两个人，预算1万5"
 不匹配 → `Rejected`；未知 / 不可选候选 key → `Rejected`；必答项缺失时
 `ConfirmRequirements` → `Rejected` 且不回退 COLLECT；单个 slot 抛异常 → 另外两个
 正常返回；撞轮数 / 资源上限 → `EXHAUSTED` 且带 `detail`；需求 patch 后 `seeds`
-正确传递；`GiveFeedback` 全程只调一次 `classify_feedback`（用计数 fake 断言）。
+正确传递；`GiveFeedback` 全程只调一次 `classify_feedback`（用计数 fake 断言）；
+**任何 `Rejected` 路径都不修改 state**（比对调用前后的序列化结果）；
+driver 的 `persisted` 只在 CAS 成功后前进（连续多轮不出现 CAS 失败）。
 
 TDD 落地顺序：`models` / `wire`（往返测试先立住持久化契约）→ `rules`（纯函数，
 最直接）→ `repo`（CAS）→ `resolver` / `providers`（fixture）→ `orchestrator`
@@ -1090,6 +1162,17 @@ HTML renderer 可直接充当服务端渲染的起点。
 
 需要注意的是**并发在这里才真正出现**：v1 CLI 是单写者，`expected_revision` 只用来
 识别"拿旧问题作答"；多用户 web 下必须依赖 §3.8 的 CAS 才能防住 lost update。
+
+但 CAS 只保证**最终状态不丢**，不保证**工作不白做**：两个并发请求可以各自跑完
+一整轮 LLM 调用（几分钟、几十万 token、各自往前端推进度），最后才由 CAS 判掉一个。
+CLI 下无所谓，web 下这是真金白银。届时要升级成"抢运行权"模型：
+
+```
+CAS 抢占（stage → RUNNING，写入 run_id）→ worker 执行 → CAS 提交结果
+```
+
+抢不到的请求立刻收到"该行程正在生成中"，而不是先烧完再被拒。`run_id` 字段
+（§3.3）已经在状态里，就是为这个留的；`RUNNING` 阶段和超时回收留给 web 那一轮设计。
 
 ### 12.2 Skill 形态
 
