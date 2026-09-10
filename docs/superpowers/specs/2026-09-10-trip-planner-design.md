@@ -26,13 +26,13 @@
 - 高德地图数据接入（POI、点到点耗时、静态地图）
 - Markdown 行程单输出
 - HTML 行程单输出（单文件自包含，含每日路线图）
+- `trip resume` 断点续跑
 
 ### v1 不包含
 
 | 不做 | 原因 |
 |---|---|
 | 多城市行程 | 引入城际交通、住宿切换、行李寄存等一整套约束，数据模型要加 city 维度 |
-| `trip resume` 命令 | 见下方"关于持久化" |
 | ics 导出 | 纯渲染层，`Itinerary` 已结构化，随时可加 |
 | Skill 形态 | 见 §12.2，架构已为此留路，且比预想的便宜 |
 | Web 界面 | 见 §12.1，架构已为此留路 |
@@ -53,13 +53,28 @@
 
 ### 关于持久化与 `resume`
 
-"每步存盘却不提供 resume 命令"看着像自相矛盾，但存盘在 v1 有两个独立的消费者：
-崩溃取证（一次规划烧 30-50 万 token，死在第三轮时你需要现场）和 §12.2 的 skill
-形态（它本质上就是外部进程反复调 `advance`）。所以存盘不是为 resume 而存在的。
+一次完整规划粗估 30-50 万 token。崩在第三轮（网断、限流、Ctrl-C、机器睡眠）
+若只能从头再来，代价远高于实现成本——给定 `advance()` 的形状，
+`trip resume <dir>` 就是 `repo.load()` + 进入与 `trip plan` 完全相同的 driver
+循环，十行左右。开发期尤其受用：调 prompt 时不必每次重跑前面几个阶段。
 
-不过话说回来：给定 `advance()` 的形状，`trip resume <dir>` 就是 `load` + 进入
-driver 循环，十行左右。**以一次运行的成本计，崩溃后能接着跑的价值远高于这十行**。
-建议纳入 v1；此处按既定范围记为不做，等确认后一并调整。
+它几乎是白送的，因为三样前置条件早已就位：`TripState` 完全可序列化（§3.3）、
+`advance()` 无隐藏状态（§3.2）、每个暂停点原子写盘（§3.8）。
+
+```python
+def cmd_resume(trip_dir):
+    state = repo.load(trip_dir)
+    persisted = state.revision
+    outcome = advance(state, emit=print_progress)   # cmd=None：等待态原样重问
+    return drive(state, outcome, persisted)         # 与 trip plan 共用
+```
+
+**等待态传 `cmd=None` 返回当前 `NeedInput` 而非死循环**（§3.4 修掉的第一个缺陷），
+正是这里能复用同一段 driver 的原因：resume 不需要知道自己停在哪个阶段。
+
+一个后果值得记下：`state.json` 从"调试用的副产品"变成**用户可见的契约**。
+它的 `format_version` 与迁移策略（§3.3）因此不是可选项——用户会持有跨版本的
+旧目录并期望 resume 得动。
 
 ## 3. 整体架构
 
@@ -1147,7 +1162,17 @@ $ trip plan "十一想去京都玩5天，两个人，预算1万5"
   ⠋ 三条线并行打磨中…  A✓  B(修订 2/3)  C✓
   三份成品并排 + 各自遗留问题
   选一份 / 对某份提意见 / 改需求
+
+$ trip resume ./trips/kyoto        # 中断后接着上次的进度
+  ✓ rev 4，阶段 AWAIT_CHOICE
+  三份成品并排 + 各自遗留问题       # 与 plan 走同一段 driver
+
+$ trip render ./trips/kyoto --format html
 ```
+
+三个子命令的分工：`plan` 建新 trip（`repo.create`），`resume` 载入既有 trip，
+两者之后共用同一个 driver 循环；`render` 只读 `state.json` 重新生成投影，
+不推进状态、不触网。
 
 产物落在 `./trips/<slug>/`：
 
@@ -1171,7 +1196,7 @@ $ trip plan "十一想去京都玩5天，两个人，预算1万5"
 | `diversity.py` | 构造高/低重合度的候选对 | 完全 |
 | `resolver.py` | 录制真实高德响应存 fixture，回放 | 完全 |
 | `providers/` | 同上 + 限流/超时路径必须覆盖（`ProviderError`） | 完全 |
-| `wire.py` | 往返测试：每种类型 encode→decode 等值；跨版本迁移用例 | 完全 |
+| `wire.py` | 往返测试：每种类型 encode→decode 等值；跨版本迁移用例；**低版本 `state.json` 能被 resume 读起来** | 完全 |
 | `repo.py` | CAS 语义：`save_if_revision` 在 revision 变化后返回 False；并发两写只有一个成功；`create` 撞 id 报错不覆盖 | 完全 |
 | `orchestrator.py` | 注入 `FakeLlm` 按脚本返回 | 完全 |
 | prompts | 少量真实调用，只断言**格式**不断言**质量**，标 slow，不进 CI 默认 | 部分 |
@@ -1199,6 +1224,10 @@ driver 的 `persisted` 只在 CAS 成功后前进（连续多轮不出现 CAS �
   `itinerary` / `facts` 为 `None`、`seeds` 为空；若 patch 含 `destination`，
   `trip_timezone` 为 `None`。断言"目的地换成另一个时区的城市后，
   新行程的 `FactSnapshot.trip_timezone` 已随之改变"。
+
+另有一条跨模块的用例值得单列：**中断后 resume 得到等价状态**——在任意暂停点
+序列化、丢弃内存对象、重新 `load`，后续行为与不中断时一致。这条同时守住
+`wire` 的完整性和 `advance` 的无隐藏状态，比分别测两者更有力。
 
 TDD 落地顺序：`models` / `wire`（往返测试先立住持久化契约）→ `rules`（纯函数，
 最直接）→ `repo`（CAS）→ `resolver` / `providers`（fixture）→ `orchestrator`
@@ -1311,4 +1340,4 @@ validate / route / render 脚本）。它会把流程保证从"代码强制"降�
 
 ### 12.5 零碎
 
-`trip resume` 命令、ics 导出，都是小增量。
+ics 导出、行程分享链接，都是小增量。
