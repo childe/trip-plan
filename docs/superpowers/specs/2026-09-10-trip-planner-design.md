@@ -115,7 +115,9 @@ class NeedInput:
 
 @dataclass
 class Rejected:
-    reason: RejectReason   # STALE_REVISION | WRONG_COMMAND_FOR_STAGE | MISSING_REQUIRED
+    reason: RejectReason   # STALE_REVISION | WRONG_COMMAND_FOR_STAGE
+                           # | MISSING_REQUIRED | UNKNOWN_CANDIDATE
+                           # | UNSELECTABLE_CANDIDATE
     current: NeedInput     # 当前真正在等的东西，driver 可直接重新渲染
 ```
 
@@ -155,9 +157,11 @@ Command = ConfirmRequirements | AmendRequirements | ChooseCandidate | GiveFeedba
   联合类型让非法状态不可表示，`match` 也能穷尽检查。
 - **`angle_key` 而非列表下标。** 需求变更后三份候选会各自重跑，顺序可能变，
   下标会指错方案。
-- **`expected_revision` 是乐观并发令牌。** v1 CLI 单进程用不上它，但它同时挡住
-  重复提交和"用户拿着旧 payload 回答新问题"。一个 int 字段加三行检查，
-  现在放进去比日后给 web driver 补要便宜得多（见 §12.1）。
+- **`expected_revision` 挡的是"拿着旧问题作答"，不是并发写。** 这两件事必须分清：
+  它能识别"用户看到的还是 rev 5 的候选列表，但状态已经推进到 rev 7"，
+  这在 CLI 和 web 下都有效；但**它不构成乐观并发控制**——两个并发请求可以都读到
+  rev 5、都通过校验、都写盘，后写的覆盖先写的。原子写只防半个文件，不防
+  lost update。真正的 CAS 在仓储层，见 §3.8。
 
 CLI 和未来的 Web 各写一个 driver，共用同一个 `advance`：
 
@@ -169,18 +173,20 @@ while True:
         case Done(itinerary):
             return itinerary
         case Rejected(reason, current):
-            warn(reason)                      # 极少见：CLI 单进程基本不会撞上
-            outcome = NeedInput(**current)
+            warn(reason)                      # 如"这份候选没跑出结果，换一个"
+            outcome = current                 # 直接复用，不重新构造
         case NeedInput():
-            save_atomic(state)                # 先落盘再问人
+            repo.save_if_revision(state, state.revision)   # 先落盘再问人
             outcome = advance(state, terminal_ask(outcome), emit=print_progress)
 
 # Web driver —— 同一个 advance，不同 driver
 @app.post("/trips/{id}/input")
 def submit(id, payload):
-    state = load(id)
+    state = repo.load(id)
+    before = state.revision
     outcome = advance(state, parse_command(payload), emit=sse_push)
-    save_atomic(state)
+    if not repo.save_if_revision(state, before):           # CAS 失败 = 有人抢先
+        return conflict(repo.load(id))                     # 让前端重新渲染
     return outcome                            # Rejected 时前端据 current 重渲染
 ```
 
@@ -222,7 +228,36 @@ class TripState:
     issues: list[Issue] = field(default_factory=list)
 ```
 
-`TripState` 必须完全可 JSON 序列化——没有栈上的隐藏状态。
+`TripState` 必须完全可 JSON 序列化——没有栈上的隐藏状态。但"可序列化"不是自动
+成立的：模型里用了 `datetime` / `date` / `time` / `Decimal` / `Enum` / `frozenset`，
+以及以元组为键的字典，**这些都不能直接 `json.dumps`**。wire format 现在定死，
+不留给 `save/load` 实现时临场发挥：
+
+| 内存类型 | JSON 表示 | 说明 |
+|---|---|---|
+| `datetime` | `"2026-10-02T09:30:00+09:00"` | ISO 8601，**带时区**（跨境行程必需） |
+| `date` / `time` | `"2026-10-02"` / `"09:30"` | ISO 8601 |
+| `Decimal` | `"1240.00"`（字符串） | 绝不能走 float，钱不能有二进制舍入 |
+| `Enum` | 成员名字符串 `"BLOCKING"` | 不用序号——重排枚举不会悄悄改变旧文件语义 |
+| `frozenset` | 排序后的 list | 排序保证同一状态的字节输出稳定，diff 才有意义 |
+| `dict[tuple, T]` | list of object | JSON 对象键只能是字符串；`routes` 因此直接定义成 `list[RouteFact]`（§5.1），键信息已在字段里 |
+| `Field[T]` | `{"value":…, "status":"INFERRED", "rationale":…}` | `status` 必须落盘，否则重载后分不清用户说的和模型猜的 |
+
+```json
+{
+  "format_version": 1,
+  "run_id": "…", "revision": 7, "stage": "AWAIT_CHOICE",
+  "requirements": {...}, "candidates": [...], "chosen_key": null
+}
+```
+
+**`format_version` 从第一天就写。** 迁移策略：读到低版本先跑迁移函数升到当前版本
+再解析；读到高版本直接报错退出，不尝试猜测——宁可让用户升级工具，也不要用旧代码
+去解析新结构，那会静默丢字段。v1 只有版本 1，迁移表为空，但**入口分支必须存在**，
+否则第一次改结构时所有历史 `state.json` 一起变砖。
+
+序列化用显式的 encoder/decoder 函数对，不依赖 `pydantic` 的隐式行为——
+`state.json` 是跨版本的持久契约，值得手写一层。
 
 **`CandidateSlot` 而不是裸 `Itinerary` 列表**：三条线并行，任何一条都可能撞上预算
 或 deadline（§3.6）。用 slot 包一层，失败的那条能带着原因出现在结果里，而不是让
@@ -248,7 +283,21 @@ def advance(state, cmd: Command | None = None, emit=noop) -> Outcome:
             return Rejected(WRONG_COMMAND_FOR_STAGE, _pending(state))
         if isinstance(cmd, ConfirmRequirements) and missing_required(state.requirements):
             return Rejected(MISSING_REQUIRED, _pending(state))   # 必答项没答，不放行
+        if (bad := _check_candidate(state, cmd)) is not None:
+            return Rejected(bad, _pending(state))
         _apply(state, cmd, emit)                            # 只有这里能改 stage
+
+
+def _check_candidate(state, cmd) -> RejectReason | None:
+    """ChooseCandidate / GiveFeedback 携带的 angle_key 必须真实且可用。"""
+    if not isinstance(cmd, (ChooseCandidate, GiveFeedback)):
+        return None
+    slot = state.slot(cmd.angle_key)
+    if slot is None:
+        return UNKNOWN_CANDIDATE
+    if slot.itinerary is None:            # FAILED 且没跑出任何东西
+        return UNSELECTABLE_CANDIDATE
+    return None
     elif cmd is not None:
         return Rejected(WRONG_COMMAND_FOR_STAGE, _pending(state))
 
@@ -295,7 +344,12 @@ def _pending(state) -> NeedInput:
     """当前等待态对应的 NeedInput —— 纯函数，可反复调用。"""
 ```
 
-修掉的两个缺陷：
+**`EXHAUSTED` 的候选是可选的，`FAILED` 且无行程的不可选。** 带着遗留硬伤定稿是
+用户的权利（问题都摆在他面前了）；但选一个根本没跑出东西的 slot 只会让
+`Done(state.chosen().itinerary)` 拿到 `None`——早先版本 `chosen_key` 完全不校验，
+任意字符串都能写进去，崩溃点被推迟到了 `Done` 那一行。
+
+修掉的三个缺陷：
 
 1. **`while True` 在等待态无出口。** 原版 `match` 没有 `AWAIT_*` 分支，无输入调用
    时三个 case 全不命中，直接死循环。现在等待态在进入循环**之前**就被拦下并返回，
@@ -304,6 +358,8 @@ def _pending(state) -> NeedInput:
 2. **错误阶段的输入被静默吞掉。** 原版 `_apply_human_input` 用 `match state.stage`
    分派，不匹配就什么也不做，用户以为提交成功了。现在返回 `Rejected` 并附上当前
    真正在等的问题。
+3. **候选 key 不校验。** 任意字符串都能写进 `chosen_key`，故障延迟到 `Done` 或
+   `REFINE` 取 slot 时才爆。现在在入口挡掉。
 
 `_pending()` 是纯函数：等待态可以被反复查询而不产生副作用，这也让 driver 的
 "重新渲染一次当前问题"变成零成本操作。
@@ -419,6 +475,28 @@ def run_agent(system_prompt, user_prompt, tools, output_schema, role, ctx) -> di
 | 什么时候问人 | | ✅ |
 | 状态存不存 | | ✅ |
 
+### 3.8 仓储层
+
+`save/load` 不能只是两个自由函数——一旦有第二个写者（另一个 CLI 进程开着同一个
+目录，或将来的 web），"读-改-写"就会丢更新。协议现在定下来：
+
+```python
+class StateRepo(Protocol):
+    def load(self, trip_id: str) -> TripState: ...
+    def save_if_revision(self, state: TripState, expected: int) -> bool:
+        """仅当持久化的 revision 仍等于 expected 时写入并返回 True；
+        否则不写、返回 False，调用方需重新 load 并告知用户。"""
+```
+
+`FileRepo`（v1）：`fcntl.flock` 锁住 trip 目录 → 读盘校验 revision → 写临时文件
+→ `os.replace` → 解锁。锁把"检查"和"写入"合成一个临界区，本地文件系统上这就是
+一次真正的 compare-and-swap。`DbRepo`（未来）用 `UPDATE … WHERE revision = ?`
+的影响行数判断，语义完全一致。
+
+这也修正了 §12.1 早先的说法："`save/load` 从文件换 DB 就两个函数"低估了——
+换的是一个带 CAS 语义的接口，不是两个裸函数。接口现在就定好，实现可以先只有
+文件版。
+
 ## 4. 数据模型
 
 ### 4.1 需求
@@ -486,8 +564,7 @@ class BudgetSpec:
 class Activity:
     id:        str                  # 稳定 ID，由代码分配（LLM 不产出 ID）
     day_id:    str
-    poi_query: str                  # LLM 写的名字，如"清水寺"
-    poi_key:   str | None           # resolver 解析后指向 FactSnapshot.pois
+    poi_query: str                  # LLM 写的名字，如"清水寺"；解析结果不存这里
     start:     time
     end:       time
     category:  Category             # SIGHT / MEAL / REST / SHOPPING
@@ -589,16 +666,49 @@ Itinerary ──resolver──▶ FactSnapshot ──validator──▶ list[Iss
 ```python
 @dataclass(frozen=True)
 class FactSnapshot:
-    pois:     dict[str, PoiFact]        # activity.poi_key -> 解析结果
-    routes:   dict[RouteKey, RouteFact] # (day_id, from_id, to_id) -> 实测
-    weather:  dict[date, WeatherFact]
-    resolved_at: datetime
-    gaps:     list[Gap]                 # ★ 没查到的事实，显式记录
+    poi_by_activity: dict[str, PoiResolution]   # activity.id -> 解析结果
+    routes:          list[RouteFact]            # 自带 day_id + 两端活动 ID
+    weather:         dict[str, WeatherFact]     # ISO 日期串 -> 天气
+    resolved_at:     datetime
+    gaps:            list[Gap]                  # ★ 没查到的事实，显式记录
+
+PoiResolution = Resolved | Ambiguous | NotFound
+
+@dataclass(frozen=True)
+class Resolved:
+    fact: PoiFact                               # id / name / coords / 营业时间 / 票价
+
+@dataclass(frozen=True)
+class Ambiguous:
+    candidates: list[PoiFact]                   # 同名多个，不擅自挑
+
+@dataclass(frozen=True)
+class NotFound:
+    query: str
 
 def resolve(itin: Itinerary, reqs: Requirements, provider) -> FactSnapshot: ...
 def run_rule_checks(itin: Itinerary, reqs: Requirements,
                     facts: FactSnapshot) -> list[Issue]: ...        # 纯函数
 ```
+
+**索引键是 `activity.id`，不是解析结果本身。** 早先版本让 `Activity.poi_key` 指向
+`FactSnapshot.pois`，而 `pois` 又以 `poi_key` 为键，同时 `resolve()` 只返回快照、
+并不回写 itinerary——这个数据流是闭不上的。现在 `Activity` 只保留 LLM 写下的
+`poi_query`，解析结果整个活在快照里，按活动 ID 索引。`Itinerary` 保持不可变，
+resolver 无副作用。
+
+**同名 POI 不擅自挑一个。** "清水寺"在高德可能匹配到多条，随便取第一条会让
+`must_visit`、`avoid` 和整条路线的校验建立在错的坐标上，而且错得无声无息。
+`Ambiguous` 与 `NotFound` 都记入 `gaps`：
+
+| Gap | 触发 | 下游影响 |
+|---|---|---|
+| `AMBIGUOUS_POI` | 匹配到多个同名候选 | 依赖该 POI 的规则降级为 WARNING，列出候选让用户定夺 |
+| `POI_NOT_FOUND` | 一个都没匹配上 | 同上；规则 #4/#5 明确说"无法核实" |
+| `ROUTE_UNAVAILABLE` | 路线查询失败/限流 | 规则 #2 降级，见 §5.1 |
+
+`must_visit` 与 `avoid` 的匹配一律走解析后的 POI id，不做字符串比对——
+"清水寺"和"清水寺（京都）"是同一个地方，字符串比不出来。
 
 三个收益：
 
@@ -685,7 +795,7 @@ LLM 拿着错误的 issue 越改越歪。
 
 ```python
 def _apply(state, cmd: Command, emit) -> None:
-    """只有这里能改 stage。调用前 advance() 已校验 revision 与阶段合法性。"""
+    """只有这里能改 stage。调用前 advance() 已校验 revision、阶段与候选 key。"""
     match cmd:
         case ConfirmRequirements():
             state.stage = Stage.GENERATE
@@ -695,25 +805,24 @@ def _apply(state, cmd: Command, emit) -> None:
                 state.raw_request += f"\n用户补充：{text}"
                 state.stage = Stage.COLLECT
             else:                                        # 定稿前改需求
-                _patch_requirements(state, text, emit)
+                _patch_requirements(state, classify_feedback(text, state.requirements), emit)
 
         case ChooseCandidate(angle_key=key):
             state.chosen_key = key
             state.stage = Stage.DONE
 
         case GiveFeedback(angle_key=key, text=text):
-            delta = classify_feedback(text, state.requirements)
+            state.chosen_key = key                       # 提意见即选定
+            delta = classify_feedback(text, state.requirements)   # ★ 只分类一次
             if delta.patches_requirements:
-                state.chosen_key = key                   # 提意见即选定
-                _patch_requirements(state, text, emit)
+                _patch_requirements(state, delta, emit)
             else:
-                state.chosen_key = key
                 state.issues = [Issue.from_human(text)]
                 state.stage = Stage.REFINE
 
 
-def _patch_requirements(state, text, emit) -> None:
-    delta = classify_feedback(text, state.requirements)
+def _patch_requirements(state, delta, emit) -> None:
+    """delta 由调用方传入 —— 不在这里重新分类。"""
     state.requirements = apply_patch(state.requirements, delta.patch)
     emit(RequirementsPatched(delta.patch))               # 非阻塞提示，不拦流程
     state.issues = []                                    # 旧 issue 基于旧需求，作废
@@ -724,6 +833,12 @@ def _patch_requirements(state, text, emit) -> None:
     else:
         state.stage = Stage.REFINE
 ```
+
+**`delta` 必须由调用方传入。** 早先版本 `GiveFeedback` 先 `classify_feedback` 一次，
+转手调 `_patch_requirements` 又分类一次：多烧一次 LLM 调用是小事，
+**两次结果可能不一致**才是真问题——第一次判定"要改需求"进了分支，第二次却给出
+一个空 patch 或不同的 scale，状态就此走歪，而且没有任何地方会报错。分类是不确定
+操作，同一次决策里只允许发生一次。
 
 `state.chosen()` 按 `chosen_key` 从 `candidates` 里取 slot；`chosen_key is None`
 就是"尚未选定"，不需要另一个布尔字段来表示同一件事。
@@ -786,7 +901,8 @@ def enforce_diversity(state, emit, threshold=0.6) -> None:
 ```
 
 判据只用一项：**核心 POI 集合的 Jaccard 重合度**（`category == SIGHT` 的
-`poi_key` 集合）。不采用 review 建议的"主题 / 核心 POI / 每日区域 / 节奏
+已解析 POI id 集合，取自 `FactSnapshot.poi_by_activity`；未解析的活动不参与比较）。
+不采用 review 建议的"主题 / 核心 POI / 每日区域 / 节奏
 四选二"——后三项要么难以客观量化（主题），要么与第一项高度相关（区域），
 引入的判定复杂度换不来相应的收益。POI 重合度单项就能抓住"换汤不换药"这个
 真正要防的失败模式。
@@ -832,7 +948,9 @@ trip-plan/
 ├── src/tripplan/
 │   ├── cli.py                     # CLI driver：交互循环 + 渲染
 │   ├── orchestrator.py            # ★ advance() / run_slot() / 阶段推进
-│   ├── state.py                   # TripState、Stage、save/load
+│   ├── state.py                   # TripState、Stage、Command/Outcome
+│   ├── repo.py                    # StateRepo Protocol + FileRepo（CAS，§3.8）
+│   ├── wire.py                    # JSON encoder/decoder + format_version 迁移
 │   ├── models/
 │   │   ├── requirements.py
 │   │   ├── itinerary.py
@@ -911,6 +1029,8 @@ $ trip plan "十一想去京都玩5天，两个人，预算1万5"
 | `diversity.py` | 构造高/低重合度的候选对 | 完全 |
 | `resolver.py` | 录制真实高德响应存 fixture，回放 | 完全 |
 | `providers/` | 同上 + 限流/超时路径必须覆盖（`ProviderError`） | 完全 |
+| `wire.py` | 往返测试：每种类型 encode→decode 等值；跨版本迁移用例 | 完全 |
+| `repo.py` | CAS 语义：`save_if_revision` 在 revision 变化后返回 False；并发两写只有一个成功 | 完全 |
 | `orchestrator.py` | 注入 `FakeLlm` 按脚本返回 | 完全 |
 | prompts | 少量真实调用，只断言**格式**不断言**质量**，标 slow，不进 CI 默认 | 部分 |
 | 端到端 | 一个 golden case，人工看 | 靠眼 |
@@ -918,13 +1038,16 @@ $ trip plan "十一想去京都玩5天，两个人，预算1万5"
 `rules.py` 之所以能进"完全确定性"这一栏，靠的是 §5.1 把触网部分切给了 resolver。
 早先版本一边声称规则是纯函数、一边让规则 #2 现场调高德，那张表是虚的。
 
-`orchestrator` 必须覆盖的分支（都是这次 review 暴露出来的）：等待态空输入 →
+`orchestrator` 必须覆盖的分支（都是两轮 review 暴露出来的）：等待态空输入 →
 返回 `NeedInput` 而非死循环；`expected_revision` 过期 → `Rejected`；命令与阶段
-不匹配 → `Rejected`；单个 slot 抛异常 → 另外两个正常返回；撞轮数/资源上限 →
-`EXHAUSTED` 且带 `detail`；需求 patch 后 `seeds` 正确传递。
+不匹配 → `Rejected`；未知 / 不可选候选 key → `Rejected`；必答项缺失时
+`ConfirmRequirements` → `Rejected` 且不回退 COLLECT；单个 slot 抛异常 → 另外两个
+正常返回；撞轮数 / 资源上限 → `EXHAUSTED` 且带 `detail`；需求 patch 后 `seeds`
+正确传递；`GiveFeedback` 全程只调一次 `classify_feedback`（用计数 fake 断言）。
 
-TDD 落地顺序：`models` → `rules`（纯函数，最直接）→ `resolver` / `providers`
-（fixture）→ `orchestrator`（FakeLlm）→ `prompts`（最后，靠迭代）→ `cli` / `render`。
+TDD 落地顺序：`models` / `wire`（往返测试先立住持久化契约）→ `rules`（纯函数，
+最直接）→ `repo`（CAS）→ `resolver` / `providers`（fixture）→ `orchestrator`
+（FakeLlm）→ `prompts`（最后，靠迭代）→ `cli` / `render`。
 
 代码格式化：每次改动后用 `black`（虚拟环境内优先，否则 `/opt/homebrew/bin/black`）。
 
@@ -961,23 +1084,41 @@ tool call 数、输出 token 数和 deadline 三道闸；没有它们，一条�
 
 `models` / `rules` / `providers` / `tools` / `agents` / `orchestrator` 原样复用
 （约 80% 代码）。新增工作全在 web 层本身：HTTP 框架、后台任务队列（三条线并行要跑
-几分钟，不能同步等）、前端、认证、多用户配额。`save/load` 从文件换 DB 就两个函数，
-届时再抽 Repository 接口。HTML renderer 可直接充当服务端渲染的起点。
+几分钟，不能同步等）、前端、认证、多用户配额。存储层换 DB 就是给 `StateRepo`
+（§3.8）加一个实现——CAS 语义已经在接口里，`UPDATE … WHERE revision = ?` 直接对上。
+HTML renderer 可直接充当服务端渲染的起点。
+
+需要注意的是**并发在这里才真正出现**：v1 CLI 是单写者，`expected_revision` 只用来
+识别"拿旧问题作答"；多用户 web 下必须依赖 §3.8 的 CAS 才能防住 lost update。
 
 ### 12.2 Skill 形态
 
 比预想的便宜得多。做法是给 CLI 加两个非交互子命令，把单步接口暴露出来：
 
+子命令必须完整表达 §3.2 的命令联合——命令类型、`expected_revision`、候选 key
+一个都不能少，否则 agent 就在猜状态机的意图：
+
 ```bash
 $ trip start "十一想去京都玩5天" --dir ./trips/kyoto
-{"outcome":"need_input","kind":"confirm_requirements","payload":{...}}
+{"outcome":"need_input","kind":"confirm_requirements","revision":1,"payload":{...}}
 
-$ trip advance ./trips/kyoto --text "预算1万5，不爱走路"
-{"outcome":"need_input","kind":"choose_or_feedback","payload":{...}}
+$ trip advance ./trips/kyoto --amend "预算1万5，不爱走路" --revision 1
+{"outcome":"need_input","kind":"confirm_requirements","revision":2,"payload":{...}}
+
+$ trip advance ./trips/kyoto --confirm --revision 2
+{"outcome":"need_input","kind":"choose_or_feedback","revision":3,"payload":{...}}
+
+$ trip advance ./trips/kyoto --feedback B --text "第2天太赶了" --revision 3
+$ trip advance ./trips/kyoto --choose B --revision 4
 ```
 
+`--revision` 从上一次返回的 `revision` 字段原样带回；对不上就拿到
+`{"outcome":"rejected","reason":"STALE_REVISION","current":{...}}`，agent 据
+`current` 重新问一遍。**这道校验存在的意义正是防止 agent 拿着几轮之前的候选列表
+作答**——它比人更容易犯这个错，因为它的"上一屏"可能已经被压缩掉了。
+
 `SKILL.md` 只需三条指令：调 `trip` 子命令、把返回的 payload 讲成人话、把用户原话
-通过 `--text` 转发回去。约 60 行，**没有一行流程逻辑**。
+按命令类型转发回去。约 60 行，**没有一行流程逻辑**。
 
 关键约束：**宿主 agent 不参与任何决策**——不做需求抽取、不做规划、不做反馈分类，
 那些全在 CLI 内部完成。一旦让 agent 参与决策（哪怕只是"反馈分类交给它，对话上下文
