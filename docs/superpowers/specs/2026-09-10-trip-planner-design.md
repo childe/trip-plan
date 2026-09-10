@@ -23,8 +23,9 @@
 - 三份差异化候选方案，各自打磨到收敛后一并展示
 - 三层 review：确定性规则 + LLM critic（换模型）+ 人工
 - 需求变更处理（"三天改四天"）
-- 高德地图数据接入（POI、点到点耗时）
+- 高德地图数据接入（POI、点到点耗时、静态地图）
 - Markdown 行程单输出
+- HTML 行程单输出（单文件自包含，含每日路线图）
 
 ### v1 不包含
 
@@ -32,9 +33,10 @@
 |---|---|
 | 多城市行程 | 引入城际交通、住宿切换、行李寄存等一整套约束，数据模型要加 city 维度 |
 | `trip resume` 命令 | 状态本来就存盘，加命令成本极低，但 v1 不需要 |
-| ics / HTML 导出 | 纯渲染层，`Itinerary` 已结构化，随时可加 |
-| Web 界面 | 见 §12，架构已为此留路 |
-| 机票 / 酒店真实预订 | 需要携程内部 API，见 §12 |
+| ics 导出 | 纯渲染层，`Itinerary` 已结构化，随时可加 |
+| Skill 形态 | 见 §12.2，架构已为此留路，且比预想的便宜 |
+| Web 界面 | 见 §12.1，架构已为此留路 |
+| 机票 / 酒店真实预订 | 需要携程内部 API，见 §12.3 |
 
 ### 已知局限（诚实记录，不假装）
 
@@ -471,6 +473,7 @@ model = "claude-haiku-4-5"
 class GeoProvider(Protocol):
     def search_poi(self, query: str, city: str) -> list[Poi]: ...
     def route(self, origin: LatLng, dest: LatLng, mode: TravelMode) -> Leg: ...
+    def static_map(self, points: list[LatLng], path: bool) -> bytes: ...   # PNG
 ```
 
 - `AmapProvider` — 高德实现，带磁盘缓存（按坐标对 + mode 去重）
@@ -518,9 +521,22 @@ trip-plan/
 │   └── render/
 │       ├── requirement_card.py
 │       ├── candidates.py
-│       └── itinerary_md.py
+│       ├── itinerary_md.py
+│       └── itinerary_html.py      # 单文件自包含 HTML
 └── tests/
 ```
+
+### 8.1 HTML 输出
+
+`trip render <dir> --format html` 产出单文件自包含 HTML：CSS 与 JS 全部内联，
+静态地图 base64 内嵌，**不依赖任何外网加载**——发给同行的人，断网也能看。
+
+版式：每天一张卡片，卡片内是活动时间轴，代码算出的交通段（`Leg`）插在相邻活动
+之间，遗留 `Issue` 按 severity 标色（BLOCKING 红 / WARNING 黄 / SUGGESTION 灰）。
+每天顶部一张高德静态地图，标出当天所有 POI 并连出路线。
+
+地图通过 `GeoProvider.static_map()` 获取，与 POI、路线共用同一层缓存。
+`FakeProvider` 返回一张占位 PNG，使 HTML 渲染测试不触网。
 
 ## 9. CLI 与产物
 
@@ -538,6 +554,7 @@ $ trip plan "十一想去京都玩5天，两个人，预算1万5"
 - `state.json` — 完整状态，每个暂停点写盘
 - `plan-{A,B,C}.md` — 三份候选
 - `itinerary.md` — 定稿
+- `itinerary.html` — 定稿的自包含 HTML（`trip render <dir> --format html`）
 
 ## 10. 测试策略
 
@@ -567,15 +584,64 @@ critic 换更便宜的模型。
 
 ## 12. 未来扩展
 
-**Web 界面** — 架构已留路。`advance(state, input) -> Outcome` 加上可 JSON 序列化的
-`TripState`，意味着 `models` / `rules` / `providers` / `tools` / `agents` /
-`orchestrator` 可原样复用（约 80% 代码）。新增工作全在 web 层本身：HTTP 框架、
-后台任务队列（三条线并行要跑几分钟，不能同步等）、前端、认证、多用户配额。
-`save/load` 从文件换 DB 就两个函数，届时再抽 Repository 接口。
+三种交付形态共用同一个 `advance(state, input) -> Outcome`——**一套编排，多个 driver**。
+这是 §3.2 那个接口形状最大的回报。
 
-**真实 API** — 新增 Provider 实现即可，见 §7。接入后规则 #9 可从 WARNING 升到 BLOCKING。
+```
+                    ┌──────────────────────────┐
+   CLI driver ────▶ │                          │
+                    │  advance(state, input)   │  唯一的编排逻辑
+ skill driver ────▶ │  强制校验 / 循环上限 / 存盘 │  唯一的校验保证
+                    │                          │  唯一的测试目标
+  web driver  ────▶ │                          │
+                    └──────────────────────────┘
+```
 
-**多城市** — 需要 `Itinerary` 加 city 维度、城际交通段、住宿切换规则。属于独立的
-一轮设计。
+### 12.1 Web 界面
 
-**其他** — `trip resume` 命令、ics / HTML 导出，都是小增量。
+`models` / `rules` / `providers` / `tools` / `agents` / `orchestrator` 原样复用
+（约 80% 代码）。新增工作全在 web 层本身：HTTP 框架、后台任务队列（三条线并行要跑
+几分钟，不能同步等）、前端、认证、多用户配额。`save/load` 从文件换 DB 就两个函数，
+届时再抽 Repository 接口。HTML renderer 可直接充当服务端渲染的起点。
+
+### 12.2 Skill 形态
+
+比预想的便宜得多。做法是给 CLI 加两个非交互子命令，把单步接口暴露出来：
+
+```bash
+$ trip start "十一想去京都玩5天" --dir ./trips/kyoto
+{"outcome":"need_input","kind":"confirm_requirements","payload":{...}}
+
+$ trip advance ./trips/kyoto --text "预算1万5，不爱走路"
+{"outcome":"need_input","kind":"choose_or_feedback","payload":{...}}
+```
+
+`SKILL.md` 只需三条指令：调 `trip` 子命令、把返回的 payload 讲成人话、把用户原话
+通过 `--text` 转发回去。约 60 行，**没有一行流程逻辑**。
+
+关键约束：**宿主 agent 不参与任何决策**——不做需求抽取、不做规划、不做反馈分类，
+那些全在 CLI 内部完成。一旦让 agent 参与决策（哪怕只是"反馈分类交给它，对话上下文
+更全"），CLI 模式和 skill 模式就分叉成两套逻辑。放弃那点准确率，换行为一致。
+
+skill 形态的真正价值不在省掉 API key（做 LLM 应用躲不掉），而在：零启动摩擦；
+payload 是 JSON，agent 能讲成人话；以及**追问能力**——用户问"方案 A 和 B 差在哪"、
+"为什么第二天不去岚山"，agent 直接读 `state.json` 和 `plan-*.json` 回答，不走流程。
+这是纯 CLI 给不了的。
+
+被否决的替代做法：让 skill 自己编排（SKILL.md 管流程，Python 只提供
+validate / route / render 脚本）。它会把流程保证从"代码强制"降级为"指令遵守"，
+且编排逻辑无法单测。可以用"`render.py` 校验产物缺失或 hash 对不上就拒绝渲染"这种
+脚本间门禁把"应该"变成"必须"，但既然 CLI 版本已经存在，没有理由退而求其次。
+
+### 12.3 真实 API
+
+新增 Provider 实现即可，见 §7。接入携程内部机票/酒店 API 后，规则 #9（营业时间）
+可从 WARNING 升到 BLOCKING。
+
+### 12.4 多城市
+
+需要 `Itinerary` 加 city 维度、城际交通段、住宿切换规则。属于独立的一轮设计。
+
+### 12.5 零碎
+
+`trip resume` 命令、ics 导出，都是小增量。
