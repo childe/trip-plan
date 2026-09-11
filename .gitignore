@@ -1,0 +1,26 @@
+# 隔离工作区
+.worktrees/
+
+# subagent-driven-development 的 ledger 与中间产物
+.superpowers/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 运行产物
+trips/
+.cache/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
