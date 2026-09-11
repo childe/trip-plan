@@ -40,7 +40,17 @@ class BudgetLedger:
 
 def build_ledger(itin: Itinerary, reqs: Requirements) -> BudgetLedger:
     spec = reqs.budget.value
-    currency = spec.currency if spec else "CNY"
+
+    # 如果有预算，用其币种；否则从行程第一个有价格的活动推断。
+    if spec is not None:
+        currency = spec.currency
+    else:
+        # 从第一个有成本的活动推断币种；全无价格则用 CNY。
+        currency = "CNY"
+        for act in itin.all_activities():
+            if act.cost is not None:
+                currency = act.cost.currency
+                break
 
     verified = estimated = Decimal("0")
     v_count = e_count = unknown = 0

@@ -126,3 +126,47 @@ def test_mismatched_currency_is_flagged_not_silently_summed():
     assert led.currency_mismatch is True
     assert led.total == Decimal("100")  # 只累加同币种的
     assert led.unknown_count == 1  # 异币种计入未知
+
+
+def test_no_budget_all_jpy_infers_currency():
+    """无预算时，从行程的第一个有价格的活动推断参考币种。全日元项目应无异币种标记。"""
+    led = build_ledger(
+        _itin(
+            [
+                _money("5000", Confidence.VERIFIED, "JPY"),
+                _money("3000", Confidence.ESTIMATED, "JPY"),
+            ]
+        ),
+        _reqs(amount=None),
+    )
+    assert led.currency == "JPY"
+    assert led.currency_mismatch is False
+    assert led.unknown_count == 0
+    assert led.verified == Decimal("5000")
+    assert led.estimated == Decimal("3000")
+
+
+def test_no_budget_mixed_currency_still_flagged():
+    """无预算且混币种时，异币种仍被标记为未知，不硬加。"""
+    led = build_ledger(
+        _itin(
+            [
+                _money("100", Confidence.VERIFIED, "CNY"),
+                _money("4000", Confidence.ESTIMATED, "JPY"),
+            ]
+        ),
+        _reqs(amount=None),
+    )
+    assert led.currency == "CNY"  # 参考第一个有价格的活动
+    assert led.currency_mismatch is True
+    assert led.total == Decimal("100")  # 只累加同币种
+    assert led.unknown_count == 1  # 异币种计入未知
+
+
+def test_over_budget_at_exact_equality_is_false():
+    """total == budget_limit 时应返回 False。"""
+    led = build_ledger(
+        _itin([_money("15000", Confidence.VERIFIED)]), _reqs("15000", Basis.TOTAL)
+    )
+    assert led.total == led.budget_limit
+    assert led.over_budget is False
