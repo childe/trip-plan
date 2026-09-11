@@ -30,6 +30,11 @@ def _key(p: LatLng) -> tuple[float, float]:
     return (round(p.lat, 6), round(p.lng, 6))
 
 
+def _normalize_coord_pair(pair: tuple[float, float]) -> tuple[float, float]:
+    """Normalize a coordinate pair to 6 decimal places."""
+    return (round(pair[0], 6), round(pair[1], 6))
+
+
 class FakeProvider:
     def __init__(
         self,
@@ -40,8 +45,17 @@ class FakeProvider:
         opening_hours=None,
     ):
         self._pois = pois or {}
-        self._routes = routes or {}
-        self._fail_routes = fail_routes or set()
+        # Normalize route pairs to 6 decimal precision at construction time
+        # so that lookups with high-precision coordinates still match
+        self._routes = {
+            (_normalize_coord_pair(origin), _normalize_coord_pair(dest)): duration
+            for (origin, dest), duration in (routes or {}).items()
+        }
+        # Normalize fail_routes set similarly
+        self._fail_routes = {
+            (_normalize_coord_pair(origin), _normalize_coord_pair(dest))
+            for origin, dest in (fail_routes or set())
+        }
         self._timezones = {**_TIMEZONES, **(timezones or {})}
         self._opening_hours = opening_hours or {}
         self.call_log: list[str] = []

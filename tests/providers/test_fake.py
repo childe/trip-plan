@@ -67,3 +67,36 @@ def test_call_log_lets_tests_assert_no_redundant_lookups():
     p.route(a, b, TravelMode.TRANSIT, WHEN)
     p.route(a, b, TravelMode.TRANSIT, WHEN)
     assert p.call_log.count("route") == 2
+
+
+def test_route_scripting_matches_with_high_precision_coordinates():
+    """Test that scripted routes and failures work with >6 decimal coordinates.
+
+    Regression guard: scripted keys are normalized to 6 decimals at construction,
+    so lookups with high-precision coordinates still match.
+    """
+    # Script with 7-decimal coordinates
+    origin = (35.12345678, 135.12345678)
+    dest = (35.23456789, 135.23456789)
+
+    p = FakeProvider(routes={(origin, dest): 40})
+    # Look up with LatLng objects (floats internally)
+    obs = p.route(LatLng(*origin), LatLng(*dest), TravelMode.TRANSIT, WHEN)
+    # Should hit the scripted value, not the computed fallback
+    assert obs.duration_min == 40
+
+
+def test_route_failure_scripting_matches_with_high_precision_coordinates():
+    """Test that scripted failures work with >6 decimal coordinates.
+
+    Regression guard: fail_routes set keys are normalized to 6 decimals at
+    construction, so route() calls with high-precision coordinates still raise.
+    """
+    # Script failure with 7-decimal coordinates
+    origin = (35.12345678, 135.12345678)
+    dest = (35.23456789, 135.23456789)
+
+    p = FakeProvider(fail_routes={(origin, dest)})
+    # Look up should raise, not silently fall through to computed fallback
+    with pytest.raises(ProviderError):
+        p.route(LatLng(*origin), LatLng(*dest), TravelMode.TRANSIT, WHEN)
