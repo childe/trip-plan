@@ -183,7 +183,19 @@ def collect(raw_request: str, deps, ctx) -> Requirements:
     return Requirements(**{name: _to_field(name, data.get(name)) for name in _PARSERS})
 
 
+def _parse_angle(raw: dict) -> Angle:
+    return Angle(raw["key"], raw["title"], raw.get("description", ""))
+
+
+_parse_angle_safe = _safe(_parse_angle)
+
+
 def pick_angles(reqs: Requirements, deps, ctx, n: int = 3) -> list[Angle]:
+    """run_agent 只校验顶层 required（["angles"]），不会递归进每个角度的
+    ["key","title"]——缺字段的角度条目要跳过而不是拖垮整批候选。但角度这
+    一步没有"部分成功也能用"的余地：跳到一个都不剩时，不能悄悄返回空
+    列表——下游会拿着零候选继续跑，既不会规划出任何东西，也没留下任何
+    能诊断的线索，所以必须在这里就报错。"""
     data = run_agent(
         system_prompt=_prompt("angle").replace("{n}", str(n)),
         user_prompt=_describe_requirements(reqs),
@@ -194,12 +206,20 @@ def pick_angles(reqs: Requirements, deps, ctx, n: int = 3) -> list[Angle]:
         client=deps.client,
         tool_impls={},
     )
-    angles = [
-        Angle(a["key"], a["title"], a.get("description", ""))
-        for a in data["angles"][:n]
-    ]
+    angles = []
+    for raw in data["angles"]:
+        try:
+            angles.append(_parse_angle_safe(raw))
+        except ParseError:
+            continue  # 单个角度解析不出来就跳过，不拖累其余候选
+        if len(angles) == n:
+            break
+    if not angles:
+        raise ValueError("模型返回的角度候选没有一个能解析——没有可用角度")
     keys = [a.key for a in angles]
     if len(set(keys)) != len(keys):
+        # key 重复没有安全的默认值可退——不像坏值那样能当没给，这里没有
+        # "半个角度"的概念，交给编排层去处理（例如重跑一次）。
         raise ValueError(f"角度 key 重复：{keys}")
     return angles
 
@@ -247,6 +267,25 @@ def _plan(prompt_parts, reqs, angle, deps, ctx) -> Itinerary:
     return assign_ids(_to_itinerary(data, angle))
 
 
+def _parse_critic_issue(raw: dict) -> Issue:
+    try:
+        severity = Severity(raw["severity"])
+    except ValueError:
+        severity = Severity.SUGGESTION  # 拿不准就往轻里判——枚举值不认识
+        # 不算这条点评彻底解析失败，只是判得轻一点
+    where = DayRef(raw["where_day"]) if raw.get("where_day") else None
+    return Issue(
+        severity=severity,
+        source=Source.CRITIC,
+        code="CRITIC",
+        message=raw["message"],
+        where=where,
+    )
+
+
+_parse_critic_issue_safe = _safe(_parse_critic_issue)
+
+
 def run_llm_critic(itin, reqs: Requirements, deps, ctx) -> list[Issue]:
     body = (
         "行程：\n" + json.dumps(_itinerary_to_json(itin), ensure_ascii=False)
@@ -266,19 +305,9 @@ def run_llm_critic(itin, reqs: Requirements, deps, ctx) -> list[Issue]:
     out = []
     for raw in data["issues"]:
         try:
-            severity = Severity(raw["severity"])
-        except ValueError:
-            severity = Severity.SUGGESTION  # 拿不准就往轻里判
-        where = DayRef(raw["where_day"]) if raw.get("where_day") else None
-        out.append(
-            Issue(
-                severity=severity,
-                source=Source.CRITIC,
-                code="CRITIC",
-                message=raw["message"],
-                where=where,
-            )
-        )
+            out.append(_parse_critic_issue_safe(raw))
+        except ParseError:
+            continue  # 一条点评解析不出来，丢的是一个意见，不是整份点评
     return out
 
 
@@ -390,23 +419,61 @@ def _to_activity(raw: dict) -> Activity:
 _parse_activity = _safe(_to_activity)
 
 
-def _to_itinerary(data: dict, angle: Angle) -> Itinerary:
-    """run_agent 只校验顶层 required（["days"]），不会递归进每个活动的字段——
-    所以一个活动缺 poi_query / start 格式不对 / cost.amount 不是数字都可能在
-    这里炸出来。丢掉整份行程会连带炸掉模型排对的其他活动，静默跳过又违反了
-    这个项目一路坚持的规矩：解析不了的东西要留痕，不能装作没发生。所以每个
-    活动单独兜底：解析不出来就跳过它，同时在 itinerary.issues 里记一条
-    WARNING，留给下游（渲染 / 人工复核）看到「这里少了什么、为什么」。
+def _parse_day_shell(raw_day: dict) -> tuple[Date, list]:
+    """解析一天的骨架：date 本身，以及 activities 是不是一个数组。
 
-    这里同样用 _safe 收敛 _to_activity 内部的异常——不必在这个 except 里
-    手动枚举 KeyError/ValueError/TypeError/InvalidOperation，以后 _to_activity
-    内部逻辑变化想抛什么都不会漏网。"""
+    这两者任一解析不出来，整天都没法安放——没有日期挂不到时间线上，
+    activities 不是数组也没什么可迭代的——所以这是与"活动级"故障不同的
+    粒度：活动级故障只丢一个活动，日级故障要丢一整天，不能试图从一个
+    连骨架都立不住的结构里硬凑活动出来。"""
+    date = Date.fromisoformat(raw_day["date"])
+    activities = raw_day["activities"]
+    if not isinstance(activities, list):
+        raise TypeError("activities 必须是数组")
+    return date, activities
+
+
+_parse_day_shell_safe = _safe(_parse_day_shell)
+
+
+def _to_itinerary(data: dict, angle: Angle) -> Itinerary:
+    """run_agent 只校验顶层 required（["days"]），不会递归进每一天 /
+    每个活动的字段——所以一天的 date 格式不对、缺 activities 键，或者
+    一个活动缺 poi_query / start 格式不对 / cost.amount 不是数字，都可能
+    在这里炸出来。丢掉整份行程会连带炸掉模型排对的其他天/其他活动，静默
+    跳过又违反了这个项目一路坚持的规矩：解析不了的东西要留痕，不能装作
+    没发生。所以按两级粒度分别兜底：
+    - 日级：这一天的骨架（date / activities 本身）解析不出来，跳过整天，
+      记一条 WARNING（这一天从没存在过，没有 day_id 可指）。
+    - 活动级：日骨架没问题，但其中某个活动解析不出来，只跳过那一个活动，
+      记一条 WARNING 并指向这一天最终会被分配到的 day_id。
+
+    两处都用 _safe 收敛内部的异常——不必在 except 里手动枚举
+    KeyError/ValueError/TypeError/InvalidOperation，以后解析逻辑变化想抛
+    什么都不会漏网。"""
     days = []
     issues: list[Issue] = []
-    for day_index, raw_day in enumerate(data["days"], start=1):
+    for raw_index, raw_day in enumerate(data["days"], start=1):
+        try:
+            date, raw_activities = _parse_day_shell_safe(raw_day)
+        except ParseError as e:
+            issues.append(
+                Issue(
+                    severity=Severity.WARNING,
+                    source=Source.RULE,
+                    code="UNPARSEABLE_DAY",
+                    message=f"原始第 {raw_index} 天解析失败，已跳过：{e}",
+                    where=None,  # 这一天没能生成，没有 day_id 可指
+                )
+            )
+            continue
+
+        # 只在这一天真正被保留时才计数，与 assign_ids 后续按 itin.days
+        # 最终顺序分配的编号对齐——中途丢掉的天不占编号。
+        day_number = len(days) + 1
+        day_id = f"d{day_number}"
         acts = []
-        day_id = f"d{day_index}"  # 与 assign_ids 后续分配的编号对齐
-        for act_index, raw in enumerate(raw_day["activities"], start=1):
+        for act_index, raw in enumerate(raw_activities, start=1):
             try:
                 acts.append(_parse_activity(raw))
             except ParseError as e:
@@ -415,17 +482,12 @@ def _to_itinerary(data: dict, angle: Angle) -> Itinerary:
                         severity=Severity.WARNING,
                         source=Source.RULE,
                         code="UNPARSEABLE_ACTIVITY",
-                        message=f"第 {day_index} 天第 {act_index} 个活动解析失败，"
+                        message=f"第 {day_number} 天第 {act_index} 个活动解析失败，"
                         f"已跳过：{e}",
                         where=DayRef(day_id),
                     )
                 )
         days.append(
-            Day(
-                id="",
-                date=Date.fromisoformat(raw_day["date"]),
-                activities=acts,
-                lodging=raw_day.get("lodging"),
-            )
+            Day(id="", date=date, activities=acts, lodging=raw_day.get("lodging"))
         )
     return Itinerary(angle=angle, days=days, issues=issues)

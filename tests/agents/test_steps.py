@@ -193,6 +193,29 @@ def test_pick_angles_rejects_duplicate_keys():
         pick_angles(Requirements(), _deps(_resp(payload)), _ctx(), n=2)
 
 
+def test_pick_angles_skips_entry_missing_title_and_keeps_the_valid_one():
+    """run_agent 只校验顶层 required（["angles"]），不会递归进每个角度的
+    ["key","title"]——缺 title 的条目应该被跳过，而不是让 KeyError 拖垮
+    整批候选角度。"""
+    payload = {
+        "angles": [
+            {"key": "A"},  # 缺 title
+            {"key": "B", "title": "市井美食", "description": "锦市场为轴"},
+        ]
+    }
+    angles = pick_angles(Requirements(), _deps(_resp(payload)), _ctx(), n=2)
+    assert [a.key for a in angles] == ["B"]
+
+
+def test_pick_angles_raises_when_no_angle_survives_parsing():
+    """跳过坏角度是安全的，但一个都凑不齐时不能悄悄返回空列表——
+    这一步本来就不能在零候选的情况下继续，必须给出清楚的报错而不是留下
+    一个"看起来成功但什么都没有"的结果。"""
+    payload = {"angles": [{"key": "A"}, {"key": "B"}]}  # 都缺 title
+    with pytest.raises(ValueError, match="没有"):
+        pick_angles(Requirements(), _deps(_resp(payload)), _ctx(), n=3)
+
+
 # ---------- generate / revise ----------
 
 PLAN = {
@@ -376,6 +399,93 @@ def test_generate_skips_activity_with_non_numeric_cost_and_keeps_the_rest():
     assert any(i.severity is Severity.WARNING for i in itin.issues)
 
 
+DAY_LEVEL_BROKEN_DATE_PLAN = {
+    "days": [
+        {
+            "date": "十月一日",  # 非法 ISO 日期——整天没法安放
+            "lodging": None,
+            "activities": [
+                {
+                    "poi_query": "清水寺",
+                    "start": "09:00",
+                    "end": "11:00",
+                    "category": "SIGHT",
+                    "cost": None,
+                    "indoor": False,
+                    "note": "",
+                },
+            ],
+        },
+        {
+            "date": "2026-10-02",
+            "lodging": None,
+            "activities": [
+                {
+                    "poi_query": "金阁寺",
+                    "start": "09:00",
+                    "end": "11:00",
+                    "category": "SIGHT",
+                    "cost": None,
+                    "indoor": False,
+                    "note": "",
+                },
+            ],
+        },
+    ]
+}
+
+
+def test_generate_skips_day_with_invalid_date_and_keeps_the_good_day():
+    """一天的 date 解析不出来，这一天整个没法安放在时间线上——应该跳过
+    这一天而不是让 ValueError 拖垮整份行程，包括其它排对了的天。"""
+    itin = generate(
+        Requirements(destination=Field("京都", Origin.USER)),
+        _angle(),
+        _deps(_resp(DAY_LEVEL_BROKEN_DATE_PLAN)),
+        _ctx(),
+    )
+    assert len(itin.days) == 1
+    assert itin.days[0].date == date(2026, 10, 2)
+    assert any(i.severity is Severity.WARNING for i in itin.issues)
+
+
+DAY_LEVEL_MISSING_ACTIVITIES_PLAN = {
+    "days": [
+        {"date": "2026-10-01", "lodging": None},  # 完全没有 activities 键
+        {
+            "date": "2026-10-02",
+            "lodging": None,
+            "activities": [
+                {
+                    "poi_query": "金阁寺",
+                    "start": "09:00",
+                    "end": "11:00",
+                    "category": "SIGHT",
+                    "cost": None,
+                    "indoor": False,
+                    "note": "",
+                },
+            ],
+        },
+    ]
+}
+
+
+def test_generate_skips_day_missing_activities_key_and_keeps_the_good_day():
+    """run_agent 只校验顶层 required（["days"]），不会递归进每一天的
+    ["date","activities"]——缺 activities 键的一天要被跳过，而不是让
+    KeyError 拖垮整份行程。"""
+    itin = generate(
+        Requirements(destination=Field("京都", Origin.USER)),
+        _angle(),
+        _deps(_resp(DAY_LEVEL_MISSING_ACTIVITIES_PLAN)),
+        _ctx(),
+    )
+    assert len(itin.days) == 1
+    assert itin.days[0].date == date(2026, 10, 2)
+    assert any(i.severity is Severity.WARNING for i in itin.issues)
+
+
 def test_revise_includes_issues_in_the_prompt():
     from tripplan.models.issue import Issue
 
@@ -418,6 +528,25 @@ def test_critic_tolerates_empty_verdict():
     assert (
         run_llm_critic(None, Requirements(), _deps(_resp({"issues": []})), _ctx()) == []
     )
+
+
+def test_critic_skips_issue_missing_message_and_keeps_the_valid_one():
+    """run_agent 只校验顶层 required（["issues"]），不会递归进每条 issue 的
+    ["severity","message"]——缺 message 的一条点评是丢了一个意见，不该拖垮
+    整份点评。"""
+    payload = {
+        "issues": [
+            {"severity": "SUGGESTION", "where_day": None},  # 缺 message
+            {
+                "severity": "BLOCKING",
+                "message": "第3天完全不符合休闲节奏",
+                "where_day": "d3",
+            },
+        ]
+    }
+    issues = run_llm_critic(None, Requirements(), _deps(_resp(payload)), _ctx())
+    assert len(issues) == 1
+    assert issues[0].message == "第3天完全不符合休闲节奏"
 
 
 # ---------- classify_feedback ----------
