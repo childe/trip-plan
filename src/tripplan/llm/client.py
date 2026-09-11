@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from tripplan.llm.config import DEFAULT_ROLES, Role, RoleConfig
+from tripplan.providers.base import ProviderError
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,8 @@ class AnthropicClient:
         )
 
     def chat(self, role, system, messages, tools) -> LlmResponse:
+        import anthropic
+
         cfg = self.configs[role]
         kwargs = dict(
             model=cfg.model,
@@ -101,7 +104,12 @@ class AnthropicClient:
         )
         if tools:
             kwargs["tools"] = tools
-        resp = self._client.messages.create(**kwargs)
+        try:
+            resp = self._client.messages.create(**kwargs)
+        except anthropic.APIError as e:
+            # 连接失败 / 429 / 5xx / 鉴权失败：外部依赖挂了，不是我们的 bug。
+            # 转成 ProviderError 让 run_slot 兜住，而不是原样炸穿整条候选线。
+            raise ProviderError(str(e)) from e
 
         text = "".join(b.text for b in resp.content if b.type == "text")
         calls = [

@@ -9,7 +9,9 @@ from tripplan.models.facts import PoiFact
 
 
 class ProviderError(Exception):
-    """外部依赖失败：网络错误、限流、鉴权失败、查无此城。
+    """外部依赖失败：网络错误、限流、鉴权失败、查无此城——不管是高德这类地理
+    服务，还是 LLM 本身的传输层故障（连接失败 / 429 / 5xx），都算在内。
+    名字虽然是 Provider，覆盖的是"任何外部依赖"，不止地理服务一家。
 
     由 run_slot 兜住（Task 18），转成 SlotStatus.FAILED 而不是炸穿整组候选。
     """

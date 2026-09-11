@@ -17,6 +17,16 @@ def _noop(_event) -> None:
     pass
 
 
+def _safe_emit(emit, event) -> None:
+    """进度回调是给外部看的旁路，不是循环的一部分——它自己炸了不能陪葬一整个
+    候选。Task 20 会让三条候选线共享同一个 emit（含多样性重试路径），一个
+    回调里的 bug 不该因此拖垮所有还在跑的候选。"""
+    try:
+        emit(event)
+    except Exception:
+        pass
+
+
 def run_slot(
     angle,
     seed,
@@ -31,16 +41,18 @@ def run_slot(
     ctx = SlotContext(limits, emit=emit)
     itin, facts = seed, None
     issues = list(issues)
+    revisions = 0  # 真正调用过 revise 的次数——轮 0 只校验首稿，不一定修订
 
     try:
         if itin is None:
-            emit(("generating", angle.key))
+            _safe_emit(emit, ("generating", angle.key))
             itin = generate(reqs, angle, deps, ctx, avoid_poi_ids=avoid_poi_ids)
 
         for rnd in range(limits.max_rounds):
             if issues:  # 有待办问题就先改
-                emit(("revision", angle.key, rnd))
+                _safe_emit(emit, ("revision", angle.key, rnd))
                 itin = revise(itin, reqs, issues, deps, ctx)
+                revisions += 1
 
             facts = resolve(itin, reqs, deps.provider, tz)  # 本轮唯一的 I/O
             issues = run_rule_checks(itin, reqs, facts)  # ① 纯函数，便宜
@@ -58,7 +70,7 @@ def run_slot(
             itin,
             facts,
             SlotStatus.EXHAUSTED,
-            f"修订 {limits.max_rounds} 轮后仍有 {blocking} 个硬伤",
+            f"修订 {revisions} 次后仍有 {blocking} 个硬伤",
         )
 
     except LimitExceeded as e:

@@ -155,7 +155,19 @@ def test_exhausted_when_rounds_run_out(mk, monkeypatch):
     slot = _run(mk, steps, monkeypatch, limits=SlotLimits(max_rounds=2))
     assert slot.status is SlotStatus.EXHAUSTED
     assert slot.itinerary is not None  # 带着残缺行程回来
-    assert "2" in slot.detail
+    assert str(steps.revise_calls) in slot.detail
+
+
+def test_exhausted_detail_reports_actual_revision_count_not_round_cap(mk, monkeypatch):
+    """轮 0 只校验首稿、不修订，所以「修订次数」永远 <= max_rounds - 1。
+    detail 里的数字必须是真正调用过 revise 的次数，不能拿轮数上限充数——
+    否则读的人会以为模型改了 3 次，其实只改了 2 次。"""
+    steps = _ScriptedSteps([_broken(mk)] * 5)
+    slot = _run(mk, steps, monkeypatch, limits=SlotLimits(max_rounds=3))
+    assert slot.status is SlotStatus.EXHAUSTED
+    assert steps.revise_calls == 2  # 轮0只校验首稿，轮1、轮2各修订一次
+    assert "修订 2 次" in slot.detail
+    assert "修订 3" not in slot.detail  # 不能拿轮数上限（3）冒充修订次数
 
 
 def test_exhausted_slot_carries_unresolved_issues(mk, monkeypatch):
@@ -230,3 +242,43 @@ def test_emits_progress_events(mk, monkeypatch):
     steps = _ScriptedSteps([_broken(mk), _clean(mk)])
     _run(mk, steps, monkeypatch, emit=events.append)
     assert any("revision" in str(e) for e in events)
+
+
+def test_raising_emit_does_not_break_the_loop(mk, monkeypatch):
+    """Task 20 会让三条候选线共享同一个 emit（含多样性重试路径）——一个
+    进度回调里的 bug 不该拖垮正在跑的候选。"""
+
+    def bad_emit(_event):
+        raise RuntimeError("callback 里的 bug，不该管到 run_slot")
+
+    steps = _ScriptedSteps([_broken(mk), _clean(mk)])
+    slot = _run(mk, steps, monkeypatch, emit=bad_emit)
+    assert slot.status is SlotStatus.OK
+
+
+def test_transport_error_surfaces_as_failed_not_propagating(mk):
+    """anthropic.APIError（连接失败/429/5xx）必须在 llm/client.py 里就转成
+    ProviderError——不然它既不是 ProviderError 也不是 LimitExceeded，会原样
+    穿过 run_slot，带崩这一条候选线（以及已经跑完的另外两条）。这里不
+    monkeypatch generate/revise/critic，走的是真实 AnthropicClient。"""
+    import anthropic
+    import httpx
+
+    from tripplan.llm.client import AnthropicClient
+    from tripplan.llm.config import DEFAULT_ROLES
+
+    class _RaisingMessages:
+        def create(self, **kwargs):
+            raise anthropic.APIConnectionError(
+                request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+            )
+
+    client = AnthropicClient(DEFAULT_ROLES, api_key="test-key")
+    client._client = type("FakeAnthropic", (), {"messages": _RaisingMessages()})()
+
+    deps = Deps(client=client, provider=FakeProvider(pois={}))
+    slot = run_slot(angle=ANGLE, seed=None, reqs=_reqs(), tz=TZ, deps=deps)
+
+    assert slot.status is SlotStatus.FAILED
+    assert slot.itinerary is None
+    assert "外部依赖失败" in slot.detail

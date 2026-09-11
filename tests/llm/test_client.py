@@ -1,9 +1,12 @@
 from unittest.mock import MagicMock, patch
 
+import anthropic
+import httpx
 import pytest
 
 from tripplan.llm.client import AnthropicClient, FakeLlm, LlmResponse, ToolCall, Usage
 from tripplan.llm.config import DEFAULT_ROLES, Role, RoleConfig
+from tripplan.providers.base import ProviderError
 
 
 def test_fake_returns_scripted_responses_in_order():
@@ -173,6 +176,27 @@ def test_anthropic_client_with_interleaved_text_and_tools():
         assert response.tool_calls[0].name == "search"
         assert response.tool_calls[1].name == "analyze"
         assert response.stop_reason == "end_turn"
+
+
+def test_anthropic_client_wraps_transport_error_as_provider_error():
+    """anthropic.APIError（连接失败 / 429 / 5xx / 鉴权失败）是外部依赖挂了，
+    不是我们的 bug——run_slot（Task 18）只兜 ProviderError，raw APIError
+    会原样穿透，把整条候选线带崩。转换必须在这里做，而不是在 run_slot
+    里加一个 except 分支。"""
+    configs = DEFAULT_ROLES
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    original = anthropic.APIConnectionError(request=request)
+
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        mock_client_instance = MagicMock()
+        MockAnthropic.return_value = mock_client_instance
+        mock_client_instance.messages.create.side_effect = original
+
+        client = AnthropicClient(configs)
+        with pytest.raises(ProviderError) as exc_info:
+            client.chat(Role.PLANNER, "sys", [], None)
+
+    assert exc_info.value.__cause__ is original  # 原始异常留痕，不是吞掉
 
 
 def test_anthropic_client_omits_tools_when_empty():
