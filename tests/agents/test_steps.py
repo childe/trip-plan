@@ -92,6 +92,40 @@ def test_collect_parses_dates_and_party():
     assert reqs.party.value == Party(adults=2)
 
 
+def test_collect_ignores_invalid_origin_value():
+    """origin 不是合法枚举值时，整条字段当没给，而不是让 collect 崩掉。"""
+    payload = dict(COLLECTED)
+    payload["destination"] = {"value": "京都", "origin": "SYSTEM", "rationale": ""}
+    reqs = collect("x", _deps(_resp(payload)), _ctx())
+    assert reqs.destination.value is None
+    assert reqs.destination.origin is None
+
+
+def test_collect_ignores_lowercase_origin_value():
+    payload = dict(COLLECTED)
+    payload["destination"] = {"value": "京都", "origin": "user", "rationale": ""}
+    reqs = collect("x", _deps(_resp(payload)), _ctx())
+    assert reqs.destination.value is None
+    assert reqs.destination.origin is None
+
+
+def test_collect_falls_back_to_empty_when_party_is_not_an_object():
+    payload = dict(COLLECTED)
+    payload["party"] = {"value": "两人", "origin": "USER", "rationale": ""}
+    reqs = collect("x", _deps(_resp(payload)), _ctx())
+    assert reqs.party.value is None
+    assert reqs.party.origin is None
+
+
+def test_collect_does_not_character_split_a_bare_string_must_visit():
+    """must_visit 是字符串而不是列表时，不能被 list() 拆成单字——
+    拆了会让规则 4 拿单字去搜 POI，全部搜不到，误判成 BLOCKING。"""
+    payload = dict(COLLECTED)
+    payload["must_visit"] = {"value": "环球影城", "origin": "USER", "rationale": ""}
+    reqs = collect("x", _deps(_resp(payload)), _ctx())
+    assert reqs.must_visit.value is None
+
+
 # ---------- pick_angles ----------
 
 
@@ -213,6 +247,50 @@ def test_generate_passes_avoid_list_into_the_prompt():
     assert "B001" in prompt
 
 
+BROKEN_PLAN = {
+    "days": [
+        {
+            "date": "2026-10-01",
+            "lodging": None,
+            "activities": [
+                {
+                    # 缺 poi_query —— 解析必炸
+                    "start": "09:00",
+                    "end": "11:00",
+                    "category": "SIGHT",
+                    "cost": None,
+                    "indoor": False,
+                    "note": "缺 poi_query",
+                },
+                {
+                    "poi_query": "清水寺",
+                    "start": "12:00",
+                    "end": "13:00",
+                    "category": "MEAL",
+                    "cost": None,
+                    "indoor": True,
+                    "note": "",
+                },
+            ],
+        }
+    ]
+}
+
+
+def test_generate_skips_malformed_activity_and_keeps_the_good_one():
+    """一个活动解析失败不该拖垮整份行程——好的那个必须留下，
+    坏的那个要留痕（issues），而不是无声消失或整体报废。"""
+    itin = generate(
+        Requirements(destination=Field("京都", Origin.USER)),
+        _angle(),
+        _deps(_resp(BROKEN_PLAN)),
+        _ctx(),
+    )
+    assert len(itin.days[0].activities) == 1
+    assert itin.days[0].activities[0].poi_query == "清水寺"
+    assert any(i.severity is Severity.WARNING for i in itin.issues)
+
+
 def test_revise_includes_issues_in_the_prompt():
     from tripplan.models.issue import Issue
 
@@ -319,4 +397,9 @@ def test_apply_patch_parses_structured_values():
 
 def test_apply_patch_ignores_unknown_field():
     out = apply_patch(Requirements(), {"wizardry": 1})
+    assert out == Requirements()
+
+
+def test_apply_patch_falls_back_when_party_is_not_an_object():
+    out = apply_patch(Requirements(), {"party": "两人"})
     assert out == Requirements()

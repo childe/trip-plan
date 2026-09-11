@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, replace
 from datetime import date as Date
 from datetime import datetime, time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -63,16 +63,34 @@ class FeedbackDelta:
 
 # ---------- 值解析 ----------
 
+
+def _parse_party(v) -> Party:
+    if not isinstance(v, dict):
+        # party 是三项必填之一：解析不了要降级为「没给」，不能让 AttributeError
+        # 这种没被上面 except 元组接住的异常把整个 collect/apply_patch 炸穿。
+        raise TypeError("party 必须是对象")
+    return Party(
+        adults=v.get("adults", 1),
+        children=v.get("children", 0),
+        seniors=v.get("seniors", 0),
+    )
+
+
+def _parse_str_list(v) -> list[str]:
+    if not isinstance(v, list):
+        # list("环球影城") 会把字符串拆成单字——不炸但更糟：下游拿单字去配
+        # POI，全部配不上，反而误判成「must_visit 没排进去」的 BLOCKING。
+        # 宁可整项当没给，也不能把约束悄悄拆坏。
+        raise TypeError("需要数组，不是字符串")
+    return list(v)
+
+
 _PARSERS = {
     "destination": lambda v: str(v),
     "dates": lambda v: DateRange(
         Date.fromisoformat(v["start"]), Date.fromisoformat(v["end"])
     ),
-    "party": lambda v: Party(
-        adults=v.get("adults", 1),
-        children=v.get("children", 0),
-        seniors=v.get("seniors", 0),
-    ),
+    "party": _parse_party,
     "arrival": lambda v: Transfer(datetime.fromisoformat(v["at"]), v.get("mode", "")),
     "departure": lambda v: Transfer(datetime.fromisoformat(v["at"]), v.get("mode", "")),
     "budget": lambda v: BudgetSpec(
@@ -81,26 +99,30 @@ _PARSERS = {
         Basis(v.get("basis", "TOTAL")),
         frozenset(CostKind(k) for k in v.get("includes", [])),
     ),
-    "styles": list,
+    "styles": _parse_str_list,
     "pace": Pace,
-    "must_visit": list,
-    "avoid": list,
+    "must_visit": _parse_str_list,
+    "avoid": _parse_str_list,
     "lodging_area": str,
-    "constraints": list,
+    "constraints": _parse_str_list,
 }
 
 
 def _to_field(name: str, raw: dict | None) -> Field:
     if not raw or raw.get("value") is None:
         return Field()
-    origin = raw.get("origin")
     try:
         value = _PARSERS[name](raw["value"])
+        # origin 的转换必须也在 try 里——"SYSTEM"、"user"（大小写不对）这类
+        # 不合法取值会让 Origin(...) 抛 ValueError，之前这行在 try 外面，
+        # 一次坏 origin 就能炸穿整个 collect()。
+        raw_origin = raw.get("origin")
+        origin = Origin(raw_origin) if raw_origin else Origin.MODEL
     except (KeyError, ValueError, TypeError):
         return Field()  # 解析不了就当没给，不要塞个坏值进去
     return Field(
         value=value,
-        origin=Origin(origin) if origin else Origin.MODEL,
+        origin=origin,
         confirmed=False,  # 确认是用户的动作，不是抽取的副产品
         rationale=raw.get("rationale", ""),
     )
@@ -301,36 +323,58 @@ def _itinerary_to_json(itin: Itinerary) -> dict:
     }
 
 
+def _to_activity(raw: dict) -> Activity:
+    cost = None
+    if raw.get("cost"):
+        cost = Money(
+            Decimal(str(raw["cost"]["amount"])),
+            raw["cost"].get("currency", "CNY"),
+            Confidence.ESTIMATED,  # 模型给的一律是估算
+            "llm:知识",
+        )
+    try:
+        category = Category(raw["category"])
+    except ValueError:
+        category = Category.SIGHT
+    return Activity(
+        id="",
+        day_id="",
+        poi_query=raw["poi_query"],
+        start=time.fromisoformat(raw["start"]),
+        end=time.fromisoformat(raw["end"]),
+        category=category,
+        cost=cost,
+        indoor=bool(raw.get("indoor", False)),
+        note=raw.get("note", ""),
+    )
+
+
 def _to_itinerary(data: dict, angle: Angle) -> Itinerary:
+    """run_agent 只校验顶层 required（["days"]），不会递归进每个活动的字段——
+    所以一个活动缺 poi_query / start 格式不对 / cost.amount 缺失都可能在这里
+    炸出来。丢掉整份行程会连带炸掉模型排对的其他活动，静默跳过又违反了这个
+    项目一路坚持的规矩：解析不了的东西要留痕，不能装作没发生。所以每个活动
+    单独兜底：解析不出来就跳过它，同时在 itinerary.issues 里记一条 WARNING，
+    留给下游（渲染 / 人工复核）看到「这里少了什么、为什么」。"""
     days = []
-    for raw_day in data["days"]:
+    issues: list[Issue] = []
+    for day_index, raw_day in enumerate(data["days"], start=1):
         acts = []
-        for raw in raw_day["activities"]:
-            cost = None
-            if raw.get("cost"):
-                cost = Money(
-                    Decimal(str(raw["cost"]["amount"])),
-                    raw["cost"].get("currency", "CNY"),
-                    Confidence.ESTIMATED,  # 模型给的一律是估算
-                    "llm:知识",
-                )
+        day_id = f"d{day_index}"  # 与 assign_ids 后续分配的编号对齐
+        for act_index, raw in enumerate(raw_day["activities"], start=1):
             try:
-                category = Category(raw["category"])
-            except ValueError:
-                category = Category.SIGHT
-            acts.append(
-                Activity(
-                    id="",
-                    day_id="",
-                    poi_query=raw["poi_query"],
-                    start=time.fromisoformat(raw["start"]),
-                    end=time.fromisoformat(raw["end"]),
-                    category=category,
-                    cost=cost,
-                    indoor=bool(raw.get("indoor", False)),
-                    note=raw.get("note", ""),
+                acts.append(_to_activity(raw))
+            except (KeyError, ValueError, TypeError, InvalidOperation) as e:
+                issues.append(
+                    Issue(
+                        severity=Severity.WARNING,
+                        source=Source.RULE,
+                        code="UNPARSEABLE_ACTIVITY",
+                        message=f"第 {day_index} 天第 {act_index} 个活动解析失败，"
+                        f"已跳过：{e}",
+                        where=DayRef(day_id),
+                    )
                 )
-            )
         days.append(
             Day(
                 id="",
@@ -339,4 +383,4 @@ def _to_itinerary(data: dict, angle: Angle) -> Itinerary:
                 lodging=raw_day.get("lodging"),
             )
         )
-    return Itinerary(angle=angle, days=days)
+    return Itinerary(angle=angle, days=days, issues=issues)
