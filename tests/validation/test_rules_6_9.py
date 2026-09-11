@@ -7,6 +7,7 @@ from tripplan.models.issue import Severity
 from tripplan.models.itinerary import Category
 from tripplan.models.requirements import Basis, BudgetSpec, CostKind, Pace
 from tripplan.validation.rules import (
+    ALL_RULES,
     run_rule_checks,
     rule_06_budget,
     rule_07_pace,
@@ -158,6 +159,32 @@ def test_r6_warns_on_currency_mismatch(mk):
     assert any("币种" in i.message for i in issues)
 
 
+def test_r6_currency_mismatch_without_budget_does_not_claim_a_budget_conflict(mk):
+    """没有预算时，币种参照是从行程里第一笔有价格的花费推断出来的，
+    不是用户填的预算——不一致的锅不能扣到一个用户从未提供的预算上。"""
+    itin = mk.itin(
+        [
+            mk.day(
+                "d1",
+                D1,
+                [
+                    mk.act("d1a1", "d1", "09:00", "11:00", cost=_cost("100")),
+                    mk.act(
+                        "d1a2",
+                        "d1",
+                        "12:00",
+                        "13:00",
+                        cost=Money(Decimal("4000"), "JPY", Confidence.ESTIMATED, "llm"),
+                    ),
+                ],
+            )
+        ]
+    )
+    issues = rule_06_budget(itin, mk.reqs(), mk.facts())
+    assert any("币种" in i.message for i in issues)
+    assert not any("预算" in i.message for i in issues)
+
+
 # ---------- 规则 7：节奏 ----------
 
 
@@ -199,6 +226,35 @@ def test_r7_packed_allows_more_than_relaxed(mk):
 def test_r7_defaults_to_normal_when_pace_unset(mk):
     itin = mk.itin([mk.day("d1", D1, [mk.act("d1a1", "d1", "09:00", "10:00")])])
     assert rule_07_pace(itin, mk.reqs(), mk.facts()) == []
+
+
+def test_r7_reports_count_and_duration_breaches_independently(mk):
+    """项数超标和在外时长超标是两个不同的问题（对策分别是砍活动/压缩行程），
+    一天里两条都超时必须各报一条——不能因为 elif 只报第一条命中的。
+    8 项、在外 780 分钟，NORMAL 节奏的上限是 6 项 / 600 分钟，两者都超。"""
+    itin = mk.itin(
+        [
+            mk.day(
+                "d1",
+                D1,
+                [
+                    mk.act("d1a1", "d1", "07:00", "07:30"),
+                    mk.act("d1a2", "d1", "08:30", "09:00"),
+                    mk.act("d1a3", "d1", "10:00", "10:30"),
+                    mk.act("d1a4", "d1", "11:30", "12:00"),
+                    mk.act("d1a5", "d1", "13:00", "13:30"),
+                    mk.act("d1a6", "d1", "14:30", "15:00"),
+                    mk.act("d1a7", "d1", "16:00", "16:30"),
+                    mk.act("d1a8", "d1", "19:00", "20:00"),
+                ],
+            )
+        ]
+    )
+    issues = rule_07_pace(itin, mk.reqs(), mk.facts())
+    assert _codes(issues) == ["R7", "R7"]
+    assert _sev(issues) == [Severity.WARNING, Severity.WARNING]
+    assert any("排了" in i.message for i in issues)
+    assert any("在外" in i.message for i in issues)
 
 
 # ---------- 规则 8：三餐 ----------
@@ -318,6 +374,24 @@ def test_r9_silent_when_hours_unknown(mk):
 
 
 # ---------- 汇总 ----------
+
+
+def test_all_rules_is_exactly_the_nine_expected_functions():
+    """两条汇总用例都只挑着断言几个 code，任何一条规则被悄悄从 ALL_RULES
+    里删掉、换成别的函数、或重复放了两次，那两条用例都不会失败——必须
+    直接断言函数名的集合，这是 Task 10「收尾规则集」这件事本身的守卫。"""
+    expected = {
+        "rule_01_no_overlap",
+        "rule_02_transit_gap",
+        "rule_03_date_coverage",
+        "rule_04_must_visit",
+        "rule_05_avoid",
+        "rule_06_budget",
+        "rule_07_pace",
+        "rule_08_meals",
+        "rule_09_opening_hours",
+    }
+    assert {r.__name__ for r in ALL_RULES} == expected
 
 
 def test_run_rule_checks_aggregates_all_nine(mk):

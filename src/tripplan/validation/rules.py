@@ -268,13 +268,17 @@ def rule_06_budget(itin, reqs, facts) -> list[Issue]:
     led = build_ledger(itin, reqs)
 
     if led.currency_mismatch:
-        issues.append(
-            _issue(
-                Severity.WARNING,
-                "R6",
-                f"部分花费的币种与预算（{led.currency}）不一致，未计入合计",
+        # 有预算时，币种基准来自用户填的预算；没有预算时，led.currency 只是
+        # 从行程里第一笔有价格的花费推断出来的——不能把「行程内部币种不一
+        # 致」说成「和一个用户从未填过的预算冲突」。
+        if reqs.budget.value is not None:
+            mismatch_msg = f"部分花费的币种与预算（{led.currency}）不一致，未计入合计"
+        else:
+            mismatch_msg = (
+                f"行程内花费存在不同币种，合计仅按其中一种（{led.currency}）"
+                "计算，其余未计入"
             )
-        )
+        issues.append(_issue(Severity.WARNING, "R6", mismatch_msg))
 
     if not led.over_budget:
         return issues
@@ -332,7 +336,9 @@ def rule_07_pace(itin, reqs, facts) -> list[Issue]:
                     DayRef(day.id),
                 )
             )
-        elif out > limit.max_out_minutes:
+        # 项数超标和在外时长超标是两个不同的问题（对策分别是砍活动/压缩行程），
+        # 各自独立判断——不能用 elif 让第二条命中的事实被吞掉。
+        if out > limit.max_out_minutes:
             issues.append(
                 _issue(
                     Severity.WARNING,
