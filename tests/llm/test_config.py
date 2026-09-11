@@ -42,3 +42,11 @@ def test_load_config_rejects_unknown_role(tmp_path):
     path.write_text('[roles.wizard]\nmodel = "x"\n', encoding="utf-8")
     with pytest.raises(ValueError, match="wizard"):
         load_config(path)
+
+
+def test_load_config_rejects_unknown_field(tmp_path):
+    """配置中的未知字段应该产生 ValueError（不是 TypeError）。"""
+    path = tmp_path / "roles.toml"
+    path.write_text('[roles.critic]\nmdoel = "gpt-5"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="无效"):
+        load_config(path)

@@ -45,7 +45,10 @@ def load_config(path: Path | None = None) -> dict[Role, RoleConfig]:
             role = Role(name)
         except ValueError as e:
             raise ValueError(f"未知角色：{name}") from e
-        cfg[role] = replace(cfg[role], **overrides)
+        try:
+            cfg[role] = replace(cfg[role], **overrides)
+        except TypeError as e:
+            raise ValueError(f"角色 {name} 的配置字段无效：{e}") from e
 
     if cfg[Role.PLANNER].model == cfg[Role.CRITIC].model:
         raise ValueError(

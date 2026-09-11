@@ -56,14 +56,22 @@ class FakeLlm:
         script: list[LlmResponse] | None = None,
         by_role: dict[Role, list[LlmResponse]] | None = None,
     ) -> None:
+        if script is not None and by_role is not None:
+            raise ValueError("FakeLlm 不支持同时指定 script 和 by_role——请选择其中一种")
         self._script = list(script or [])
         self._by_role = {r: list(v) for r, v in (by_role or {}).items()}
         self.calls: list[RecordedCall] = []
 
     def chat(self, role, system, messages, tools) -> LlmResponse:
-        self.calls.append(RecordedCall(role, system, list(messages), tools))
+        self.calls.append(
+            RecordedCall(role, system, list(messages), list(tools) if tools else None)
+        )
         queue = self._by_role.get(role) if self._by_role else self._script
-        assert queue, f"FakeLlm 脚本用尽：role={role}"
+        if not queue:
+            if self._by_role:
+                raise AssertionError(f"该角色未脚本化：role={role}")
+            else:
+                raise AssertionError(f"脚本已用尽：role={role}")
         return queue.pop(0)
 
 
