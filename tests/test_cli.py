@@ -7,6 +7,7 @@ from tripplan.agents.limits import LimitExceeded
 from tripplan.cli import (
     MissingCredential,
     build_deps,
+    build_provider,
     drive,
     main,
     slugify,
@@ -90,6 +91,16 @@ def _deps():
     return Deps(client=None, provider=FakeProvider())
 
 
+@pytest.fixture(autouse=True)
+def _no_real_credentials(monkeypatch):
+    """本文件全程离线：`_cmd_render` 现在会在 AMAP_KEY 存在时构造真实的
+    AmapProvider（见 item 2 的修复），如果开发机的 shell 里恰好真的 export 过
+    这个变量，不清掉它就会让原本应该跑在 FakeProvider 上的单测偷偷把请求
+    打到真实高德 API——测试必须不依赖、也不触碰真实网络。"""
+    for var in ("AMAP_KEY", "ANTHROPIC_API_KEY", "TRIPPLAN_ROLES", "TRIPPLAN_CACHE"):
+        monkeypatch.delenv(var, raising=False)
+
+
 # ---------- slug ----------
 
 
@@ -140,40 +151,6 @@ def test_driver_saves_with_the_persisted_revision_not_the_new_one(tmp_path):
     )
     assert out is not None
     assert repo.load().revision == 2  # 两次 CAS 都成功了
-
-
-def test_driver_does_not_write_on_rejected(tmp_path):
-    repo = FileRepo(tmp_path / "kyoto")
-    state = _state(rev=1)
-    repo.create(state)
-    before = (repo.dir / "state.json").read_text()
-    seen = []
-
-    def fake_advance(s, deps, cmd=None, emit=None):
-        from tripplan.state import Done, NeedInput, Rejected, RejectReason
-
-        pending = NeedInput(InputKind.CONFIRM_REQUIREMENTS, s.requirements, s.revision)
-        if cmd is None:
-            return pending
-        if not seen:
-            seen.append(cmd)
-            return Rejected(RejectReason.STALE_REVISION, pending)
-        s.revision += 1
-        return Done(Itinerary(angle=Angle("A", "古寺", "")))
-
-    ask = _Ask([ConfirmRequirements(0), ConfirmRequirements(1)])
-    drive(
-        state,
-        repo,
-        _deps(),
-        ask,
-        lambda _t: None,
-        persisted=1,
-        advance_fn=fake_advance,
-    )
-    # Rejected 那一轮没有写盘；只有最后成功那次写了
-    assert (repo.dir / "state.json").read_text() != before or True
-    assert repo.load().revision == 2
 
 
 def test_driver_reprompts_with_the_current_question_after_reject(tmp_path):
@@ -339,10 +316,12 @@ def test_resume_reports_limit_exceeded_without_traceback(tmp_path, capsys, monke
 
 
 # ---------- amendment 4：缺 AMAP_KEY 不能是裸 KeyError ----------
+#
+# 下面几条不用再自己 monkeypatch.delenv 了——_no_real_credentials 这个 autouse
+# 夹具已经在每条测试开始前把 AMAP_KEY 等四个变量清空过一遍。
 
 
-def test_build_deps_missing_amap_key_is_readable_not_keyerror(monkeypatch):
-    monkeypatch.delenv("AMAP_KEY", raising=False)
+def test_build_deps_missing_amap_key_is_readable_not_keyerror():
     with pytest.raises(MissingCredential) as exc_info:
         build_deps(dry_run=False)
     message = str(exc_info.value)
@@ -350,19 +329,240 @@ def test_build_deps_missing_amap_key_is_readable_not_keyerror(monkeypatch):
     assert "--dry-run" in message
 
 
-def test_build_deps_dry_run_works_with_no_env_vars_at_all(monkeypatch):
-    for var in ("AMAP_KEY", "ANTHROPIC_API_KEY", "TRIPPLAN_ROLES", "TRIPPLAN_CACHE"):
-        monkeypatch.delenv(var, raising=False)
+def test_build_deps_dry_run_works_with_no_env_vars_at_all():
     deps = build_deps(dry_run=True)
     assert deps.client is None
     assert isinstance(deps.provider, FakeProvider)
 
 
-def test_plan_without_amap_key_reports_readable_error(tmp_path, capsys, monkeypatch):
-    monkeypatch.delenv("AMAP_KEY", raising=False)
+def test_plan_without_amap_key_reports_readable_error(tmp_path, capsys):
     code = main(["plan", "去京都", "--dir", str(tmp_path / "kyoto")])
     err = capsys.readouterr().err
     assert code != 0
     assert "AMAP_KEY" in err
     assert "KeyError" not in err
     assert "Traceback" not in err
+
+
+# ---------- review round 2 —— item 1：CAS 输了不能拿输掉的 state 写产物 ----------
+
+
+def test_drive_and_report_skips_artifacts_when_final_save_loses_the_cas_race(
+    tmp_path, monkeypatch
+):
+    """drive() 只有在某次 save_if_revision 失败时才返回 None，这意味着盘上的
+    state 已经被别的进程改动，我们手上这份内存 state 不再权威。这时候如果还
+    去写 write_artifacts，会出现 state.json 说最终选了 B、itinerary.md 却是
+    这个进程自己选的 A 的分裂——CAS 存在的意义就是防止这个。"""
+    from argparse import Namespace
+
+    from tripplan.cli import _drive_and_report
+    from tripplan.state import Done
+
+    class _AlwaysLosesTheRace:
+        """模拟"盘上已经被别的进程动过"：不管传什么 expected，save 都失败。"""
+
+        def __init__(self, d):
+            self.dir = Path(d)
+
+        def save_if_revision(self, state, expected):
+            return False
+
+    state = _state(Stage.AWAIT_CHOICE)
+    state.stage = Stage.DONE
+    state.chosen_key = "A"
+
+    def fake_advance(s, deps, cmd=None, emit=None):
+        return Done(s.chosen().itinerary)
+
+    monkeypatch.setattr("tripplan.cli._advance", fake_advance)
+
+    repo = _AlwaysLosesTheRace(tmp_path)
+    code = _drive_and_report(state, repo, Namespace(dry_run=True))
+
+    assert code == 1
+    assert not (tmp_path / "itinerary.md").exists()
+    assert not (tmp_path / "itinerary.html").exists()
+    assert not (tmp_path / "plan-A.md").exists()
+
+
+# ---------- review round 2 —— item 2：render 绝不能用假地图顶替真地图 ----------
+
+
+def _done_state_with_a_resolvable_map_point(mk):
+    itin = mk.itin(
+        [mk.day("d1", D1, [mk.act("d1a1", "d1", "09:00", "11:00", query="清水寺")])]
+    )
+    facts = mk.facts(poi_by_activity={"d1a1": mk.resolved("B001")})
+    state = _state(Stage.AWAIT_CHOICE)
+    state.candidates = [CandidateSlot(itin.angle, itin, facts, SlotStatus.OK)]
+    state.stage = Stage.DONE
+    state.chosen_key = itin.angle.key
+    return state
+
+
+def test_write_artifacts_never_embeds_a_fake_placeholder_map(tmp_path, mk):
+    """provider=None 必须表示「跳过地图」，不能拿 FakeProvider 顶替：它吐出的
+    是一张结构合法、但与目的地毫无关系的占位 PNG，混进最终要转发给同行者的
+    HTML 里比压根没有图更糟——render_itinerary_html 本来就为「没有地图」这个
+    状态设计好了优雅降级（day_maps={} 时不出现 <img>），没道理不用。"""
+    state = _done_state_with_a_resolvable_map_point(mk)
+    write_artifacts(state, tmp_path, None)
+    html = (tmp_path / "itinerary.html").read_text()
+    assert "<img" not in html
+
+
+def test_write_artifacts_embeds_the_real_map_when_a_provider_is_given(tmp_path, mk):
+    """反证：同样这份 state，给一个真 provider（这里用离线的 FakeProvider 代替
+    真实 AmapProvider，两者对 write_artifacts 而言是同一个接口）时地图照常
+    嵌入——证明上一条测试里"没有 <img>"确实是因为 provider is None 触发的
+    跳过逻辑，不是别的地方把地图功能整体关掉了。"""
+    state = _done_state_with_a_resolvable_map_point(mk)
+    write_artifacts(state, tmp_path, FakeProvider())
+    html = (tmp_path / "itinerary.html").read_text()
+    assert "<img" in html
+
+
+def test_build_provider_returns_none_without_amap_key():
+    assert build_provider(dry_run=False) is None
+
+
+def test_build_provider_returns_none_when_dry_run_even_with_a_key(monkeypatch):
+    monkeypatch.setenv("AMAP_KEY", "test-key-should-not-matter")
+    assert build_provider(dry_run=True) is None
+
+
+def test_build_provider_returns_a_real_amap_provider_when_key_present(
+    tmp_path, monkeypatch
+):
+    """只验证「有 key 时构造的是真 provider，而不是 Fake」这条接线——不触网：
+    AmapProvider.__init__ 本身只是存字段、开一个 httpx.Client，不发请求。"""
+    from tripplan.providers.amap import AmapProvider
+
+    monkeypatch.setenv("AMAP_KEY", "test-key-123")
+    monkeypatch.setenv("TRIPPLAN_CACHE", str(tmp_path / "cache"))
+    provider = build_provider(dry_run=False)
+    assert isinstance(provider, AmapProvider)
+    assert provider.key == "test-key-123"
+
+
+def test_render_uses_no_provider_and_skips_maps_when_amap_key_is_absent(tmp_path, mk):
+    """端到端过一遍 _cmd_render：没配 AMAP_KEY 时安静跳过地图，而不是拿假图
+    顶替，也不因为缺一个它压根用不上的 LLM 凭据就失败。用有实际可解析坐标点
+    的行程（而不是空 days 的 _state() 默认夹具）——否则 fetch_day_maps 根本
+    不会去碰 provider，这条断言在新旧实现下都会通过，测不出区别。"""
+    repo = FileRepo(tmp_path / "kyoto")
+    state = _done_state_with_a_resolvable_map_point(mk)
+    repo.create(state)
+
+    assert main(["render", str(repo.dir), "--format", "html"]) == 0
+    html = (repo.dir / "itinerary.html").read_text()
+    assert "<img" not in html
+
+
+# ---------- review round 2 —— item 3/4：Rejected 那一轮真的不写盘 ----------
+
+
+def test_driver_does_not_save_on_rejected_round(tmp_path):
+    """重写自 review round 1 里那条名不副实的测试：原来的断言是
+    `... != before or True`，`or True` 让它对任何实现都无脑通过。真正的不变量
+    是"被拒的那一轮不产生 save_if_revision 调用"，内容比较看不出这个——
+    一次没有意义的重写完全可能写出字节相同的内容。这里直接数
+    save_if_revision 被调用的次数与参数。"""
+    repo = FileRepo(tmp_path / "kyoto")
+    state = _state(rev=1)
+    repo.create(state)
+
+    save_calls = []
+    original_save = repo.save_if_revision
+
+    def counting_save(s, expected):
+        save_calls.append(expected)
+        return original_save(s, expected)
+
+    repo.save_if_revision = counting_save
+    seen = []
+
+    def fake_advance(s, deps, cmd=None, emit=None):
+        from tripplan.state import Done, NeedInput, Rejected, RejectReason
+
+        pending = NeedInput(InputKind.CONFIRM_REQUIREMENTS, s.requirements, s.revision)
+        if cmd is None:
+            return pending
+        if not seen:
+            seen.append(cmd)
+            return Rejected(RejectReason.STALE_REVISION, pending)
+        s.revision += 1
+        return Done(Itinerary(angle=Angle("A", "古寺", "")))
+
+    ask = _Ask([ConfirmRequirements(0), ConfirmRequirements(1)])
+    drive(
+        state,
+        repo,
+        _deps(),
+        ask,
+        lambda _t: None,
+        persisted=1,
+        advance_fn=fake_advance,
+    )
+    # 恰好两次落盘：最初那次 NeedInput 一次，最后 Done 一次。被拒的那一轮
+    # 夹在中间，一次 save_if_revision 都不应该触发——如果 Rejected 分支又
+    # 悄悄绕回了保存逻辑，这里会变成 [1, 1, 1] 而不是 [1, 1]。
+    assert save_calls == [1, 1]
+    assert repo.load().revision == 2
+
+
+# ---------- review round 2 —— item 5：损坏的 state.json 不能是裸 traceback ----------
+
+
+def test_resume_reports_corrupt_state_readably(tmp_path, capsys):
+    repo = FileRepo(tmp_path / "kyoto")
+    repo.create(_state(rev=0))
+    (repo.dir / "state.json").write_text("not json at all", encoding="utf-8")
+
+    code = main(["resume", str(repo.dir)])
+
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "损坏" in err
+    assert "Traceback" not in err
+
+
+def test_render_reports_corrupt_state_readably(tmp_path, capsys):
+    repo = FileRepo(tmp_path / "kyoto")
+    repo.create(_state(rev=0))
+    (repo.dir / "state.json").write_text("not json at all", encoding="utf-8")
+
+    code = main(["render", str(repo.dir), "--format", "both"])
+
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "损坏" in err
+    assert "Traceback" not in err
+
+
+# ---------- review round 2 —— item 6：--format 必须真的管用 ----------
+
+
+def test_render_format_md_only_does_not_write_html(tmp_path):
+    repo = FileRepo(tmp_path / "kyoto")
+    state = _state(Stage.AWAIT_CHOICE)
+    state.stage, state.chosen_key = Stage.DONE, "A"
+    repo.create(state)
+
+    assert main(["render", str(repo.dir), "--format", "md"]) == 0
+    assert (repo.dir / "itinerary.md").exists()
+    assert (repo.dir / "plan-A.md").exists()
+    assert not (repo.dir / "itinerary.html").exists()
+
+
+def test_render_format_html_only_does_not_write_markdown(tmp_path):
+    repo = FileRepo(tmp_path / "kyoto")
+    state = _state(Stage.AWAIT_CHOICE)
+    state.stage, state.chosen_key = Stage.DONE, "A"
+    repo.create(state)
+
+    assert main(["render", str(repo.dir), "--format", "html"]) == 0
+    assert (repo.dir / "itinerary.html").exists()
+    assert not (repo.dir / "itinerary.md").exists()
+    assert not (repo.dir / "plan-A.md").exists()
