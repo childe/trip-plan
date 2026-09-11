@@ -6,14 +6,13 @@ UPDATE ... WHERE revision = ? 的影响行数判断，语义完全一致。
 """
 
 import fcntl
-import json
 import os
 import tempfile
 from pathlib import Path
 from typing import Protocol
 
 from tripplan.state import TripState
-from tripplan.wire import dumps, loads
+from tripplan.wire import UnsupportedVersion, dumps, loads
 
 
 class TripExists(Exception):
@@ -81,10 +80,21 @@ class FileRepo:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     def _decode(self, text: str) -> TripState:
-        """把「解析失败」变成一个说得清楚的错误，而不是一截 JSON 栈回溯。"""
+        """把「解析失败」变成一个说得清楚的错误，而不是一截 JSON 栈回溯。
+
+        从用户角度只有两条出路：删目录重来（损坏），或者升级工具（文件是
+        更新版本的工具写的）。这两者必须能分清——版本过新单独放行为
+        UnsupportedVersion，其余任何解析失败（JSON 非法、结构缺字段、字段
+        类型不对……）一律归为损坏。不枚举具体异常类型：任意坏文件能从模型
+        构造函数里激发的异常集合是无界的，枚举是打不完的地鼠。保留
+        `from e`，这样 repo.py/wire.py 里真正的 bug 仍能通过 __cause__ 诊
+        断出来，而不是被误诊成坏文件。
+        """
         try:
             return loads(text)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        except UnsupportedVersion:
+            raise  # 版本过新是另一回事：用户该升级工具，不是删目录
+        except Exception as e:
             raise TripCorrupt(
                 f"{self._state_path} 无法解析：文件已损坏，"
                 "建议删除该 trip 目录后重新运行"

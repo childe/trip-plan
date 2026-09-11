@@ -1,10 +1,15 @@
+import json
 import multiprocessing as mp
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from tripplan.models.common import Field
+from tripplan.models.requirements import Basis, BudgetSpec, Requirements
 from tripplan.repo import FileRepo, TripCorrupt, TripExists, TripNotFound
 from tripplan.state import Stage, TripState
+from tripplan.wire import UnsupportedVersion
 
 
 def _state(rev: int = 0) -> TripState:
@@ -43,6 +48,50 @@ def test_load_corrupt_state_raises_clear_error(tmp_path: Path):
     message = str(exc_info.value)
     assert str(repo.dir / "state.json") in message
     assert "损坏" in message
+
+
+def test_load_null_json_raises_trip_corrupt(tmp_path: Path):
+    """合法 JSON（null）但不是对象：decode_state 对它 .get(...) 会炸
+    AttributeError——这条不在原来枚举的异常类型里，必须也归为 TripCorrupt。"""
+    repo = FileRepo(tmp_path / "kyoto")
+    repo.create(_state(0))
+    (repo.dir / "state.json").write_text("null", encoding="utf-8")
+
+    with pytest.raises(TripCorrupt):
+        repo.load()
+
+
+def test_load_non_numeric_money_amount_raises_trip_corrupt(tmp_path: Path):
+    """结构合法，但 BudgetSpec.amount 不是数字：Decimal(...) 抛
+    decimal.InvalidOperation（ArithmeticError 的子类，不是 ValueError）——
+    同样必须落到 TripCorrupt，而不是裸的 decimal 异常。"""
+    repo = FileRepo(tmp_path / "kyoto")
+    s = _state(0)
+    s.requirements = Requirements(
+        budget=Field(value=BudgetSpec(Decimal("100"), "JPY", Basis.TOTAL, frozenset()))
+    )
+    repo.create(s)
+
+    raw = json.loads((repo.dir / "state.json").read_text(encoding="utf-8"))
+    raw["requirements"]["budget"]["value"]["amount"] = "NOT-A-NUMBER"
+    (repo.dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(TripCorrupt):
+        repo.load()
+
+
+def test_load_too_new_format_version_is_unsupported_not_corrupt(tmp_path: Path):
+    """UnsupportedVersion 是那条例外：文件是更新版本的工具写的，用户该升级
+    工具而不是删目录。回归哨兵——防止以后重构把这条也吞成 TripCorrupt。"""
+    repo = FileRepo(tmp_path / "kyoto")
+    repo.create(_state(0))
+
+    raw = json.loads((repo.dir / "state.json").read_text(encoding="utf-8"))
+    raw["format_version"] = raw["format_version"] + 1000
+    (repo.dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(UnsupportedVersion):
+        repo.load()
 
 
 def test_save_succeeds_when_expected_matches_disk(tmp_path: Path):
