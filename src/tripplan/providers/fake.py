@@ -39,12 +39,18 @@ class FakeProvider:
     def __init__(
         self,
         pois=None,
+        fail_pois=None,
         routes=None,
         fail_routes=None,
         timezones=None,
         opening_hours=None,
     ):
         self._pois = pois or {}
+        # search_poi() already matches _pois by query alone (city is not part
+        # of the key there), so fail_pois mirrors that: a plain set of query
+        # strings. Unlike coordinate pairs, strings have no float-precision
+        # mismatch to normalize away — membership is exact by construction.
+        self._fail_pois = set(fail_pois or set())
         # Normalize route pairs to 6 decimal precision at construction time
         # so that lookups with high-precision coordinates still match
         self._routes = {
@@ -62,6 +68,8 @@ class FakeProvider:
 
     def search_poi(self, query: str, city: str) -> list[PoiFact]:
         self.call_log.append("search_poi")
+        if query in self._fail_pois:
+            raise ProviderError(f"POI 查询失败：{query}")
         return [
             PoiFact(
                 id=pid,

@@ -47,6 +47,12 @@ def test_route_failure_can_be_scripted():
         p.route(LatLng(35.0, 135.0), LatLng(35.1, 135.1), TravelMode.TRANSIT, WHEN)
 
 
+def test_search_failure_can_be_scripted():
+    p = FakeProvider(pois={"清水寺": [("B001", 34.99, 135.78)]}, fail_pois={"清水寺"})
+    with pytest.raises(ProviderError):
+        p.search_poi("清水寺", city="京都")
+
+
 def test_static_map_returns_png_bytes():
     data = FakeProvider().static_map([LatLng(35.0, 135.0)], polyline=None)
     assert data.startswith(b"\x89PNG")

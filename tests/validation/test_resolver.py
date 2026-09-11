@@ -190,3 +190,47 @@ def test_resolve_timezone_uses_destination(mk):
 def test_resolve_timezone_falls_back_to_utc_when_unknown(mk):
     reqs = mk.reqs(destination=Field("虚构城", Origin.MODEL))
     assert resolve_timezone(reqs, _provider()) == "UTC"
+
+
+def test_provider_failure_on_poi_lookup_preserves_error_detail(mk):
+    """服务限流不是「查无此地」——detail 要带上 provider 的原始报错，
+    不能和真查不到时用一样的泛化文案，否则用户会去改一个本来没错的地名。"""
+    provider = _provider(fail_pois={"清水寺"})
+    itin = mk.itin(
+        [mk.day("d1", D1, [mk.act("d1a1", "d1", "09:00", "11:00", query="清水寺")])]
+    )
+    facts = resolve(itin, mk.reqs(), provider, TZ)
+    assert isinstance(facts.poi_by_activity["d1a1"], NotFound)
+    gap = next(g for g in facts.gaps if g.subject == "d1a1")
+    assert gap.kind == GapKind.POI_NOT_FOUND
+    assert gap.detail == "POI 查询失败：清水寺"
+
+
+def test_cross_side_cache_hit_for_shared_place_name(mk):
+    """同一地名既是某天的活动，又出现在 must_visit 里——两侧共用一份缓存。"""
+    itin = mk.itin(
+        [mk.day("d1", D1, [mk.act("d1a1", "d1", "09:00", "11:00", query="清水寺")])]
+    )
+    provider = _provider()
+    resolve(itin, mk.reqs(must_visit=["清水寺"]), provider, TZ)
+    assert provider.call_log.count("search_poi") == 1
+
+
+def test_route_skip_gap_names_which_endpoint_failed(mk):
+    """只有一端没解析出来时，detail 要点名是哪一端，不能笼统说「两端」。"""
+    itin = mk.itin(
+        [
+            mk.day(
+                "d1",
+                D1,
+                [
+                    mk.act("d1a1", "d1", "09:00", "11:00", query="虚构地点"),
+                    mk.act("d1a2", "d1", "13:00", "14:00", query="八坂神社"),
+                ],
+            )
+        ]
+    )
+    facts = resolve(itin, mk.reqs(), _provider(), TZ)
+    gap = next(g for g in facts.gaps if g.kind == GapKind.ROUTE_UNAVAILABLE)
+    assert "虚构地点" in gap.detail
+    assert "八坂神社" not in gap.detail
