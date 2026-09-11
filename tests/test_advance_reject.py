@@ -1,6 +1,10 @@
+import json
+
 import pytest
 
 from tripplan.deps import Deps
+from tripplan.llm.client import FakeLlm, LlmResponse, Usage
+from tripplan.llm.config import Role
 from tripplan.models.common import Field, Origin
 from tripplan.models.itinerary import Angle, Itinerary
 from tripplan.models.requirements import DateRange, Party, Requirements
@@ -157,11 +161,34 @@ def test_missing_required_does_not_fall_back_to_collect():
     assert s.stage is Stage.AWAIT_REQ_CONFIRM
 
 
-@pytest.mark.xfail(strict=True, reason="_apply 由 Task 20 实现；届时本标记应被摘除")
 def test_amend_is_allowed_even_when_required_missing():
-    """只有用户补充了新信息才值得重跑 COLLECT。"""
+    """只有用户补充了新信息才值得重跑 COLLECT。
+
+    AmendRequirements 在 AWAIT_REQ_CONFIRM 会把 stage 推回 COLLECT，advance
+    在同一次调用里就会跑真正的 collect() —— 模块级 `_deps()` 的
+    `client=None` 只够跑本文件其余那些从不触达 _apply/_run_to_pause 的
+    拒绝路径，这里需要一个能实际应答一次 collect 的 FakeLlm。
+    """
     s = _awaiting_confirm(reqs=Requirements())
-    out = advance(s, _deps(), AmendRequirements(3, "目的地是京都"))
+    collected = {
+        "destination": {"value": "京都", "origin": "USER", "rationale": ""},
+        "dates": {"value": None, "origin": None, "rationale": ""},
+        "party": {"value": None, "origin": None, "rationale": ""},
+    }
+    llm = FakeLlm(
+        by_role={
+            Role.CLASSIFIER: [
+                LlmResponse(
+                    "end_turn",
+                    json.dumps(collected, ensure_ascii=False),
+                    [],
+                    Usage(10, 10),
+                )
+            ]
+        }
+    )
+    deps = Deps(client=llm, provider=FakeProvider())
+    out = advance(s, deps, AmendRequirements(3, "目的地是京都"))
     assert not isinstance(out, Rejected)
 
 
@@ -180,7 +207,6 @@ def test_candidate_without_itinerary_is_unselectable():
     assert out.reason is RejectReason.UNSELECTABLE_CANDIDATE
 
 
-@pytest.mark.xfail(strict=True, reason="_apply 由 Task 20 实现；届时本标记应被摘除")
 def test_exhausted_candidate_is_selectable():
     """带着遗留硬伤定稿是用户的权利——问题都摆在他面前了。"""
     s = _awaiting_choice()
