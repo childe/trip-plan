@@ -8,11 +8,7 @@ from tripplan.models.facts import GapKind
 from tripplan.models.issue import Issue, Severity, Source
 from tripplan.models.itinerary import Category
 from tripplan.models.requirements import Basis, BudgetSpec, CostKind
-from tripplan.providers.fake import FakeProvider
-from tripplan.render.itinerary_html import (
-    fetch_day_maps,
-    render_itinerary_html,
-)
+from tripplan.render.itinerary_html import render_itinerary_html
 
 D1 = date(2026, 10, 1)
 
@@ -121,31 +117,6 @@ def test_html_escapes_user_and_model_content(mk):
 def test_output_is_stable_across_repeated_renders(mk):
     args = (_itin(mk), mk.facts(), mk.reqs())
     assert render_itinerary_html(*args) == render_itinerary_html(*args)
-
-
-def test_fetch_day_maps_returns_one_image_per_day(mk):
-    facts = mk.facts(
-        poi_by_activity={"d1a1": mk.resolved("B001"), "d1a2": mk.resolved("B002")}
-    )
-    maps = fetch_day_maps(_itin(mk), facts, FakeProvider())
-    assert set(maps) == {"d1"}
-    assert maps["d1"].startswith(b"\x89PNG")
-
-
-def test_fetch_day_maps_skips_days_without_resolved_coords(mk):
-    maps = fetch_day_maps(_itin(mk), mk.facts(), FakeProvider())
-    assert maps == {}
-
-
-def test_fetch_day_maps_survives_provider_failure(mk):
-    class Broken(FakeProvider):
-        def static_map(self, points, polyline=None):
-            from tripplan.providers.base import ProviderError
-
-            raise ProviderError("限流")
-
-    facts = mk.facts(poi_by_activity={"d1a1": mk.resolved("B001")})
-    assert fetch_day_maps(_itin(mk), facts, Broken()) == {}
 
 
 # ---------- Amendments over the brief ----------

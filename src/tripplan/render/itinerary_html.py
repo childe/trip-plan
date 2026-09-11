@@ -1,16 +1,16 @@
 """单文件自包含 HTML。CSS 内联、图片 base64 —— 断网也能看。
 
-触网的 fetch_day_maps 与纯函数的 render_itinerary_html 分开：
-渲染测试不需要 provider，同一份 state.json 反复渲染结果一致。
+触网的 fetch_day_maps（`tripplan.maps`）与这里纯函数的 render_itinerary_html
+分开成两个模块：渲染测试不需要 provider，同一份 state.json 反复渲染结果一致，
+`render/` 下的模块也就不必也不会引入任何网络依赖。
 """
 
 import base64
 from html import escape
 
 from tripplan.models.common import Confidence
-from tripplan.models.facts import GapKind, Resolved
+from tripplan.models.facts import GapKind
 from tripplan.models.issue import Severity
-from tripplan.providers.base import ProviderError
 from tripplan.validation.budget import build_ledger
 
 _SEV_CLASS = {
@@ -48,28 +48,6 @@ footer { color: #888; font-size: .85rem; margin-top: 2rem; }
   .day { border-color: #333; }
 }
 """
-
-
-def fetch_day_maps(itin, facts, provider) -> dict[str, bytes]:
-    """每天一张带标记与路线的静态图。触网，失败就跳过这一天。"""
-    out: dict[str, bytes] = {}
-    for day in itin.days:
-        points = []
-        for act in day.activities:
-            res = facts.poi_by_activity.get(act.id)
-            if isinstance(res, Resolved):
-                points.append(res.fact.coords)
-        if not points:
-            continue
-        polyline = next(
-            (r.polyline for r in facts.routes if r.day_id == day.id and r.polyline),
-            None,
-        )
-        try:
-            out[day.id] = provider.static_map(points, polyline)
-        except ProviderError:
-            continue  # 少一张图不值得让整份 HTML 出不来
-    return out
 
 
 def _cost_html(cost) -> str:
