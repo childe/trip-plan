@@ -5,15 +5,12 @@
 不按 0 处理，也不假装通过。
 """
 
-from datetime import date as Date
-from datetime import datetime, timedelta
-from decimal import Decimal
+from datetime import timedelta
+from decimal import ROUND_CEILING, Decimal
 from zoneinfo import ZoneInfo
 
-from tripplan.models.facts import FactSnapshot, GapKind
-from tripplan.models.issue import ActivityRef, DayRef, Issue, Severity, Source
-from tripplan.models.itinerary import Itinerary
-from tripplan.models.requirements import Requirements
+from tripplan.models.facts import GapKind
+from tripplan.models.issue import ActivityRef, Issue, Severity, Source
 
 #: 实测耗时之上再留 20%——换乘走错口、等信号、找入口都在这里面。
 TRANSIT_BUFFER = Decimal("1.2")
@@ -88,14 +85,20 @@ def rule_02_transit_gap(itin, reqs, facts) -> list[Issue]:
                     )
                 )
                 continue
-            needed = int(Decimal(route.duration_min) * TRANSIT_BUFFER)
-            if gap < needed:
+            # 不在这里就地取整——40 分钟这种整十数乘 1.2 恰好还是整数，
+            # 会掩盖截断问题；13 分钟乘 1.2 是 15.6，截断成 15 就会把
+            # 15 分钟的间隙误判为够用。比较必须用没有取整的 Decimal。
+            needed = Decimal(route.duration_min) * TRANSIT_BUFFER
+            if Decimal(gap) < needed:
+                # 展示用的整数只能向上取整，不能向下——否则文案会声称
+                # 比实际比较用的门槛更松，跟真正做的判断对不上。
+                needed_display = int(needed.to_integral_value(rounding=ROUND_CEILING))
                 issues.append(
                     _issue(
                         Severity.BLOCKING,
                         "R2",
                         f"{prev.poi_query} 到 {nxt.poi_query} 实测需 "
-                        f"{route.duration_min} 分钟（含缓冲 {needed}），"
+                        f"{route.duration_min} 分钟（含缓冲 {needed_display}），"
                         f"但只留了 {gap} 分钟",
                         ActivityRef(day.id, nxt.id),
                     )
@@ -122,11 +125,9 @@ def rule_03_date_coverage(itin, reqs, facts) -> list[Issue]:
         )
 
     tz = ZoneInfo(facts.trip_timezone)
-    checked_transfer = False
 
     arrival = reqs.arrival.value
     if arrival is not None:
-        checked_transfer = True
         local = arrival.at.astimezone(tz)
         for day in itin.days:
             if day.date != local.date():
@@ -145,7 +146,6 @@ def rule_03_date_coverage(itin, reqs, facts) -> list[Issue]:
 
     departure = reqs.departure.value
     if departure is not None:
-        checked_transfer = True
         local = departure.at.astimezone(tz)
         for day in itin.days:
             if day.date != local.date():
@@ -162,19 +162,59 @@ def rule_03_date_coverage(itin, reqs, facts) -> list[Issue]:
                         )
                     )
 
-    if not checked_transfer:
-        # 只有首末日真排了活动，「按整天计」才可能算多——空的日子没有可担
-        # 心的东西。
-        boundary_dates = {min(wanted), max(wanted)} if wanted else set()
-        boundary_has_activities = any(
-            day.activities for day in itin.days if day.date in boundary_dates
-        )
-        if boundary_has_activities:
+    # 抵达、离开是两件独立的事——任何一侧缺失都必须单独说清楚，不能因为
+    # 另一侧已知就用一个共享标记把这一侧的「未核实」悄悄吞掉。
+    first_date = min(wanted) if wanted else None
+    last_date = max(wanted) if wanted else None
+
+    def _has_activities(d):
+        day = next((day for day in itin.days if day.date == d), None)
+        return day is not None and bool(day.activities)
+
+    # 只有首/末日真排了活动，「按整天计」才可能算多——空的日子没有可担
+    # 心的东西。
+    arrival_missing = (
+        arrival is None and first_date is not None and _has_activities(first_date)
+    )
+    departure_missing = (
+        departure is None and last_date is not None and _has_activities(last_date)
+    )
+
+    if first_date is not None and first_date == last_date:
+        # 单日行程：首末是同一天，缺失哪一侧就在一条消息里点名，不要为
+        # 同一天重复发两条几乎一样的提示。
+        if arrival_missing or departure_missing:
+            if arrival is None and departure is None:
+                sides = "抵达和离开时间"
+            elif arrival is None:
+                sides = "抵达时间"
+            else:
+                sides = "离开时间"
             issues.append(
                 _issue(
                     Severity.WARNING,
                     "R3",
-                    "未提供抵离时间，首末日按整天计——实际可用时间可能更短",
+                    f"未提供{sides}，{first_date.isoformat()} 按整天计——"
+                    "实际可用时间可能更短",
+                )
+            )
+    else:
+        if arrival_missing:
+            issues.append(
+                _issue(
+                    Severity.WARNING,
+                    "R3",
+                    f"未提供抵达时间，第一天（{first_date.isoformat()}）"
+                    "按整天计——实际可用时间可能更短",
+                )
+            )
+        if departure_missing:
+            issues.append(
+                _issue(
+                    Severity.WARNING,
+                    "R3",
+                    f"未提供离开时间，最后一天（{last_date.isoformat()}）"
+                    "按整天计——实际可用时间可能更短",
                 )
             )
     return issues
