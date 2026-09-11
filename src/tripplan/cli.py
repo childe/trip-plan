@@ -53,6 +53,30 @@ def slugify(text: str) -> str:
 # ---------- 交互 ----------
 
 
+def _resolve_candidate_key(typed: str, slots) -> str:
+    """把用户敲的东西对回**真实存在的**候选 key，大小写不敏感。
+
+    原来这里是无条件 `.upper()`。角度 key 由 LLM 自己取名（Angle 的
+    docstring：「由 LLM 自己想，不写死枚举」，prompts/angle.md 里对 key
+    一个字都没提），所以它完全可能是 `foodie`。界面照原样打印
+    `选一份（foodie/…）`，用户照抄 `foodie`，CLI 却送出 `FOODIE` ——
+    `UNKNOWN_CANDIDATE`，而且这个提示下**没有任何输入能成功**：重试多少
+    次都一样，用户已经为一整轮三候选的规划付过钱，唯一出路是 Ctrl-C。
+    （CJK key 侥幸没事，因为 upper() 对它是恒等。）
+
+    修法取「大小写不敏感地匹配真实 key」而不是「在 prompt 里约束 key」：
+    后者依赖模型守规矩，这个项目一路上反复被这个假设打脸；前者不依赖
+    任何人守规矩。对不上就原样传下去——那时 UNKNOWN_CANDIDATE 是一句
+    诚实的话，而不是一个由 CLI 自己制造出来的谎。
+    """
+    folded = typed.casefold()
+    for slot in slots or []:
+        key = getattr(getattr(slot, "angle", None), "key", None)
+        if isinstance(key, str) and key.casefold() == folded:
+            return key  # 回填真实 key，大小写以候选为准
+    return typed
+
+
 def terminal_ask(need: NeedInput):
     if need.kind is InputKind.CONFIRM_REQUIREMENTS:
         print(render_requirement_card(need.payload))
@@ -68,7 +92,7 @@ def terminal_ask(need: NeedInput):
     if not raw:
         return ConfirmRequirements(need.revision)  # 会被拒，重新问
     head, _, rest = raw.partition(" ")
-    key = head.strip().upper()
+    key = _resolve_candidate_key(head.strip(), need.payload)
     return (
         ChooseCandidate(need.revision, key)
         if not rest.strip()

@@ -566,3 +566,151 @@ def test_render_format_html_only_does_not_write_markdown(tmp_path):
     assert (repo.dir / "itinerary.html").exists()
     assert not (repo.dir / "itinerary.md").exists()
     assert not (repo.dir / "plan-A.md").exists()
+
+
+# ---------- 最终评审 C2：terminal_ask 的第一批测试 ----------
+#
+# 这一层此前零覆盖（`grep -rn terminal_ask tests/` 一条都搜不到），而树里
+# 所有夹具用的都是 Angle("A")/("B")/("C") ——本来就是大写，`.upper()` 对它们
+# 是恒等变换，所以那个 bug 在测试里根本没有现身的机会。
+
+
+def _choice_need(*keys, revision=5):
+    slots = [
+        CandidateSlot(
+            Angle(k, f"方案{k}", ""),
+            Itinerary(angle=Angle(k, f"方案{k}", "")),
+            _facts(),
+            SlotStatus.OK,
+        )
+        for k in keys
+    ]
+    from tripplan.state import NeedInput
+
+    return NeedInput(InputKind.CHOOSE_OR_FEEDBACK, slots, revision)
+
+
+def _typed(monkeypatch, text):
+    monkeypatch.setattr("builtins.input", lambda _prompt="": text)
+
+
+@pytest.mark.parametrize(
+    "candidate_key,typed",
+    [
+        ("foodie", "foodie"),  # 照抄界面打印的 key —— 曾经必被拒
+        ("foodie", "FOODIE"),
+        ("A", "a"),
+        ("A", "A"),
+        ("寺社巡礼", "寺社巡礼"),
+    ],
+)
+def test_terminal_ask_matches_candidate_keys_case_insensitively(
+    monkeypatch, capsys, candidate_key, typed
+):
+    """界面显示什么 key，用户敲什么就该认——不分大小写，且回填的一定是
+    候选自己的那个 key（不是用户敲的那个大小写），这样 advance 的
+    _check_candidate 一定能对上。"""
+    from tripplan.cli import terminal_ask
+    from tripplan.state import ChooseCandidate as CC
+
+    _typed(monkeypatch, typed)
+    cmd = terminal_ask(_choice_need(candidate_key))
+    capsys.readouterr()
+
+    assert isinstance(cmd, CC)
+    assert cmd.angle_key == candidate_key
+    assert cmd.expected_revision == 5
+
+
+def test_terminal_ask_key_and_feedback_are_split_and_the_key_still_matches(
+    monkeypatch, capsys
+):
+    from tripplan.cli import terminal_ask
+    from tripplan.state import GiveFeedback as GF
+
+    _typed(monkeypatch, "foodie 第2天太赶了")
+    cmd = terminal_ask(_choice_need("foodie", "寺社巡礼"))
+    capsys.readouterr()
+
+    assert isinstance(cmd, GF)
+    assert cmd.angle_key == "foodie"
+    assert cmd.text == "第2天太赶了"
+
+
+def test_terminal_ask_passes_an_unmatched_key_through_unchanged(monkeypatch, capsys):
+    """对不上任何候选时不要自作聪明地改写输入：原样传下去，
+    UNKNOWN_CANDIDATE 才是一句诚实的话，而不是 CLI 自己制造出来的谎。"""
+    from tripplan.cli import terminal_ask
+    from tripplan.state import ChooseCandidate as CC
+
+    _typed(monkeypatch, "Z")
+    cmd = terminal_ask(_choice_need("foodie"))
+    capsys.readouterr()
+
+    assert isinstance(cmd, CC)
+    assert cmd.angle_key == "Z"
+
+
+def test_terminal_ask_empty_choice_input_asks_again_via_a_rejectable_command(
+    monkeypatch, capsys
+):
+    from tripplan.cli import terminal_ask
+
+    _typed(monkeypatch, "   ")
+    cmd = terminal_ask(_choice_need("A"))
+    capsys.readouterr()
+    assert isinstance(cmd, ConfirmRequirements)  # AWAIT_CHOICE 下会被拒，于是重新问
+
+
+def test_terminal_ask_confirm_stage_empty_confirms_and_text_amends(monkeypatch, capsys):
+    from tripplan.cli import terminal_ask
+    from tripplan.state import AmendRequirements, NeedInput
+
+    need = NeedInput(InputKind.CONFIRM_REQUIREMENTS, _reqs(), 3)
+
+    _typed(monkeypatch, "")
+    assert terminal_ask(need) == ConfirmRequirements(3)
+
+    _typed(monkeypatch, "改成四天")
+    assert terminal_ask(need) == AmendRequirements(3, "改成四天")
+    capsys.readouterr()
+
+
+def test_a_lowercase_angle_key_no_longer_livelocks_the_choice_prompt(
+    monkeypatch, tmp_path, capsys
+):
+    """C2 的端到端回归：LLM 给候选取名 foodie（prompts/angle.md 从没约束过
+    key），界面打印「选一份（foodie/…）」，用户照抄。修复前每一次重试都是
+    UNKNOWN_CANDIDATE，这个提示下没有任何输入能成功，只能 Ctrl-C；修复后
+    第一次就定稿，reject 循环一次都不该转。"""
+    from tripplan.orchestrator import advance
+    from tripplan.cli import terminal_ask
+
+    repo = FileRepo(tmp_path / "kyoto")
+    state = _state(Stage.AWAIT_CHOICE, rev=1)
+    state.candidates = [
+        CandidateSlot(
+            Angle("foodie", "吃遍京都", ""),
+            Itinerary(angle=Angle("foodie", "吃遍京都", "")),
+            _facts(),
+            SlotStatus.OK,
+        )
+    ]
+    state.trip_timezone = "Asia/Tokyo"
+    repo.create(state)
+
+    asked = []
+
+    def ask(need):
+        asked.append(need)
+        assert len(asked) < 4, "又是那个死循环：同一个提示反复问"
+        _typed(monkeypatch, "foodie")
+        return terminal_ask(need)
+
+    itinerary = drive(state, repo, _deps(), ask, lambda _t: None, persisted=1)
+    capsys.readouterr()
+
+    assert itinerary is not None
+    assert len(asked) == 1  # 一次就过，没有被拒后的重问
+    assert state.stage is Stage.DONE
+    assert state.chosen_key == "foodie"
