@@ -1,10 +1,8 @@
 """Markdown 行程单。只读 FactSnapshot，不触网。"""
 
 from tripplan.models.facts import GapKind
-from tripplan.models.issue import Severity
+from tripplan.render import SEVERITY_MARK as _MARK
 from tripplan.validation.budget import build_ledger
-
-_MARK = {Severity.BLOCKING: "🔴", Severity.WARNING: "🟡", Severity.SUGGESTION: "⚪"}
 
 
 def _transit_line(facts, day, prev, nxt) -> str:

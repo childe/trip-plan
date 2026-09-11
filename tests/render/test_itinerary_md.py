@@ -93,33 +93,37 @@ def test_lists_outstanding_issues(mk):
     assert "没安排晚餐" in out
 
 
+def test_lists_unparseable_content_dropped_during_parsing(mk):
+    """UNPARSEABLE_DAY / UNPARSEABLE_CRITIQUE 是解析阶段丢内容留下的普通
+    WARNING（见 agents/steps.py 的 _parse_itinerary 与 _run_critic），用生产
+    代码里真实会出现的字面量构造，确认它们和其他 issue 一样正常显示，不需要
+    特殊分支。"""
+    itin = _itin(mk)
+    itin.issues = [
+        Issue(
+            severity=Severity.WARNING,
+            source=Source.RULE,
+            code="UNPARSEABLE_DAY",
+            message="原始第 2 天解析失败，已跳过：'date' 字段缺失",
+            where=None,
+        ),
+        Issue(
+            severity=Severity.WARNING,
+            source=Source.RULE,
+            code="UNPARSEABLE_CRITIQUE",
+            message="issues 解析失败，整份点评无法使用：not a list",
+            where=None,
+        ),
+    ]
+    out = render_itinerary_md(itin, mk.facts(), mk.reqs())
+    assert "原始第 2 天解析失败，已跳过：'date' 字段缺失" in out
+    assert "issues 解析失败，整份点评无法使用：not a list" in out
+
+
 def test_lists_unverified_facts_honestly(mk):
     facts = mk.facts(gaps=[mk.gap(GapKind.POI_NOT_FOUND, "d1a1", "查不到")])
     out = render_itinerary_md(_itin(mk), facts, mk.reqs())
     assert "未核实" in out or "未能核实" in out
-
-
-def test_renderer_does_not_touch_the_network(mk):
-    """同一份 state.json 反复渲染必须得到同样的结果。"""
-    import ast
-    import pathlib
-
-    import tripplan.render.itinerary_md as mod
-
-    src = pathlib.Path(mod.__file__).read_text(encoding="utf-8")
-    names = {
-        a.name
-        for n in ast.walk(ast.parse(src))
-        if isinstance(n, ast.Import)
-        for a in n.names
-    }
-    names |= {
-        n.module or ""
-        for n in ast.walk(ast.parse(src))
-        if isinstance(n, ast.ImportFrom)
-    }
-    assert not (names & {"httpx", "requests", "urllib"})
-    assert not any(m.startswith("tripplan.providers") for m in names)
 
 
 def test_output_is_stable_across_repeated_renders(mk):

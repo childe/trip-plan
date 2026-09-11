@@ -1,9 +1,7 @@
 """三份候选并排。遗留问题是用户挑选方案的重要依据，必须显示。"""
 
-from tripplan.models.issue import Severity
+from tripplan.render import SEVERITY_MARK as _MARK
 from tripplan.state import SlotStatus
-
-_MARK = {Severity.BLOCKING: "🔴", Severity.WARNING: "🟡", Severity.SUGGESTION: "⚪"}
 
 
 def render_candidates(slots) -> str:
@@ -33,5 +31,8 @@ def render_candidates(slots) -> str:
         lines.append("")
 
     keys = "/".join(s.angle.key for s in slots if s.itinerary is not None)
-    lines += [f"选一份（{keys}），或对某一份提修改意见，或直接说需求要改。"]
+    if keys:
+        lines += [f"选一份（{keys}），或对某一份提修改意见，或直接说需求要改。"]
+    else:
+        lines += ["候选全部生成失败，没有可选的方案——请先修改需求后重试。"]
     return "\n".join(lines)
