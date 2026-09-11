@@ -915,7 +915,7 @@ v1 的票价来自 LLM 知识（`confidence=ESTIMATED`），而且 `cost` 允许
 BLOCKING。这个条件在 v1 基本不会满足，接入真实票价 API 后自然生效——
 和规则 #9 是同一个道理，早先版本对 #9 做了诚实降级却漏了 #6，是内部不一致。
 
-### 5.2 LLM critic（`validation/critic.py`）
+### 5.2 LLM critic（实现在 `agents/steps.run_llm_critic`）
 
 **必须使用与 planner 不同的模型。** planner 对自己的输出有系统性盲点，同源 critic
 容易"英雄所见略同"地放过同一个问题。理想情况换厂商；若只有单一厂商，退而使用不同
@@ -1128,7 +1128,10 @@ trip-plan/
 │   ├── state.py                   # TripState、Stage、Command/Outcome
 │   ├── repo.py                    # StateRepo Protocol + FileRepo（CAS，§3.8）
 │   ├── wire.py                    # JSON encoder/decoder + format_version 迁移
+│   ├── maps.py                    # 静态地图字节（渲染链路唯一触网点，不进 FactSnapshot）
 │   ├── models/
+│   │   ├── common.py              # Field / Money / Origin / Confidence / LatLng
+│   │   ├── facts.py               # FactSnapshot / PoiFact / RouteFact / Gap
 │   │   ├── requirements.py
 │   │   ├── itinerary.py
 │   │   └── issue.py
@@ -1137,17 +1140,20 @@ trip-plan/
 │   │   └── config.py
 │   ├── agents/
 │   │   ├── runner.py              # run_agent：tool loop + schema 校验重试
+│   │   ├── schemas.py             # 各角色输出 schema（type 由 runner 递归执行）
+│   │   ├── steps.py               # collect / pick_angles / generate / critic / classify
+│   │   ├── tools.py               # 给 LLM 调的工具 + 注册表
 │   │   └── prompts/               # collect / angle / plan / critic / classify.md
-│   ├── tools/                     # 给 LLM 调的工具 + 注册表
 │   ├── providers/
 │   │   ├── base.py                # Protocol
 │   │   ├── amap.py
+│   │   ├── cache.py
 │   │   └── fake.py
 │   ├── validation/
-│   │   ├── resolver.py            # Itinerary → FactSnapshot（唯一触网点）
+│   │   ├── resolver.py            # Itinerary → FactSnapshot（校验链路唯一触网点）
 │   │   ├── rules.py               # 9 条规则，纯函数，只消费 FactSnapshot
-│   │   ├── diversity.py           # 候选差异度检查，§6.1
-│   │   └── critic.py
+│   │   ├── budget.py              # 分层账单，§5.1
+│   │   └── diversity.py           # 候选差异度检查，§6.1
 │   └── render/
 │       ├── requirement_card.py
 │       ├── candidates.py
@@ -1192,7 +1198,8 @@ $ trip render ./trips/kyoto --format html
 
 三个子命令的分工：`plan` 建新 trip（`repo.create`），`resume` 载入既有 trip，
 两者之后共用同一个 driver 循环；`render` 只读 `state.json` 重新生成投影，
-不推进状态、不触网。
+不推进状态、不写回 `state.json`；有 `AMAP_KEY` 时会为当天地图取一次图
+（`maps.py`，见 §8.1），没有就整份跳过地图——**绝不拿占位图顶替**。
 
 产物落在 `./trips/<slug>/`：
 
