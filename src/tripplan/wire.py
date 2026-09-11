@@ -172,8 +172,10 @@ def _un_requirements(d: dict) -> Requirements:
 
 
 def _issue(i: Issue) -> dict:
-    where = None
-    if isinstance(i.where, ActivityRef):
+    """i.where 是判别式联合，必须显式穷举——见 _resolution 的同一套规则。"""
+    if i.where is None:
+        where = None
+    elif isinstance(i.where, ActivityRef):
         where = {
             "kind": "ActivityRef",
             "day_id": i.where.day_id,
@@ -181,6 +183,8 @@ def _issue(i: Issue) -> dict:
         }
     elif isinstance(i.where, DayRef):
         where = {"kind": "DayRef", "day_id": i.where.day_id}
+    else:
+        raise TypeError(f"未知的 Issue.where: {i.where!r}")
     return {
         "severity": i.severity.value,
         "source": i.source.value,
@@ -192,11 +196,14 @@ def _issue(i: Issue) -> dict:
 
 def _un_issue(d: dict) -> Issue:
     w = d["where"]
-    where = None
-    if w and w["kind"] == "ActivityRef":
+    if w is None:
+        where = None
+    elif w["kind"] == "ActivityRef":
         where = ActivityRef(w["day_id"], w["activity_id"])
-    elif w and w["kind"] == "DayRef":
+    elif w["kind"] == "DayRef":
         where = DayRef(w["day_id"])
+    else:
+        raise UnsupportedVersion(f"未知的 Issue.where kind: {w['kind']}")
     return Issue(
         Severity(d["severity"]), Source(d["source"]), d["code"], d["message"], where
     )
@@ -422,7 +429,11 @@ def encode_state(s: TripState) -> dict:
 
 def decode_state(raw: dict) -> TripState:
     version = raw.get("format_version")
-    if version is None or version > FORMAT_VERSION:
+    if version is None:
+        raise UnsupportedVersion(
+            "state.json 缺少 format_version 字段；不是可识别的 state.json"
+        )
+    if version > FORMAT_VERSION:
         raise UnsupportedVersion(
             f"state.json 版本 {version} 高于本工具支持的 {FORMAT_VERSION}；"
             "请升级 tripplan，而不是用旧代码去解析新结构"
@@ -432,7 +443,13 @@ def decode_state(raw: dict) -> TripState:
         if migrate is None:
             raise UnsupportedVersion(f"缺少从版本 {version} 升级的迁移函数")
         raw = migrate(raw)
-        version = raw["format_version"]
+        new_version = raw["format_version"]
+        if new_version <= version:
+            # 迁移函数必须推进版本号；否则这个 while 循环会原地死转。
+            raise UnsupportedVersion(
+                f"迁移函数未能推进版本号：{version} -> {new_version}"
+            )
+        version = new_version
 
     s = TripState(
         run_id=raw["run_id"],

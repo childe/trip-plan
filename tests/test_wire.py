@@ -15,7 +15,7 @@ from tripplan.models.facts import (
     Resolved,
     RouteFact,
 )
-from tripplan.models.issue import ActivityRef, Issue, Severity, Source
+from tripplan.models.issue import ActivityRef, DayRef, Issue, Severity, Source
 from tripplan.models.itinerary import Activity, Angle, Category, Day, Itinerary
 from tripplan.models.requirements import (
     Basis,
@@ -248,3 +248,45 @@ def test_slot_without_itinerary_roundtrips():
     assert b.itinerary is None and b.facts is None
     assert b.status is SlotStatus.FAILED
     assert b.detail == "高德限流"
+
+
+def test_issue_with_dayref_roundtrips():
+    state = _full_state()
+    state.issues.append(
+        Issue(Severity.WARNING, Source.RULE, "R9", "整天没安排", where=DayRef("d1"))
+    )
+    restored = loads(dumps(state))
+    day_issue = restored.issues[-1]
+    assert isinstance(day_issue.where, DayRef)
+    assert day_issue.where.day_id == "d1"
+
+
+def test_decoding_unrecognized_where_kind_raises_unsupported_version():
+    """kind 是 tagged union 的判别标签——遇到不认识的值必须报错，不能悄悄丢
+
+    where。参见 _resolution/_un_resolution 对 PoiResolution 的同一套处理。"""
+    raw = json.loads(dumps(_full_state()))
+    raw["candidates"][0]["itinerary"]["issues"][0]["where"]["kind"] = "Bogus"
+    with pytest.raises(UnsupportedVersion):
+        loads(json.dumps(raw))
+
+
+def test_encoding_unrecognized_where_type_raises_type_error():
+    state = _full_state()
+    state.issues.append(
+        Issue(Severity.WARNING, Source.RULE, "R9", "坏引用", where="not-a-ref")
+    )
+    with pytest.raises(TypeError):
+        dumps(state)
+
+
+def test_migration_that_fails_to_advance_version_raises():
+    """迁移函数忘了推进 format_version 必须立刻报错，而不是让 while 循环原地死转。"""
+    raw = json.loads(dumps(_full_state()))
+    raw["format_version"] = 0
+    MIGRATIONS[0] = lambda d: d  # 没有把 format_version 改成 1
+    try:
+        with pytest.raises(UnsupportedVersion):
+            loads(json.dumps(raw))
+    finally:
+        del MIGRATIONS[0]
