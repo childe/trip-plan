@@ -194,7 +194,8 @@ outcome = advance(state, emit=print_progress)
 while True:
     match outcome:
         case Done(itinerary):
-            repo.save_if_revision(state, persisted)
+            if not repo.save_if_revision(state, persisted):
+                return conflict()      # 不能报成功却没写盘
             return itinerary
         case Rejected(reason, current):
             warn(reason)                      # 如"这份候选没跑出结果，换一个"
@@ -223,6 +224,8 @@ def submit(id, payload):
   因此拒绝路径永远不需要写盘。
 - **`persisted` 只在 CAS 成功后前进。** 它跟踪的是"盘上是什么"，不是"内存里是
   什么"；把两者混为一谈正是上一版 CLI 那行必然失败的 CAS 的成因。
+- **每一次 `save_if_revision` 的返回值都要看，`Done` 分支尤其。** 定稿是用户唯一
+  真正在意的那次写入；CAS 失败却打印"✅ 已定稿"，等于告诉用户一件没发生的事。
 
 `repo.create()` 与 `save_if_revision()` 分开：新 trip 盘上无物，没有可比较的
 revision，用 CAS 表达"创建"只能靠约定一个哨兵值，不如给它一个自己的方法——
@@ -313,6 +316,10 @@ class TripState:
 
 ```python
 def advance(state, cmd: Command | None = None, emit=noop) -> Outcome:
+    # ⓪ 终态幂等：已定稿的行程反复查询只回同一个答案
+    if state.stage is Stage.DONE:
+        return Done(state.chosen().itinerary)
+
     # ① 校验：所有拒绝与空查询都在这里返回 —— 不改状态、不递增 revision
     if state.stage in AWAITING:
         if cmd is None:
@@ -422,9 +429,19 @@ def _pending(state) -> NeedInput:
    `expected=3` 提交，后者仍能覆盖前者。**依赖"所有路径碰巧都会走到 `_pause`"
    是靠不住的**，现在递增收敛到 `advance` 里唯一一处，位于校验之后、返回之前，
    结构上覆盖包括 DONE 在内的每一条修改路径。
+5. **终态不幂等。** `DONE` 不在 `AWAITING` 里，于是无命令调用会一路走到
+   `_run_to_pause` 拿到 `Done`，再照样 `revision += 1`——重复 `trip resume` 一个
+   已定稿的行程会不断改版本号，还会让别人手里的 `expected_revision` 平白失效。
+   带命令重放更糟：落到 `Rejected(..., _pending(state))`，而 `_pending` 对 DONE
+   只能硬凑一个 `CHOOSE_OR_FEEDBACK`，**伪造一个根本不存在的待答问题**。
+   ⓪ 号分支因此必须在最前面。
 
-由此得到一条可测的不变量：**`advance` 要么拒绝（状态不变、`revision` 不变），
-要么修改（`revision` 恰好 +1）**。测试直接断言这个二分，而不是逐条路径去数。
+**它只拦「进来时就已经是 DONE」。** `ChooseCandidate` 把 stage 推到 DONE 的那一次
+仍然走正常路径并递增 `revision`——否则第 4 条又会回来。
+
+由此得到一条可测的不变量：**`advance` 要么拒绝（状态与 `revision` 均不变），
+要么修改（`revision` 恰好 +1），要么在终态幂等返回（同样不变）**。
+测试直接断言这个三分，而不是逐条路径去数。
 
 `_pending()` 是纯函数：等待态可以被反复查询而不产生副作用，这也让 driver 的
 "重新渲染一次当前问题"变成零成本操作。
@@ -615,7 +632,10 @@ def missing_required(reqs) -> list[str]:
 | 模型推断"预算按人均 3000" | 有 | `MODEL` | 确认前 `False`，确认后 `True` |
 | 目的地没说 | `None` | `None` | `False` |
 
-`ConfirmRequirements` 把所有字段的 `confirmed` 置 `True`，**不动 `origin`**。
+`ConfirmRequirements` 把**有取值的**字段的 `confirmed` 置 `True`，**不动 `origin`**。
+`value is None` 的字段保持 `confirmed=False`——空值的语义是 `origin=None,
+confirmed=False`，把一个"用户压根没提"的可选字段标成已确认是自相矛盾的，
+下游也就再分不清"确认过不需要"和"从没问过"。
 需求卡标灰的判据是 `origin is MODEL and not confirmed`；定稿后回看行程时，
 `origin is MODEL` 依然告诉你哪些前提是猜的。
 

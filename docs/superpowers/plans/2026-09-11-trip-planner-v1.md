@@ -6924,8 +6924,9 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 2. 原 `_apply_human_input` 用 `match state.stage` 分派，不匹配就什么也不做——**用户以为提交成功了**。
 3. `chosen_key` 完全不校验，任意字符串都能写进去，崩溃点被推迟到 `Done` 那一行。
 4. `revision` 的递增点原先藏在 `_pause()` 里，而 `ChooseCandidate → DONE` 不经过它，**CAS 可被绕过**。
+5. **终态不幂等**：`DONE` 不在 `AWAITING` 里，于是 `advance(state, cmd=None)` 会一路走到 `_run_to_pause` 拿到 `Done`，然后照样 `revision += 1`——重复 `trip resume` 一个已定稿的行程，会不断改版本号，还会让别人手里的 `expected_revision` 平白失效。带命令重放时更糟：走 `Rejected(..., _pending(state))`，而 `_pending` 对 DONE 只能硬凑一个 `CHOOSE_OR_FEEDBACK`——**伪造一个根本不存在的待答问题**。
 
-因此本任务确立的核心不变量是：**`advance` 要么拒绝（状态与 `revision` 均不变），要么修改（`revision` 恰好 +1）**。测试直接断言这个二分，而不是逐条路径去数——上一条漏掉的正是「逐条枚举」漏出来的。
+因此本任务确立的核心不变量是：**`advance` 要么拒绝（状态与 `revision` 均不变），要么修改（`revision` 恰好 +1），要么在终态幂等返回（同样不变）**。测试直接断言这个三分，而不是逐条路径去数——上面几条漏掉的正是「逐条枚举」漏出来的。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -6946,6 +6947,7 @@ from tripplan.state import (
     CandidateSlot,
     ChooseCandidate,
     ConfirmRequirements,
+    Done,
     GiveFeedback,
     InputKind,
     NeedInput,
@@ -7147,6 +7149,49 @@ def test_awaiting_stages_are_all_covered_by_allowed_commands():
     from tripplan.state import ALLOWED_COMMANDS
 
     assert set(ALLOWED_COMMANDS) == set(AWAITING)
+
+
+# ---------- 终态幂等 ----------
+
+
+def _done_state() -> TripState:
+    s = _awaiting_choice()
+    s.stage = Stage.DONE
+    s.chosen_key = "A"
+    return s
+
+
+def test_done_state_returns_the_itinerary_without_a_command():
+    """重复 resume 一个已定稿的行程，只回同一个答案。"""
+    s = _done_state()
+    out = advance(s, _deps(), None)
+    assert isinstance(out, Done)
+    assert out.itinerary.angle.key == "A"
+
+
+def test_done_state_does_not_bump_revision():
+    """否则每次 resume 都无意义地改版本，还会让别人的 expected_revision 失效。"""
+    s = _done_state()
+    before, snapshot = s.revision, dumps(s)
+    advance(s, _deps(), None)
+    advance(s, _deps(), None)
+    assert s.revision == before
+    assert dumps(s) == snapshot
+
+
+def test_done_state_is_idempotent_across_repeated_calls():
+    s = _done_state()
+    assert advance(s, _deps(), None) == advance(s, _deps(), None)
+
+
+def test_command_replayed_against_done_returns_done_not_rejected():
+    """DONE 没有待回答的问题，构造 Rejected(..., _pending(state)) 会伪造一个
+    根本不存在的 NeedInput。"""
+    s = _done_state()
+    out = advance(s, _deps(), ChooseCandidate(s.revision, "B"))
+    assert isinstance(out, Done)
+    assert out.itinerary.angle.key == "A"      # 不会改选
+    assert s.chosen_key == "A"
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -7187,6 +7232,13 @@ def _noop(_event) -> None:
 
 
 def advance(state, deps, cmd=None, emit=_noop):
+    # ⓪ 终态幂等：已定稿的行程反复查询只回同一个答案，不改状态、不递增 revision。
+    #    这个分支必须在 _apply 之前 —— ChooseCandidate 把 stage 推到 DONE 的那一次
+    #    仍要走下面的正常路径并递增 revision（否则并发选择又能互相覆盖）。
+    #    这里处理的只是「进来时就已经是 DONE」。
+    if state.stage is Stage.DONE:
+        return Done(state.chosen().itinerary)
+
     # ① 校验：所有拒绝与空查询都在这里返回 —— 不改状态、不递增 revision
     if state.stage in AWAITING:
         if cmd is None:
@@ -7256,7 +7308,8 @@ def _run_to_pause(state, deps, emit):
 - [ ] **Step 4: 运行确认——拒绝路径全绿，其余按预期 NotImplementedError**
 
 Run: `uv run pytest tests/test_advance_reject.py -v`
-Expected: PASS（19 passed）。所有测试都只走拒绝或 `_pending` 路径，不会碰到未实现的函数。
+Expected: PASS（23 passed）。所有测试都只走「DONE 早返回 / 拒绝 / `_pending`」三条路径，
+不会碰到 Task 20 才补全的 `_apply` 与 `_run_to_pause`。
 
 - [ ] **Step 5: 格式化并提交**
 
@@ -7760,6 +7813,9 @@ def _run_to_pause(state, deps, emit):
                 return _pending(state)
 
             case Stage.DONE:
+                # 仍然可达，且必须保留：ChooseCandidate 在 _apply 里把 stage 推到
+                # DONE，然后落到这里返回——那一次要经过 advance 的递增点。
+                # advance 顶部的 DONE 早返回只拦「进来时就已经是 DONE」。
                 return Done(state.chosen().itinerary)
 ```
 
