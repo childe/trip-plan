@@ -157,6 +157,7 @@ def test_missing_required_does_not_fall_back_to_collect():
     assert s.stage is Stage.AWAIT_REQ_CONFIRM
 
 
+@pytest.mark.xfail(strict=True, reason="_apply 由 Task 20 实现；届时本标记应被摘除")
 def test_amend_is_allowed_even_when_required_missing():
     """只有用户补充了新信息才值得重跑 COLLECT。"""
     s = _awaiting_confirm(reqs=Requirements())
@@ -179,6 +180,7 @@ def test_candidate_without_itinerary_is_unselectable():
     assert out.reason is RejectReason.UNSELECTABLE_CANDIDATE
 
 
+@pytest.mark.xfail(strict=True, reason="_apply 由 Task 20 实现；届时本标记应被摘除")
 def test_exhausted_candidate_is_selectable():
     """带着遗留硬伤定稿是用户的权利——问题都摆在他面前了。"""
     s = _awaiting_choice()
