@@ -1,12 +1,10 @@
-import json
 import multiprocessing as mp
 from pathlib import Path
 
 import pytest
 
-from tripplan.repo import FileRepo, TripExists, TripNotFound
+from tripplan.repo import FileRepo, TripCorrupt, TripExists, TripNotFound
 from tripplan.state import Stage, TripState
-from tripplan.wire import dumps
 
 
 def _state(rev: int = 0) -> TripState:
@@ -31,6 +29,20 @@ def test_create_refuses_to_overwrite(tmp_path: Path):
 def test_load_missing_trip_raises(tmp_path: Path):
     with pytest.raises(TripNotFound):
         FileRepo(tmp_path / "nope").load()
+
+
+def test_load_corrupt_state_raises_clear_error(tmp_path: Path):
+    """损坏的 state.json 应该报一个说得清楚的错误，而不是原始 JSON 栈回溯。"""
+    repo = FileRepo(tmp_path / "kyoto")
+    repo.create(_state(0))
+    (repo.dir / "state.json").write_text("not json at all", encoding="utf-8")
+
+    with pytest.raises(TripCorrupt) as exc_info:
+        repo.load()
+
+    message = str(exc_info.value)
+    assert str(repo.dir / "state.json") in message
+    assert "损坏" in message
 
 
 def test_save_succeeds_when_expected_matches_disk(tmp_path: Path):
@@ -96,13 +108,24 @@ def test_concurrent_writers_exactly_one_wins(tmp_path: Path):
     assert repo.load().revision == 1
 
 
-def test_write_is_atomic_no_partial_file(tmp_path: Path):
-    """临时文件 + os.replace：目录里不该留下半截文件。"""
+def test_replace_failure_leaves_old_state_and_no_tmp_file(tmp_path: Path, monkeypatch):
+    """临时文件 + os.replace 才是真原子：os.replace 中途失败时，旧
+    state.json 必须原封不动，目录里也不该留下 .tmp 半截文件。一个直接写
+    state.json（不经过临时文件）的实现在这里会失败。"""
     repo = FileRepo(tmp_path / "kyoto")
     repo.create(_state(0))
+    before = (repo.dir / "state.json").read_text()
+
+    def _boom(*args, **kwargs):
+        raise OSError("simulated os.replace failure")
+
+    monkeypatch.setattr("tripplan.repo.os.replace", _boom)
+
     s = repo.load()
     s.revision = 1
-    repo.save_if_revision(s, expected=0)
+    with pytest.raises(OSError):
+        repo.save_if_revision(s, expected=0)
+
+    assert (repo.dir / "state.json").read_text() == before
     names = {p.name for p in repo.dir.iterdir()}
     assert names == {"state.json", ".lock"}
-    json.loads((repo.dir / "state.json").read_text())  # 合法 JSON
