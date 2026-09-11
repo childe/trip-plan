@@ -166,6 +166,23 @@ def test_collect_degrades_when_a_parser_raises_an_unexpected_exception_type():
     assert reqs.destination.origin is None
 
 
+def test_collect_falls_back_when_a_field_envelope_is_flattened():
+    """模型偶尔会把信封拍平，直接给 "destination": "京都" 而不是
+    {"value": "京都", "origin": ..., "rationale": ...}。_to_field 原来在
+    `raw.get("value") is None` 这行就先调用了 .get()，如果 raw 是个非空
+    字符串（"京都"），not raw 为 False，直接 raw.get(...) 就
+    AttributeError——一个字段被拍平就能炸穿其余十一个字段的抽取。"""
+    payload = dict(COLLECTED)
+    payload["destination"] = "京都"  # 信封被压平
+    reqs = collect("x", _deps(_resp(payload)), _ctx())
+    assert reqs.destination.value is None
+    assert reqs.destination.origin is None
+    # 其余字段完全不受这一个坏字段影响，照常解析
+    assert reqs.dates.value.days == 5
+    assert reqs.party.value == Party(adults=2)
+    assert reqs.pace.value is Pace.RELAXED
+
+
 # ---------- pick_angles ----------
 
 
@@ -486,6 +503,34 @@ def test_generate_skips_day_missing_activities_key_and_keeps_the_good_day():
     assert any(i.severity is Severity.WARNING for i in itin.issues)
 
 
+def test_generate_returns_empty_itinerary_with_warning_when_days_is_null():
+    """{"days": null} 这种整个容器都不对的输入——run_agent 只查顶层
+    required 是否"存在"这个键，不管值是不是数组，所以 data["days"] 可能
+    是 None。对 None 做 enumerate() 会直接 TypeError，炸穿整份行程。
+    应该退化成空行程 + 一条 WARNING，而不是崩溃。"""
+    itin = generate(
+        Requirements(destination=Field("京都", Origin.USER)),
+        _angle(),
+        _deps(_resp({"days": None})),
+        _ctx(),
+    )
+    assert itin.days == []
+    assert any(i.severity is Severity.WARNING for i in itin.issues)
+
+
+def test_generate_returns_empty_itinerary_with_warning_when_days_is_a_scalar():
+    """days 是标量（比如一个字符串）时同样不是数组——须与 null 走同一条
+    退化路径，而不是被当成可迭代对象逐字符拆开、逐个当"天"去解析。"""
+    itin = generate(
+        Requirements(destination=Field("京都", Origin.USER)),
+        _angle(),
+        _deps(_resp({"days": "京都"})),
+        _ctx(),
+    )
+    assert itin.days == []
+    assert any(i.severity is Severity.WARNING for i in itin.issues)
+
+
 def test_revise_includes_issues_in_the_prompt():
     from tripplan.models.issue import Issue
 
@@ -533,7 +578,11 @@ def test_critic_tolerates_empty_verdict():
 def test_critic_skips_issue_missing_message_and_keeps_the_valid_one():
     """run_agent 只校验顶层 required（["issues"]），不会递归进每条 issue 的
     ["severity","message"]——缺 message 的一条点评是丢了一个意见，不该拖垮
-    整份点评。"""
+    整份点评。
+
+    这里只断言"能解析出来的那条点评"确实幸存——不对返回列表的总长度做
+    强断言，因为下面新增的测试要求额外附带一条记录"丢了几条"的 WARNING，
+    列表长度会随之变化，两个测试各自关心不同的事情。"""
     payload = {
         "issues": [
             {"severity": "SUGGESTION", "where_day": None},  # 缺 message
@@ -545,8 +594,30 @@ def test_critic_skips_issue_missing_message_and_keeps_the_valid_one():
         ]
     }
     issues = run_llm_critic(None, Requirements(), _deps(_resp(payload)), _ctx())
-    assert len(issues) == 1
-    assert issues[0].message == "第3天完全不符合休闲节奏"
+    parsed = [i for i in issues if i.code == "CRITIC"]
+    assert len(parsed) == 1
+    assert parsed[0].message == "第3天完全不符合休闲节奏"
+
+
+def test_critic_records_a_warning_issue_for_how_many_could_not_be_parsed():
+    """一条解析不出来的点评之前是 bare continue 悄悄丢掉，不留任何痕迹——
+    天和活动两级故障都留了 WARNING，点评这一级不该是例外，尤其是丢的那条
+    如果恰好是 BLOCKING，静默消失会悄悄削弱整个复审循环。"""
+    payload = {
+        "issues": [
+            {"severity": "SUGGESTION", "where_day": None},  # 缺 message
+            {
+                "severity": "BLOCKING",
+                "message": "第3天完全不符合休闲节奏",
+                "where_day": "d3",
+            },
+        ]
+    }
+    issues = run_llm_critic(None, Requirements(), _deps(_resp(payload)), _ctx())
+    trace = [i for i in issues if i.code == "UNPARSEABLE_CRITIQUE"]
+    assert len(trace) == 1
+    assert trace[0].severity is Severity.WARNING
+    assert "1" in trace[0].message
 
 
 # ---------- classify_feedback ----------
@@ -632,3 +703,13 @@ def test_apply_patch_falls_back_when_budget_amount_is_not_numeric():
         },
     )
     assert out == Requirements()
+
+
+def test_apply_patch_returns_unchanged_when_patch_is_not_a_dict():
+    """classify_feedback 里 data.get("patch") or {} 只替换掉 falsy 值——
+    一个 truthy 的非 dict（比如模型把 patch 直接写成一句话字符串）会原样
+    传下去，patch.items() 就 AttributeError。apply_patch 必须自己兜住，
+    不能假设调用方一定传了个字典。"""
+    reqs = Requirements(destination=Field("京都", Origin.USER))
+    out = apply_patch(reqs, "改成四天")
+    assert out == reqs

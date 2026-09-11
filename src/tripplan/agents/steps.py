@@ -98,6 +98,18 @@ def _safe(fn):
 _parse_origin = _safe(lambda raw: Origin(raw) if raw else Origin.MODEL)
 
 
+def _ensure_list(v) -> list:
+    """确认一个"应该是数组的容器"真的是数组，不是 None、标量或字典——
+    对着这些东西 enumerate()/iterate 要么直接抛 TypeError（None），要么
+    悄悄迭代出一堆不是本意的东西（字符串会被逐字符拆开）。和其它解析
+    失败一样，统一收敛成 ParseError；调用点按各自已有的退化路径处理
+    （行程→留空天数组+一条 WARNING，角度→已有的"没有可用角度"报错，
+    点评→已有的"零条点评"），不必另外发明一套新信号。"""
+    if not isinstance(v, list):
+        raise ParseError(f"需要数组，实际是 {type(v).__name__}")
+    return v
+
+
 def _parse_party(v) -> Party:
     if not isinstance(v, dict):
         # party 是三项必填之一：解析不了要降级为「没给」，不能让 AttributeError
@@ -150,8 +162,14 @@ _PARSERS = {
 }
 
 
-def _to_field(name: str, raw: dict | None) -> Field:
-    if not raw or raw.get("value") is None:
+def _to_field(name: str, raw) -> Field:
+    # 模型偶尔会把信封拍平（"destination": "京都" 而不是
+    # {"value": "京都", ...}）。isinstance 检查必须排在 raw.get(...) 之前
+    # 短路掉——raw 不是 dict 时调用 .get 会直接 AttributeError，这一行
+    # 本身还在任何 except 保护范围之外，一个字段被拍平就能炸穿其余
+    # 十一个字段的抽取。这与第一轮把 Origin(...) 挪回 try 是同一类修法：
+    # 守卫必须先做，不能等到已经调用了可能失败的操作之后再兜底。
+    if not isinstance(raw, dict) or raw.get("value") is None:
         return Field()
     try:
         value = _PARSERS[name](raw["value"])
@@ -206,8 +224,12 @@ def pick_angles(reqs: Requirements, deps, ctx, n: int = 3) -> list[Angle]:
         client=deps.client,
         tool_impls={},
     )
+    try:
+        raw_angles = _ensure_list(data["angles"])
+    except ParseError:
+        raw_angles = []  # 容器都不对，等同于一个能解析的角度都没有
     angles = []
-    for raw in data["angles"]:
+    for raw in raw_angles:
         try:
             angles.append(_parse_angle_safe(raw))
         except ParseError:
@@ -302,12 +324,30 @@ def run_llm_critic(itin, reqs: Requirements, deps, ctx) -> list[Issue]:
         client=deps.client,
         tool_impls={},
     )
+    try:
+        raw_issues = _ensure_list(data["issues"])
+    except ParseError:
+        return []  # 容器都不对，等同于没产出任何点评——与"空验收"同等对待
     out = []
-    for raw in data["issues"]:
+    unparseable = 0
+    for raw in raw_issues:
         try:
             out.append(_parse_critic_issue_safe(raw))
         except ParseError:
-            continue  # 一条点评解析不出来，丢的是一个意见，不是整份点评
+            unparseable += 1  # 一条点评解析不出来，丢的是一个意见，不是整份点评
+    if unparseable:
+        # 天和活动两级故障都留了 WARNING；点评这一级原来是 bare continue
+        # 悄悄丢掉，一条本该是 BLOCKING 的点评消失得无声无息，会悄悄削弱
+        # 复审循环。这里补一条留痕，不逐条重复，只记总数。
+        out.append(
+            Issue(
+                severity=Severity.WARNING,
+                source=Source.RULE,
+                code="UNPARSEABLE_CRITIQUE",
+                message=f"有 {unparseable} 条点评解析失败，已丢弃",
+                where=None,
+            )
+        )
     return out
 
 
@@ -331,8 +371,15 @@ def classify_feedback(text: str, reqs: Requirements, deps, ctx) -> FeedbackDelta
     )
 
 
-def apply_patch(reqs: Requirements, patch: dict) -> Requirements:
-    """把 patch 应用到需求上。用户改的字段一律标 USER + 已确认。"""
+def apply_patch(reqs: Requirements, patch) -> Requirements:
+    """把 patch 应用到需求上。用户改的字段一律标 USER + 已确认。
+
+    classify_feedback 里 `data.get("patch") or {}` 只替换掉 falsy 值——
+    一个 truthy 的非 dict（模型把 patch 直接写成一句话）会原样传下来，
+    patch.items() 就 AttributeError。这里没有什么"部分应用"的余地：
+    传进来的不是对象，就当没有任何补丁，原样返回。"""
+    if not isinstance(patch, dict):
+        return reqs
     updates = {}
     for name, raw_value in patch.items():
         if name not in _PARSERS:
@@ -437,23 +484,42 @@ _parse_day_shell_safe = _safe(_parse_day_shell)
 
 
 def _to_itinerary(data: dict, angle: Angle) -> Itinerary:
-    """run_agent 只校验顶层 required（["days"]），不会递归进每一天 /
-    每个活动的字段——所以一天的 date 格式不对、缺 activities 键，或者
-    一个活动缺 poi_query / start 格式不对 / cost.amount 不是数字，都可能
-    在这里炸出来。丢掉整份行程会连带炸掉模型排对的其他天/其他活动，静默
+    """run_agent 只校验顶层 required（["days"]）这个键存不存在，既不检查
+    它的类型，也不会递归进每一天/每个活动的字段——所以 days 本身可能不是
+    数组（None、标量），一天的 date 格式不对、缺 activities 键，或者一个
+    活动缺 poi_query / start 格式不对 / cost.amount 不是数字，都可能在
+    这里炸出来。丢掉整份行程会连带炸掉模型排对的其他天/其他活动，静默
     跳过又违反了这个项目一路坚持的规矩：解析不了的东西要留痕，不能装作
-    没发生。所以按两级粒度分别兜底：
-    - 日级：这一天的骨架（date / activities 本身）解析不出来，跳过整天，
+    没发生。所以按三级粒度分别兜底：
+    - 容器级：data["days"] 本身不是数组，直接返回空行程 + 一条 WARNING，
+      不尝试往下解析。
+    - 日级：某一天的骨架（date / activities 本身）解析不出来，跳过整天，
       记一条 WARNING（这一天从没存在过，没有 day_id 可指）。
     - 活动级：日骨架没问题，但其中某个活动解析不出来，只跳过那一个活动，
       记一条 WARNING 并指向这一天最终会被分配到的 day_id。
 
-    两处都用 _safe 收敛内部的异常——不必在 except 里手动枚举
+    三处都用 _safe/_ensure_list 收敛内部的异常——不必在 except 里手动枚举
     KeyError/ValueError/TypeError/InvalidOperation，以后解析逻辑变化想抛
     什么都不会漏网。"""
+    try:
+        raw_days = _ensure_list(data["days"])
+    except ParseError as e:
+        return Itinerary(
+            angle=angle,
+            days=[],
+            issues=[
+                Issue(
+                    severity=Severity.WARNING,
+                    source=Source.RULE,
+                    code="UNPARSEABLE_DAYS_CONTAINER",
+                    message=f"days 解析失败，已返回空行程：{e}",
+                    where=None,
+                )
+            ],
+        )
     days = []
     issues: list[Issue] = []
-    for raw_index, raw_day in enumerate(data["days"], start=1):
+    for raw_index, raw_day in enumerate(raw_days, start=1):
         try:
             date, raw_activities = _parse_day_shell_safe(raw_day)
         except ParseError as e:
