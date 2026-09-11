@@ -77,6 +77,22 @@ class AmapProvider:
             raise ProviderError(
                 self._redact(f"高德请求失败：{type(e).__name__}")
             ) from e
+        except ValueError as e:
+            # resp.json() 对非 JSON 正文抛的是 json.JSONDecodeError，它是
+            # ValueError，既不是 HTTPStatusError 也不是 HTTPError——两个
+            # except 都接不住。触发场景很普通：200 + HTML 正文（WAF 拦截页、
+            # 门户网络的劫持页、网关限流页）。漏出去之后 _lookup / run_slot
+            # 都只认 ProviderError，最终被 _safe_slot 记成「候选线出现未处理
+            # 异常」——三条候选同时撞上同一次故障，用户拿到的是三个 FAILED
+            # 候选、一份行程都没有，而不是三份带 POI_NOT_FOUND 缺口的行程。
+            # 这正是 Task 14 为 KeyError 立下的那条规矩，只是换了个触发点。
+            raise ProviderError(self._redact("高德返回的不是合法 JSON")) from e
+        if not isinstance(data, dict):
+            # 合法 JSON 但不是对象（比如正文就是 `null` / `[]`）：再往下
+            # data.get(...) 就是 AttributeError，同样会漏出 ProviderError 之外。
+            raise ProviderError(
+                self._redact(f"高德返回的 JSON 不是对象：{type(data).__name__}")
+            )
         if data.get("status") != "1":
             raise ProviderError(
                 self._redact(f"高德返回错误：{data.get('info', '未知')}")

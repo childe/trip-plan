@@ -243,3 +243,57 @@ def test_real_amap_smoke(tmp_path):
     p = AmapProvider(key=key, cache=DiskCache(tmp_path, ttl_days=1))
     hits = p.search_poi("外滩", "上海")
     assert hits and hits[0].coords.lat > 30
+
+
+# ---------- 最终评审 I2：200 + 非 JSON 正文 ----------
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda p: p.search_poi("清水寺", "京都"),
+        lambda p: p.route(
+            LatLng(34.9, 135.7), LatLng(35.0, 135.8), TravelMode.TRANSIT, WHEN
+        ),
+    ],
+    ids=["search_poi", "route"],
+)
+def test_non_json_200_body_becomes_provider_error(tmp_path, call):
+    """resp.json() 抛的 json.JSONDecodeError 是 ValueError，
+    httpx.HTTPStatusError / httpx.HTTPError 两个 except 都接不住。
+    WAF 拦截页、门户网络劫持页、网关限流页都是 200 + HTML 正文。
+
+    漏出去的后果不是"这一次查询失败"，而是 _safe_slot 把它记成「候选线
+    出现未处理异常」——三条候选同时撞上同一次故障，用户一份行程都拿不到，
+    而不是三份带 POI_NOT_FOUND 缺口的行程。"""
+
+    def handler(request):
+        return httpx.Response(200, text="<html><body>请完成安全验证</body></html>")
+
+    with pytest.raises(ProviderError):
+        call(_provider(handler, tmp_path))
+
+
+def test_non_json_200_body_does_not_leak_the_key(tmp_path):
+    def handler(request):
+        return httpx.Response(200, text="<html>blocked</html>")
+
+    with pytest.raises(ProviderError) as exc_info:
+        _provider(handler, tmp_path).search_poi("清水寺", "京都")
+    assert "test-key" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "body", ["null", "[]", '"ok"'], ids=["null", "array", "string"]
+)
+def test_valid_json_that_is_not_an_object_becomes_provider_error(tmp_path, body):
+    """合法 JSON 但不是对象时，下一行 data.get("status") 就是 AttributeError，
+    照样逃出 ProviderError 之外。"""
+
+    def handler(request):
+        return httpx.Response(
+            200, text=body, headers={"content-type": "application/json"}
+        )
+
+    with pytest.raises(ProviderError):
+        _provider(handler, tmp_path).search_poi("清水寺", "京都")
