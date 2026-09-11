@@ -628,3 +628,35 @@ def test_collect_failure_propagates_and_leaves_state_unmutated(wire, monkeypatch
 
     assert dumps(s) == before
     assert s.revision == 0
+
+
+def test_a_wrongly_typed_angle_key_no_longer_escapes_advance_as_a_typeerror():
+    """评审 I6 的回归：{"angles":[{"key":[],...}]} 曾经一路走到
+    pick_angles 的 len(set(keys))，抛 TypeError: unhashable type: 'list'——
+    那个类型不在 _run_to_pause 的 except 元组里，直接变成一截裸 traceback。
+
+    这里**不**打桩 pick_angles：走真实的 run_agent，让 schema 里早就写着的
+    `"key": {"type": "string"}` 自己把它挡回去。挡回去之后模型改不出来，
+    最终以 LimitExceeded 收场——那个类型在元组里，于是流程停在一个合法的
+    暂停态（FAILED 占位候选），而不是崩给用户。"""
+    import json
+
+    from tripplan.llm.client import FakeLlm, LlmResponse, Usage
+
+    bad = LlmResponse(
+        "end_turn",
+        json.dumps({"angles": [{"key": [], "title": "T"}]}),
+        [],
+        Usage(10, 10),
+    )
+    s = TripState.new("去京都", run_id="r1")
+    s.stage = Stage.GENERATE
+    s.requirements = _reqs()
+    s.trip_timezone = "Asia/Tokyo"
+    deps = Deps(client=FakeLlm([bad] * 3), provider=FakeProvider())
+
+    out = advance(s, deps)  # 不应该抛
+
+    assert isinstance(out, NeedInput)
+    assert s.stage is Stage.AWAIT_CHOICE
+    assert [c.status for c in s.candidates] == [SlotStatus.FAILED]

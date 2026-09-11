@@ -33,6 +33,66 @@ def _load_json(text: str):
             raise SchemaError(f"不是合法 JSON：{e2}") from e2
 
 
+#: JSON Schema 的 type 关键字 → Python 侧的判定。bool 在 Python 里是 int 的
+#: 子类，而 JSON 里 true 不是数字，所以 number/integer 必须显式排除 bool。
+_TYPE_PREDICATES = {
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "null": lambda v: v is None,
+}
+
+
+def _json_type(value) -> str:
+    for name, pred in _TYPE_PREDICATES.items():
+        if name != "integer" and pred(value):
+            return name
+    return type(value).__name__
+
+
+def _check_types(value, schema: dict, path: str) -> None:
+    """按 schema 声明的 type 递归校验，命中不符就抛 SchemaError。
+
+    只校验 type，不在嵌套层再查 required —— 这是刻意的分工：
+    - 类型不对的标量（poi_query=null、note=3、lodging={...}、message=null）
+      会被原封不动地塞进领域对象，一路干净地往返 state.json，最后在渲染
+      HTML 时炸成一截 AttributeError，而且 `trip render` 会永远复现；
+    - 嵌套层缺字段则另有一整套「跳过这一个活动/这一天/这一条点评，并留下
+      一条 WARNING」的部分成功语义（steps.py 的三级兜底）。把嵌套 required
+      也搬到这里，等于把「30 个活动里有 1 个缺 poi_query」升级成「整份行程
+      作废重来」，那是另一个契约，不是本次要换的那个。
+
+    校验放在 run_agent 这一层而不是消费侧，是因为这里还能让既有的修复轮
+    把错误回喂给模型、要它自己改正；消费侧的任何 isinstance 守卫都只能
+    把数据丢掉。
+    """
+    declared = schema.get("type")
+    if declared is not None:
+        allowed = [declared] if isinstance(declared, str) else list(declared)
+        preds = [_TYPE_PREDICATES[t] for t in allowed if t in _TYPE_PREDICATES]
+        if preds and not any(pred(value) for pred in preds):
+            where = path or "顶层"
+            raise SchemaError(
+                f"{where} 需要 {'/'.join(allowed)}，实际是 {_json_type(value)}"
+            )
+
+    # 类型对不对是一回事，能不能往下走是另一回事：只要值确实是容器，就按
+    # properties / items 继续下探，不管 type 里还列了别的什么（["object","null"]）。
+    if isinstance(value, dict):
+        for key, sub_schema in (schema.get("properties") or {}).items():
+            if key in value:
+                sub_path = f"{path}.{key}" if path else key
+                _check_types(value[key], sub_schema, sub_path)
+    elif isinstance(value, list):
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, element in enumerate(value):
+                _check_types(element, item_schema, f"{path}[{index}]")
+
+
 def _parse_and_validate(text: str, schema: dict) -> dict:
     data = _load_json(text)
     if not isinstance(data, dict):
@@ -40,6 +100,7 @@ def _parse_and_validate(text: str, schema: dict) -> dict:
     missing = [k for k in schema.get("required", []) if k not in data]
     if missing:
         raise SchemaError(f"缺少必填字段：{', '.join(missing)}")
+    _check_types(data, schema, "")
     return data
 
 

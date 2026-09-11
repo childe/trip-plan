@@ -1,9 +1,11 @@
+import json
 from decimal import Decimal
 
 import pytest
 
 from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
-from tripplan.agents.runner import SchemaError, run_agent
+from tripplan.agents.runner import SchemaError, _parse_and_validate, run_agent
+from tripplan.agents.schemas import ANGLES_SCHEMA, CRITIQUE_SCHEMA, ITINERARY_SCHEMA
 from tripplan.llm.client import FakeLlm, LlmResponse, ToolCall, Usage
 from tripplan.llm.config import Role
 
@@ -211,3 +213,168 @@ def test_tool_result_containing_decimal_is_serialised_not_swallowed_as_error():
     last_messages = llm.calls[-1].messages
     assert any("12.50" in str(m) for m in last_messages)
     assert not any("错误" in str(m) for m in last_messages)
+
+
+# ---------- 最终评审 C1/I1：按 schema 声明的 type 递归校验 ----------
+#
+# 这一组守的是评审那条裁定：schema 里**本来就写着**每一个被忽略掉的类型。
+# 不按它执行的后果不是"校验不够严"，而是一个 null/数字/对象标量能干净地
+# 穿过解析、穿过领域对象、穿过 state.json 往返，最后在 escape() 里炸成一截
+# AttributeError——而且 `trip render` 会永远复现，itinerary.html 再也出不来。
+
+
+def _act(**over):
+    base = {
+        "poi_query": "清水寺",
+        "start": "09:00",
+        "end": "10:00",
+        "category": "SIGHT",
+        "cost": {"amount": 400, "currency": "JPY"},
+        "indoor": False,
+        "note": "",
+    }
+    base.update(over)
+    return base
+
+
+def _plan(day_over=None, **act_over):
+    day = {"date": "2026-10-01", "lodging": "京都塔", "activities": [_act(**act_over)]}
+    day.update(day_over or {})
+    return {"days": [day]}
+
+
+#: 评审 C1 点名的五种毒数据，全部满足各自 schema 的 required，
+#: 全部在旧实现下"零 issue 地"通过校验，全部只炸 HTML 不炸 Markdown。
+_POISON = [
+    pytest.param(
+        _plan(cost={"amount": 400, "currency": None}),
+        ITINERARY_SCHEMA,
+        "cost.currency",
+        id="cost.currency=null",
+    ),
+    pytest.param(_plan(poi_query=None), ITINERARY_SCHEMA, "poi_query", id="poi=null"),
+    pytest.param(_plan(note=3), ITINERARY_SCHEMA, "note", id="note=number"),
+    pytest.param(
+        _plan(day_over={"lodging": {"name": "京都塔酒店"}}),
+        ITINERARY_SCHEMA,
+        "lodging",
+        id="lodging=object",
+    ),
+    pytest.param(
+        {"issues": [{"severity": "BLOCKING", "message": None}]},
+        CRITIQUE_SCHEMA,
+        "message",
+        id="critic.message=null",
+    ),
+]
+
+
+@pytest.mark.parametrize("payload,schema,where", _POISON)
+def test_non_string_scalar_is_rejected_by_the_declared_type(payload, schema, where):
+    with pytest.raises(SchemaError) as exc:
+        _parse_and_validate(json.dumps(payload, ensure_ascii=False), schema)
+    assert where in str(exc.value)  # 报错要指到具体位置，模型才改得动
+
+
+@pytest.mark.parametrize("payload,schema,where", _POISON)
+def test_type_violation_engages_the_repair_loop_rather_than_failing_outright(
+    payload, schema, where
+):
+    """关键在"打回重写"而不是"直接失败"：修在 run_agent 这一层，模型还能
+    把字段改对，用户拿回的是数据；修在渲染器里加 isinstance 只能把数据丢掉。"""
+    good = {"days": []} if schema is ITINERARY_SCHEMA else {"issues": []}
+    llm = FakeLlm(
+        [
+            _text(json.dumps(payload, ensure_ascii=False)),
+            _text(json.dumps(good, ensure_ascii=False)),
+        ]
+    )
+    out = run_agent(
+        system_prompt="sys",
+        user_prompt="do it",
+        tools=None,
+        output_schema=schema,
+        role=Role.PLANNER,
+        ctx=SlotContext(SlotLimits(max_schema_repairs=1)),
+        client=llm,
+        tool_impls={},
+    )
+    assert out == good
+    assert len(llm.calls) == 2
+    # 修复提示里必须带上出错的位置，否则模型只能瞎猜
+    assert any(where in str(m) for m in llm.calls[-1].messages)
+
+
+def test_angle_key_of_the_wrong_type_is_rejected():
+    """评审 I6：{"key": []} 会让 pick_angles 在 len(set(keys)) 处抛
+    TypeError（unhashable），那个类型不在 orchestrator 的 except 元组里，
+    直接变成一截裸 traceback。key 声明的是 string，照着执行就没这回事。"""
+    payload = {"angles": [{"key": [], "title": "T"}]}
+    with pytest.raises(SchemaError, match="key"):
+        _parse_and_validate(json.dumps(payload), ANGLES_SCHEMA)
+
+
+# ---------- 校验器本身的行为 ----------
+
+
+def test_nested_array_items_are_checked_elementwise():
+    schema = {
+        "type": "object",
+        "properties": {"xs": {"type": "array", "items": {"type": "string"}}},
+    }
+    with pytest.raises(SchemaError, match=r"xs\[1\]"):
+        _parse_and_validate('{"xs": ["a", 2, "c"]}', schema)
+
+
+def test_union_type_accepts_every_listed_member():
+    schema = {
+        "type": "object",
+        "properties": {"x": {"type": ["string", "null"]}},
+    }
+    assert _parse_and_validate('{"x": null}', schema) == {"x": None}
+    assert _parse_and_validate('{"x": "s"}', schema) == {"x": "s"}
+
+
+def test_boolean_does_not_satisfy_number_even_though_python_says_bool_is_int():
+    """JSON 里 true 不是数字；Python 里 bool 是 int 的子类。不显式排除的话，
+    {"amount": true} 会被当成合法金额，然后 Decimal(str(True)) 才炸。"""
+    schema = {"type": "object", "properties": {"n": {"type": "number"}}}
+    with pytest.raises(SchemaError, match="n"):
+        _parse_and_validate('{"n": true}', schema)
+    assert _parse_and_validate('{"n": 1}', schema) == {"n": 1}
+
+
+def test_number_does_not_satisfy_boolean_either():
+    schema = {"type": "object", "properties": {"b": {"type": "boolean"}}}
+    with pytest.raises(SchemaError, match="b"):
+        _parse_and_validate('{"b": 1}', schema)
+
+
+def test_absent_optional_property_is_not_type_checked():
+    """缺字段的语义归 steps.py 的三级兜底管（跳过这一项、留一条 WARNING）；
+    校验器只管"给了的东西类型对不对"，不能顺手把嵌套 required 也接管过来——
+    那会把"30 个活动里有 1 个缺 poi_query"升级成"整份行程作废重来"。"""
+    schema = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+        "required": ["a"],
+    }
+    assert _parse_and_validate('{"a": "x"}', schema) == {"a": "x"}
+
+
+def test_missing_nested_required_key_still_passes_validation():
+    payload = {"angles": [{"key": "A"}]}  # 缺 title
+    assert _parse_and_validate(json.dumps(payload), ANGLES_SCHEMA) == payload
+
+
+def test_property_without_a_declared_type_accepts_anything():
+    """_FIELD 里的 "value": {} 是刻意不声明类型的——十二个字段的 value
+    形状各不相同（字符串/对象/数组/枚举），交给 _PARSERS 去解释。"""
+    schema = {"type": "object", "properties": {"value": {}}}
+    for raw in ('{"value": null}', '{"value": 3}', '{"value": {"a": 1}}'):
+        _parse_and_validate(raw, schema)  # 不抛
+
+
+def test_unknown_type_keyword_is_ignored_rather_than_rejecting_everything():
+    schema = {"type": "object", "properties": {"x": {"type": "date-time"}}}
+    assert _parse_and_validate('{"x": "2026-10-01"}', schema) == {"x": "2026-10-01"}

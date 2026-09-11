@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from tripplan.agents.limits import SlotContext, SlotLimits
+from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
 from tripplan.agents.steps import (
     Scale,
     apply_patch,
@@ -166,21 +166,45 @@ def test_collect_degrades_when_a_parser_raises_an_unexpected_exception_type():
     assert reqs.destination.origin is None
 
 
-def test_collect_falls_back_when_a_field_envelope_is_flattened():
+def test_collect_repairs_a_flattened_field_envelope_instead_of_losing_it():
     """模型偶尔会把信封拍平，直接给 "destination": "京都" 而不是
-    {"value": "京都", "origin": ..., "rationale": ...}。_to_field 原来在
-    `raw.get("value") is None` 这行就先调用了 .get()，如果 raw 是个非空
-    字符串（"京都"），not raw 为 False，直接 raw.get(...) 就
-    AttributeError——一个字段被拍平就能炸穿其余十一个字段的抽取。"""
-    payload = dict(COLLECTED)
-    payload["destination"] = "京都"  # 信封被压平
-    reqs = collect("x", _deps(_resp(payload)), _ctx())
-    assert reqs.destination.value is None
-    assert reqs.destination.origin is None
-    # 其余字段完全不受这一个坏字段影响，照常解析
+    {"value": "京都", ...}。_to_field 的 isinstance 守卫能挡住 AttributeError，
+    但代价是把用户明明说过的"京都"整条丢掉，而且一声不响（评审 I5/I8：
+    拍平整份响应时三项必答全部变成"？"）。schema 现在声明了字段信封是
+    object/null，类型校验因此会在 run_agent 里打回去，让模型自己改正——
+    用户拿回的是字段，不是一个静默的空值。"""
+    flattened = dict(COLLECTED)
+    flattened["destination"] = "京都"  # 信封被压平
+    deps = _deps(_resp(flattened), _resp(COLLECTED))
+    reqs = collect("x", deps, _ctx())
+    assert reqs.destination.value == "京都"  # 修复轮把它救回来了
+    assert len(deps.client.calls) == 2
     assert reqs.dates.value.days == 5
     assert reqs.party.value == Party(adults=2)
     assert reqs.pace.value is Pace.RELAXED
+
+
+def test_collect_loses_nothing_silently_when_the_whole_envelope_is_flat():
+    """评审 I8 的原始复现：整份响应都是拍平的（"我想10月1号到3号去京都，
+    两个人" → 三项必答全部报"缺"）。这种响应必须被打回，而不是通过校验后
+    退化成一个空 Requirements。"""
+    flat = {
+        "destination": "京都",
+        "dates": {"start": "2026-10-01", "end": "2026-10-03"},
+        "party": {"adults": 2},
+    }
+    with pytest.raises(LimitExceeded, match="destination"):
+        collect("x", _deps(_resp(flat)), SlotContext(SlotLimits(max_schema_repairs=0)))
+
+
+def test_to_field_still_degrades_a_flattened_envelope_when_called_directly():
+    """校验器在 run_agent 那一层拦截之后，_to_field 的 isinstance 守卫就不再
+    是唯一防线了——但它仍然必须成立：apply_patch 之类的路径不经过 schema
+    校验，守卫一旦被当成"已经没用了"删掉，那些路径立刻裸奔。"""
+    from tripplan.agents import steps
+    from tripplan.models.common import Field
+
+    assert steps._to_field("destination", "京都") == Field()
 
 
 # ---------- pick_angles ----------
@@ -503,30 +527,28 @@ def test_generate_skips_day_missing_activities_key_and_keeps_the_good_day():
     assert any(i.severity is Severity.WARNING for i in itin.issues)
 
 
-def test_generate_returns_empty_itinerary_with_warning_when_days_is_null():
-    """{"days": null} 这种整个容器都不对的输入——run_agent 只查顶层
-    required 是否"存在"这个键，不管值是不是数组，所以 data["days"] 可能
-    是 None。对 None 做 enumerate() 会直接 TypeError，炸穿整份行程。
-    应该退化成空行程 + 一条 WARNING，而不是崩溃。"""
+@pytest.mark.parametrize("bad_days", [None, "京都"], ids=["null", "scalar"])
+def test_generate_repairs_a_bad_days_container_instead_of_returning_nothing(bad_days):
+    """{"days": null} / {"days": "京都"} 整个容器就不对。schema 早就声明了
+    days 是 array——校验现在真的照它执行，于是模型会被要求重写一遍，用户
+    拿回的是一份真行程，而不是一份空行程加一条 WARNING。"""
+    deps = _deps(_resp({"days": bad_days}), _resp(PLAN))
     itin = generate(
-        Requirements(destination=Field("京都", Origin.USER)),
-        _angle(),
-        _deps(_resp({"days": None})),
-        _ctx(),
+        Requirements(destination=Field("京都", Origin.USER)), _angle(), deps, _ctx()
     )
-    assert itin.days == []
-    assert any(i.severity is Severity.WARNING for i in itin.issues)
+    assert len(itin.days) == 1
+    assert itin.issues == []
+    assert len(deps.client.calls) == 2
 
 
-def test_generate_returns_empty_itinerary_with_warning_when_days_is_a_scalar():
-    """days 是标量（比如一个字符串）时同样不是数组——须与 null 走同一条
-    退化路径，而不是被当成可迭代对象逐字符拆开、逐个当"天"去解析。"""
-    itin = generate(
-        Requirements(destination=Field("京都", Origin.USER)),
-        _angle(),
-        _deps(_resp({"days": "京都"})),
-        _ctx(),
-    )
+@pytest.mark.parametrize("bad_days", [None, "京都"], ids=["null", "scalar"])
+def test_to_itinerary_still_degrades_when_the_days_container_is_not_a_list(bad_days):
+    """容器级兜底本身必须留着：修复轮有次数上限，也不是每个 run_agent 的
+    消费方都会在同一层挡住——对 None 做 enumerate() 是 TypeError，对字符串
+    做迭代更糟（逐字拆开，每个字当一天）。"""
+    from tripplan.agents import steps
+
+    itin = steps._to_itinerary({"days": bad_days}, _angle())
     assert itin.days == []
     assert any(i.severity is Severity.WARNING for i in itin.issues)
 
@@ -575,19 +597,35 @@ def test_critic_tolerates_empty_verdict():
     )
 
 
-def test_critic_records_a_warning_when_the_issues_container_itself_is_unparseable():
-    """{"issues": null} 之前和合法的空验收（{"issues": []}）返回一模一样的
-    []——容器整个坏掉比"某一条点评解析不出来"更严重，却比后者留的痕还少，
-    一份点评（可能里面本来有 BLOCKING）就这么无声消失。必须能和空验收
-    区分开，且不能升级成 BLOCKING（否则一份解析不出来的点评自己就会触发
-    重写）。"""
-    issues = run_llm_critic(
-        None, Requirements(), _deps(_resp({"issues": None})), _ctx()
-    )
+def test_critic_repairs_a_null_issues_container_instead_of_discarding_the_critique():
+    """{"issues": null} 现在会被类型校验打回（schema 声明的就是 array），
+    模型重写一遍，整份点评连同里面的 BLOCKING 都保住了——比"退化成一条
+    UNPARSEABLE_CRITIQUE 的 WARNING"好得多。"""
+    good = {
+        "issues": [{"severity": "BLOCKING", "message": "第3天太赶", "where_day": "d3"}]
+    }
+    deps = _deps(_resp({"issues": None}), _resp(good))
+    issues = run_llm_critic(None, Requirements(), deps, _ctx())
+    assert [i.severity for i in issues] == [Severity.BLOCKING]
+    assert len(deps.client.calls) == 2
+
+
+def test_run_llm_critic_still_records_a_warning_if_the_container_slips_through():
+    """容器级兜底仍是真守卫：修复轮用尽、或以后换了个不走 schema 校验的
+    客户端，{"issues": null} 都不能和合法的空验收（[]）长得一模一样——
+    那等于让一份可能带 BLOCKING 的点评无声消失。"""
+    from tripplan.agents import steps
+
+    monkey = lambda **kw: {"issues": None}  # noqa: E731
+    original = steps.run_agent
+    steps.run_agent = monkey
+    try:
+        issues = run_llm_critic(None, Requirements(), _deps(), _ctx())
+    finally:
+        steps.run_agent = original
     assert len(issues) == 1
     assert issues[0].severity is Severity.WARNING
     assert issues[0].code == "UNPARSEABLE_CRITIQUE"
-    # 与合法空验收（[]）必须能区分开，不能长得一样
     assert issues != []
 
 
