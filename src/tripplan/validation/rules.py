@@ -9,8 +9,11 @@ from datetime import timedelta
 from decimal import ROUND_CEILING, Decimal
 from zoneinfo import ZoneInfo
 
-from tripplan.models.facts import GapKind
-from tripplan.models.issue import ActivityRef, Issue, Severity, Source
+from tripplan.models.facts import FactSnapshot, GapKind
+from tripplan.models.issue import ActivityRef, DayRef, Issue, Severity, Source
+from tripplan.models.itinerary import Category, Itinerary
+from tripplan.models.requirements import Pace, Requirements
+from tripplan.validation.budget import build_ledger
 
 #: 实测耗时之上再留 20%——换乘走错口、等信号、找入口都在这里面。
 TRANSIT_BUFFER = Decimal("1.2")
@@ -250,3 +253,185 @@ def rule_04_must_visit(itin, reqs, facts) -> list[Issue]:
 
 def rule_05_avoid(itin, reqs, facts) -> list[Issue]:
     return _constraint_issues(itin, facts, reqs.avoid.value, "R5", False)
+
+
+# ---------- 规则 6：预算 ----------
+
+
+def rule_06_budget(itin, reqs, facts) -> list[Issue]:
+    """输出分层账单式的判断，而不是拿模型自报的数字去 BLOCK 模型自己的方案。
+
+    只有覆盖完整（无未知项）且全部 VERIFIED 时超支才升为 BLOCKING。
+    这个条件在 v1 基本不会满足，接入真实票价 API 后自然生效。
+    """
+    issues: list[Issue] = []
+    led = build_ledger(itin, reqs)
+
+    if led.currency_mismatch:
+        issues.append(
+            _issue(
+                Severity.WARNING,
+                "R6",
+                f"部分花费的币种与预算（{led.currency}）不一致，未计入合计",
+            )
+        )
+
+    if not led.over_budget:
+        return issues
+
+    detail = (
+        f"已核实 {led.verified}（{led.verified_count} 项）"
+        f"／估算 {led.estimated}（{led.estimated_count} 项）"
+        f"／未知 {led.unknown_count} 项，预算 {led.budget_limit}"
+    )
+    if led.complete and led.all_verified:
+        issues.append(_issue(Severity.BLOCKING, "R6", f"超出预算：{detail}"))
+    else:
+        issues.append(
+            _issue(
+                Severity.WARNING,
+                "R6",
+                f"按当前估算可能超出预算：{detail}（金额未全部核实，仅供参考）",
+            )
+        )
+    return issues
+
+
+# ---------- 规则 7：节奏 ----------
+
+
+class PaceLimit:
+    def __init__(self, max_activities: int, max_out_minutes: int) -> None:
+        self.max_activities = max_activities
+        self.max_out_minutes = max_out_minutes
+
+
+PACE_LIMITS: dict[Pace, PaceLimit] = {
+    Pace.RELAXED: PaceLimit(max_activities=4, max_out_minutes=8 * 60),
+    Pace.NORMAL: PaceLimit(max_activities=6, max_out_minutes=10 * 60),
+    Pace.PACKED: PaceLimit(max_activities=8, max_out_minutes=12 * 60),
+}
+
+
+def rule_07_pace(itin, reqs, facts) -> list[Issue]:
+    pace = reqs.pace.value or Pace.NORMAL
+    limit = PACE_LIMITS[pace]
+    issues: list[Issue] = []
+    for day in itin.days:
+        if not day.activities:
+            continue
+        count = len(day.activities)
+        out = _minutes(day.activities[-1].end) - _minutes(day.activities[0].start)
+        if count > limit.max_activities:
+            issues.append(
+                _issue(
+                    Severity.WARNING,
+                    "R7",
+                    f"{day.date.isoformat()} 排了 {count} 项，"
+                    f"超过 {pace.value} 节奏建议的 {limit.max_activities} 项",
+                    DayRef(day.id),
+                )
+            )
+        elif out > limit.max_out_minutes:
+            issues.append(
+                _issue(
+                    Severity.WARNING,
+                    "R7",
+                    f"{day.date.isoformat()} 在外 {out // 60} 小时，"
+                    f"超过 {pace.value} 节奏建议的 "
+                    f"{limit.max_out_minutes // 60} 小时",
+                    DayRef(day.id),
+                )
+            )
+    return issues
+
+
+# ---------- 规则 8：三餐 ----------
+
+MEAL_WINDOWS = (("午餐", 11 * 60, 14 * 60 + 30), ("晚餐", 17 * 60, 21 * 60))
+
+
+def rule_08_meals(itin, reqs, facts) -> list[Issue]:
+    issues: list[Issue] = []
+    for day in itin.days:
+        if not day.activities:
+            continue
+        for label, lo, hi in MEAL_WINDOWS:
+            ok = any(
+                a.category is Category.MEAL and lo <= _minutes(a.start) <= hi
+                for a in day.activities
+            )
+            if not ok:
+                issues.append(
+                    _issue(
+                        Severity.WARNING,
+                        "R8",
+                        f"{day.date.isoformat()} 没有安排{label}",
+                        DayRef(day.id),
+                    )
+                )
+    return issues
+
+
+# ---------- 规则 9：营业时间 ----------
+
+
+def _parse_hours(text: str) -> tuple[int, int] | None:
+    try:
+        lo, hi = text.split("-")
+        h1, m1 = map(int, lo.strip().split(":"))
+        h2, m2 = map(int, hi.strip().split(":"))
+        return h1 * 60 + m1, h2 * 60 + m2
+    except (ValueError, AttributeError):
+        return None
+
+
+def rule_09_opening_hours(itin, reqs, facts) -> list[Issue]:
+    """v1 没有权威营业时间数据源，因此**永远只给 WARNING**。
+
+    接入真实 API 后才能升为 BLOCKING——不假装它可靠，比悄悄放过去强。
+    """
+    issues: list[Issue] = []
+    for day in itin.days:
+        for act in day.activities:
+            res = facts.poi_by_activity.get(act.id)
+            hours = getattr(getattr(res, "fact", None), "opening_hours", None)
+            window = _parse_hours(hours) if hours else None
+            if window is None:
+                continue
+            lo, hi = window
+            if _minutes(act.start) < lo or _minutes(act.end) > hi:
+                issues.append(
+                    _issue(
+                        Severity.WARNING,
+                        "R9",
+                        f"{act.poi_query} 的安排（{act.start:%H:%M}–{act.end:%H:%M}）"
+                        f"可能不在营业时间 {hours} 内（该数据未核实）",
+                        ActivityRef(day.id, act.id),
+                    )
+                )
+    return issues
+
+
+# ---------- 汇总 ----------
+
+ALL_RULES = (
+    rule_01_no_overlap,
+    rule_02_transit_gap,
+    rule_03_date_coverage,
+    rule_04_must_visit,
+    rule_05_avoid,
+    rule_06_budget,
+    rule_07_pace,
+    rule_08_meals,
+    rule_09_opening_hours,
+)
+
+
+def run_rule_checks(
+    itin: Itinerary, reqs: Requirements, facts: FactSnapshot
+) -> list[Issue]:
+    issues: list[Issue] = []
+    for rule in ALL_RULES:
+        issues.extend(rule(itin, reqs, facts))
+    return issues
