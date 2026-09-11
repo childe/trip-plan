@@ -195,5 +195,63 @@ def test_ledger_shows_currency_mismatch_caveat(mk):
         ]
     )
     out = render_itinerary_html(itin, mk.facts(), mk.reqs())
-    assert "不一致" in out
-    assert "未计入合计" in out
+    # 提示必须在；措辞按"有没有预算"分两种，见下面 I4 那一组。这里的
+    # mk.reqs() 没有预算，所以断言的是无预算那句。
+    assert "不同币种" in out
+    assert "未计入" in out
+
+
+# ---------- 最终评审 I4：没有预算时不能声称「与预算币种不一致」 ----------
+
+
+def _mixed_currency_itin(mk):
+    return mk.itin(
+        [
+            mk.day(
+                "d1",
+                D1,
+                [
+                    mk.act(
+                        "d1a1",
+                        "d1",
+                        "09:00",
+                        "10:00",
+                        query="酒店",
+                        cost=Money(Decimal("10000"), "CNY", Confidence.VERIFIED, "x"),
+                    ),
+                    mk.act(
+                        "d1a2",
+                        "d1",
+                        "12:00",
+                        "13:00",
+                        query="拉面",
+                        category=Category.MEAL,
+                        cost=Money(Decimal("1500"), "JPY", Confidence.ESTIMATED, "llm"),
+                    ),
+                ],
+            )
+        ]
+    )
+
+
+def _jpy_budget():
+    return Field(
+        BudgetSpec(Decimal("15000"), "JPY", Basis.TOTAL, frozenset({CostKind.MEAL})),
+        Origin.USER,
+    )
+
+
+def test_mismatch_without_a_budget_does_not_invent_one(mk):
+    """HTML 是那份会被转发给同行者的文件 —— 凭空提到一个不存在的预算，
+    读者无从分辨真假。"""
+    out = render_itinerary_html(_mixed_currency_itin(mk), mk.facts(), mk.reqs())
+    assert "预算" not in out
+    assert "行程内花费存在不同币种" in out
+    assert "未计入" in out
+
+
+def test_mismatch_with_a_budget_still_says_it_is_the_budget_currency(mk):
+    out = render_itinerary_html(
+        _mixed_currency_itin(mk), mk.facts(), mk.reqs(budget=_jpy_budget())
+    )
+    assert "与预算币种不一致" in out

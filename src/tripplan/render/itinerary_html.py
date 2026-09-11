@@ -153,10 +153,24 @@ def _ledger_html(itin, reqs) -> list[str]:
         )
     if led.currency_mismatch:
         rows.append(
-            '<tr><td colspan="3" class="mismatch">⚠️ 存在与预算币种不一致的'
-            "花费，未计入合计</td></tr>"
+            f'<tr><td colspan="3" class="mismatch">{_mismatch_caveat(led)}</td></tr>'
         )
     return ["<h2>花费</h2>", '<table class="ledger">', *rows, "</table>"]
+
+
+def _mismatch_caveat(led) -> str:
+    """没有预算时不能说「与预算币种不一致」——用户根本没填过预算。
+
+    与 itinerary_md._mismatch_caveat 同一条裁定（rules.py 的 rule_06_budget
+    在 Task 10 已经按它改过，渲染层当时没跟上）。这一份尤其要紧：HTML 才是
+    那个会被转发给同行者的文件，凭空提到一个不存在的预算，读者无从分辨。
+    """
+    if led.budget_limit is not None:
+        return "⚠️ 存在与预算币种不一致的花费，未计入合计"
+    return (
+        f"⚠️ 行程内花费存在不同币种，合计仅按其中一种（{escape(led.currency)}）"
+        "计算，其余未计入"
+    )
 
 
 def _issues_html(itin) -> list[str]:

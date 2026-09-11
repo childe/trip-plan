@@ -129,3 +129,74 @@ def test_lists_unverified_facts_honestly(mk):
 def test_output_is_stable_across_repeated_renders(mk):
     args = (_itin(mk), mk.facts(), mk.reqs())
     assert render_itinerary_md(*args) == render_itinerary_md(*args)
+
+
+# ---------- 最终评审 I4：没有预算时不能声称「与预算币种不一致」 ----------
+
+
+def _mixed_currency_itin(mk):
+    return mk.itin(
+        [
+            mk.day(
+                "d1",
+                D1,
+                [
+                    mk.act(
+                        "d1a1",
+                        "d1",
+                        "09:00",
+                        "10:00",
+                        query="酒店",
+                        cost=Money(Decimal("10000"), "CNY", Confidence.VERIFIED, "x"),
+                    ),
+                    mk.act(
+                        "d1a2",
+                        "d1",
+                        "12:00",
+                        "13:00",
+                        query="拉面",
+                        category=Category.MEAL,
+                        cost=Money(Decimal("1500"), "JPY", Confidence.ESTIMATED, "llm"),
+                    ),
+                ],
+            )
+        ]
+    )
+
+
+def _jpy_budget():
+    return Field(
+        BudgetSpec(Decimal("15000"), "JPY", Basis.TOTAL, frozenset({CostKind.MEAL})),
+        Origin.USER,
+    )
+
+
+def test_mismatch_without_a_budget_does_not_invent_one(mk):
+    """用户从未填过预算时，led.currency 只是从行程第一笔花费推断出来的，
+    不是任何人给过的基准。说"与预算币种不一致"等于凭空编造一个用户没做过
+    的决定 —— rules.py 在 Task 10 就为这句话改过，渲染层当时没跟上。"""
+    out = render_itinerary_md(_mixed_currency_itin(mk), mk.facts(), mk.reqs())
+    assert "预算" not in out
+    assert "行程内花费存在不同币种" in out
+    assert "未计入" in out  # 提示本身不能一起消失
+
+
+def test_mismatch_with_a_budget_still_says_it_is_the_budget_currency(mk):
+    """反证：真有预算时那句话是对的，不能因为修 I4 把它一起删掉。"""
+    out = render_itinerary_md(
+        _mixed_currency_itin(mk), mk.facts(), mk.reqs(budget=_jpy_budget())
+    )
+    assert "与预算币种不一致" in out
+
+
+def test_mismatch_wording_matches_the_rule_layer_verdict(mk):
+    """同一份文档里，规则给的话与账单给的话不能互相打架：R6 说「行程内
+    花费存在不同币种」，账单行却说「与预算不一致」，读者无从判断到底有没有
+    预算这回事。"""
+    from tripplan.validation.rules import rule_06_budget
+
+    itin, reqs = _mixed_currency_itin(mk), mk.reqs()
+    issues = rule_06_budget(itin, reqs, mk.facts())
+    out = render_itinerary_md(itin, mk.facts(), reqs)
+    rule_msg = next(i.message for i in issues if "币种" in i.message)
+    assert ("预算" in rule_msg) == ("预算" in out)

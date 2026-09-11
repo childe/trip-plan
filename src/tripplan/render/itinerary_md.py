@@ -70,8 +70,25 @@ def _ledger_section(itin, reqs) -> list[str]:
     if led.budget_limit is not None:
         out.append(f"- 预算：{led.budget_limit} {led.currency}")
     if led.currency_mismatch:
-        out.append("- ⚠️ 存在与预算币种不一致的花费，未计入合计")
+        out.append("- " + _mismatch_caveat(led))
     return out + [""]
+
+
+def _mismatch_caveat(led) -> str:
+    """没有预算时不能说「与预算币种不一致」——用户根本没填过预算。
+
+    rules.py 的 rule_06_budget 在 Task 10 就按这条裁定改过了（「不能把
+    『行程内部币种不一致』说成『和一个用户从未填过的预算冲突』」），渲染层
+    当时没跟上。无预算时 led.currency 只是从行程里第一笔有价格的花费推断出
+    来的，它不是任何人给过的基准，照着它说"和预算不一致"是凭空编造一个用户
+    从未做过的决定 —— 而这句话就印在那份要转发给同行者的 HTML 里。
+    """
+    if led.budget_limit is not None:
+        return "⚠️ 存在与预算币种不一致的花费，未计入合计"
+    return (
+        f"⚠️ 行程内花费存在不同币种，合计仅按其中一种（{led.currency}）计算，"
+        "其余未计入"
+    )
 
 
 def _issues_section(itin) -> list[str]:
