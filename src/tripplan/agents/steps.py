@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, replace
 from datetime import date as Date
 from datetime import datetime, time
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -64,6 +64,40 @@ class FeedbackDelta:
 # ---------- 值解析 ----------
 
 
+class ParseError(Exception):
+    """字段/活动解析失败的统一出口。
+
+    上一轮把 Origin(...) 挪回 try、给 party 补了类型检查之后，复审又在
+    budget.amount 上踩到同一类坑：Decimal(str("五千")) 抛的是
+    decimal.InvalidOperation——它是 ArithmeticError，不是 ValueError 也不是
+    TypeError，不在调用点的 except 元组里，一样会把整条抽取炸穿。
+    与其继续在每个调用点枚举"这次又冒出了哪种异常"，不如让解析函数自己把
+    内部的异常收敛成这一种，调用点只认 ParseError——新解析器以后想抛什么
+    原始异常都不会漏网。
+    """
+
+
+def _safe(fn):
+    """把一个"可能失败"的解析函数包成"失败只抛 ParseError"的版本。
+
+    调用点因此只需要写 `except ParseError`，不必再为每一种可能的原始异常
+    （KeyError/ValueError/TypeError/InvalidOperation/……）单独记一笔。
+    """
+
+    def wrapped(v):
+        try:
+            return fn(v)
+        except ParseError:
+            raise
+        except Exception as e:
+            raise ParseError(str(e)) from e
+
+    return wrapped
+
+
+_parse_origin = _safe(lambda raw: Origin(raw) if raw else Origin.MODEL)
+
+
 def _parse_party(v) -> Party:
     if not isinstance(v, dict):
         # party 是三项必填之一：解析不了要降级为「没给」，不能让 AttributeError
@@ -86,25 +120,33 @@ def _parse_str_list(v) -> list[str]:
 
 
 _PARSERS = {
-    "destination": lambda v: str(v),
-    "dates": lambda v: DateRange(
-        Date.fromisoformat(v["start"]), Date.fromisoformat(v["end"])
+    "destination": _safe(lambda v: str(v)),
+    "dates": _safe(
+        lambda v: DateRange(
+            Date.fromisoformat(v["start"]), Date.fromisoformat(v["end"])
+        )
     ),
-    "party": _parse_party,
-    "arrival": lambda v: Transfer(datetime.fromisoformat(v["at"]), v.get("mode", "")),
-    "departure": lambda v: Transfer(datetime.fromisoformat(v["at"]), v.get("mode", "")),
-    "budget": lambda v: BudgetSpec(
-        Decimal(str(v["amount"])),
-        v.get("currency", "CNY"),
-        Basis(v.get("basis", "TOTAL")),
-        frozenset(CostKind(k) for k in v.get("includes", [])),
+    "party": _safe(_parse_party),
+    "arrival": _safe(
+        lambda v: Transfer(datetime.fromisoformat(v["at"]), v.get("mode", ""))
     ),
-    "styles": _parse_str_list,
-    "pace": Pace,
-    "must_visit": _parse_str_list,
-    "avoid": _parse_str_list,
-    "lodging_area": str,
-    "constraints": _parse_str_list,
+    "departure": _safe(
+        lambda v: Transfer(datetime.fromisoformat(v["at"]), v.get("mode", ""))
+    ),
+    "budget": _safe(
+        lambda v: BudgetSpec(
+            Decimal(str(v["amount"])),
+            v.get("currency", "CNY"),
+            Basis(v.get("basis", "TOTAL")),
+            frozenset(CostKind(k) for k in v.get("includes", [])),
+        )
+    ),
+    "styles": _safe(_parse_str_list),
+    "pace": _safe(Pace),
+    "must_visit": _safe(_parse_str_list),
+    "avoid": _safe(_parse_str_list),
+    "lodging_area": _safe(str),
+    "constraints": _safe(_parse_str_list),
 }
 
 
@@ -113,12 +155,8 @@ def _to_field(name: str, raw: dict | None) -> Field:
         return Field()
     try:
         value = _PARSERS[name](raw["value"])
-        # origin 的转换必须也在 try 里——"SYSTEM"、"user"（大小写不对）这类
-        # 不合法取值会让 Origin(...) 抛 ValueError，之前这行在 try 外面，
-        # 一次坏 origin 就能炸穿整个 collect()。
-        raw_origin = raw.get("origin")
-        origin = Origin(raw_origin) if raw_origin else Origin.MODEL
-    except (KeyError, ValueError, TypeError):
+        origin = _parse_origin(raw.get("origin"))
+    except ParseError:
         return Field()  # 解析不了就当没给，不要塞个坏值进去
     return Field(
         value=value,
@@ -272,7 +310,7 @@ def apply_patch(reqs: Requirements, patch: dict) -> Requirements:
             continue  # 未知字段忽略，不炸
         try:
             value = _PARSERS[name](raw_value)
-        except (KeyError, ValueError, TypeError):
+        except ParseError:
             continue
         updates[name] = Field(value=value, origin=Origin.USER, confirmed=True)
     return replace(reqs, **updates) if updates else reqs
@@ -349,13 +387,20 @@ def _to_activity(raw: dict) -> Activity:
     )
 
 
+_parse_activity = _safe(_to_activity)
+
+
 def _to_itinerary(data: dict, angle: Angle) -> Itinerary:
     """run_agent 只校验顶层 required（["days"]），不会递归进每个活动的字段——
-    所以一个活动缺 poi_query / start 格式不对 / cost.amount 缺失都可能在这里
-    炸出来。丢掉整份行程会连带炸掉模型排对的其他活动，静默跳过又违反了这个
-    项目一路坚持的规矩：解析不了的东西要留痕，不能装作没发生。所以每个活动
-    单独兜底：解析不出来就跳过它，同时在 itinerary.issues 里记一条 WARNING，
-    留给下游（渲染 / 人工复核）看到「这里少了什么、为什么」。"""
+    所以一个活动缺 poi_query / start 格式不对 / cost.amount 不是数字都可能在
+    这里炸出来。丢掉整份行程会连带炸掉模型排对的其他活动，静默跳过又违反了
+    这个项目一路坚持的规矩：解析不了的东西要留痕，不能装作没发生。所以每个
+    活动单独兜底：解析不出来就跳过它，同时在 itinerary.issues 里记一条
+    WARNING，留给下游（渲染 / 人工复核）看到「这里少了什么、为什么」。
+
+    这里同样用 _safe 收敛 _to_activity 内部的异常——不必在这个 except 里
+    手动枚举 KeyError/ValueError/TypeError/InvalidOperation，以后 _to_activity
+    内部逻辑变化想抛什么都不会漏网。"""
     days = []
     issues: list[Issue] = []
     for day_index, raw_day in enumerate(data["days"], start=1):
@@ -363,8 +408,8 @@ def _to_itinerary(data: dict, angle: Angle) -> Itinerary:
         day_id = f"d{day_index}"  # 与 assign_ids 后续分配的编号对齐
         for act_index, raw in enumerate(raw_day["activities"], start=1):
             try:
-                acts.append(_to_activity(raw))
-            except (KeyError, ValueError, TypeError, InvalidOperation) as e:
+                acts.append(_parse_activity(raw))
+            except ParseError as e:
                 issues.append(
                     Issue(
                         severity=Severity.WARNING,

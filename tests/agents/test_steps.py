@@ -126,6 +126,46 @@ def test_collect_does_not_character_split_a_bare_string_must_visit():
     assert reqs.must_visit.value is None
 
 
+def test_collect_falls_back_when_budget_amount_is_not_numeric():
+    """Decimal(str(v["amount"])) 对中文数字这类非数字字符串会抛
+    decimal.InvalidOperation——它是 ArithmeticError，不是 ValueError，
+    不在旧的 except (KeyError, ValueError, TypeError) 元组里，会直接
+    炸穿 collect。budget 必须像其他字段一样安全降级。"""
+    payload = dict(COLLECTED)
+    payload["budget"] = {
+        "value": {
+            "amount": "五千",
+            "currency": "CNY",
+            "basis": "TOTAL",
+            "includes": [],
+        },
+        "origin": "USER",
+        "rationale": "",
+    }
+    reqs = collect("x", _deps(_resp(payload)), _ctx())
+    assert reqs.budget.value is None
+    assert reqs.budget.origin is None
+
+
+def test_collect_degrades_when_a_parser_raises_an_unexpected_exception_type():
+    """回归防线：解析器内部不管抛什么异常类型，收敛之后只应该在调用点
+    看到 ParseError 一种——不该出现"这个具体异常类型忘了列进 except 元组"
+    这种漏洞（decimal.InvalidOperation 就是这么漏网的）。"""
+    from tripplan.agents import steps
+
+    def _boom(_v):
+        raise ZeroDivisionError("没被专门枚举过的异常类型")
+
+    original = steps._PARSERS["destination"]
+    steps._PARSERS["destination"] = steps._safe(_boom)
+    try:
+        reqs = collect("x", _deps(_resp(COLLECTED)), _ctx())
+    finally:
+        steps._PARSERS["destination"] = original
+    assert reqs.destination.value is None
+    assert reqs.destination.origin is None
+
+
 # ---------- pick_angles ----------
 
 
@@ -291,6 +331,51 @@ def test_generate_skips_malformed_activity_and_keeps_the_good_one():
     assert any(i.severity is Severity.WARNING for i in itin.issues)
 
 
+BROKEN_COST_PLAN = {
+    "days": [
+        {
+            "date": "2026-10-01",
+            "lodging": None,
+            "activities": [
+                {
+                    "poi_query": "清水寺",
+                    "start": "09:00",
+                    "end": "11:00",
+                    "category": "SIGHT",
+                    "cost": {"amount": "五百", "currency": "JPY"},
+                    "indoor": False,
+                    "note": "cost.amount 不是数字",
+                },
+                {
+                    "poi_query": "某食堂",
+                    "start": "12:00",
+                    "end": "13:00",
+                    "category": "MEAL",
+                    "cost": None,
+                    "indoor": True,
+                    "note": "",
+                },
+            ],
+        }
+    ]
+}
+
+
+def test_generate_skips_activity_with_non_numeric_cost_and_keeps_the_rest():
+    """Decimal(str("五百")) 抛的是 decimal.InvalidOperation——它既不是
+    ValueError 也不是 TypeError，若调用点只认这两个类型就会漏网，
+    炸穿整份行程。"""
+    itin = generate(
+        Requirements(destination=Field("京都", Origin.USER)),
+        _angle(),
+        _deps(_resp(BROKEN_COST_PLAN)),
+        _ctx(),
+    )
+    assert len(itin.days[0].activities) == 1
+    assert itin.days[0].activities[0].poi_query == "某食堂"
+    assert any(i.severity is Severity.WARNING for i in itin.issues)
+
+
 def test_revise_includes_issues_in_the_prompt():
     from tripplan.models.issue import Issue
 
@@ -402,4 +487,19 @@ def test_apply_patch_ignores_unknown_field():
 
 def test_apply_patch_falls_back_when_party_is_not_an_object():
     out = apply_patch(Requirements(), {"party": "两人"})
+    assert out == Requirements()
+
+
+def test_apply_patch_falls_back_when_budget_amount_is_not_numeric():
+    out = apply_patch(
+        Requirements(),
+        {
+            "budget": {
+                "amount": "五千",
+                "currency": "CNY",
+                "basis": "TOTAL",
+                "includes": [],
+            }
+        },
+    )
     assert out == Requirements()
