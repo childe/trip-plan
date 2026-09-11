@@ -3,9 +3,28 @@
 核心不变量：advance 要么拒绝（状态与 revision 均不变），
 要么修改（revision 恰好 +1）。递增只发生在一处，位于校验之后、返回之前——
 依赖「所有路径碰巧都会走到某个暂停函数」是靠不住的。
+
+第三种结局——外部依赖失败：collect 与 classify_feedback 直接调用 LLM，
+一旦底层传输失败（Task 18 把这类故障统一归一为 ProviderError）或撞额度
+（LimitExceeded），二者都不捕获，原样从 advance 里抛出去；调用方看到的是
+异常，不是 Rejected/NeedInput。这是刻意的：模型不可达是环境故障，不是
+规划结果，不该被编码成状态机里的一个 transition——那会逼着下游把"服务
+临时挂了"解释成某种行程语义。调用方（driver/CLI）应该捕获 ProviderError，
+告诉用户"模型暂时无法访问，进度已保存在 revision N，稍后重试"。
+
+为了让这条"异常途中，state 不留半吊子改动"站得住，_apply 的每个分支都
+排好了顺序：可能失败的调用（classify_feedback）必须先做，成功拿到返回值
+之后才能把结果写回 state——反过来的顺序会在调用失败时留下一个已经写进去、
+但 revision 没递增的改动，逃出了「拒绝/修改」这个二分律。
+
+`pick_angles` 是例外：它没有 seed/候选可以退回，唯一的产出就是角度本身，
+所以它的 ProviderError/LimitExceeded 与它自己那个"角度 key 重复"的裸
+ValueError 一视同仁——都收敛成一个 FAILED 占位候选，让流程停在
+AWAIT_CHOICE 而不是把异常甩给调用方；run_slot 系的三条候选线同理，一条
+线撞见外部依赖失败不该拖累另外两条。
 """
 
-from tripplan.agents.limits import SlotContext, SlotLimits
+from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
 from tripplan.agents.steps import (
     Scale,
     apply_patch,
@@ -16,6 +35,7 @@ from tripplan.agents.steps import (
 from tripplan.models.issue import Issue
 from tripplan.models.itinerary import Angle
 from tripplan.models.requirements import mark_all_confirmed, missing_required
+from tripplan.providers.base import ProviderError
 from tripplan.slot import run_slot
 from tripplan.state import (
     ALLOWED_COMMANDS,
@@ -146,9 +166,14 @@ def _apply(state, cmd, deps, emit) -> None:
             state.stage = Stage.DONE
 
         case GiveFeedback(angle_key=key, text=text):
-            state.chosen_key = key  # 提意见即选定
-            # ★ 只分类一次：两次结果可能不一致，状态会就此走歪且无人报错
+            # ★ 先调用可能失败的 classify_feedback，成功后才落 chosen_key。
+            # 反过来的顺序（先选定再分类）会在 classify_feedback 抛
+            # ProviderError/LimitExceeded 时，把 chosen_key 已经写进去、
+            # revision 却没有递增的半吊子改动留在 state 里——逃出了
+            # advance「拒绝/修改」的二分律。同时也只分类这一次：两次结果
+            # 可能不一致，状态会就此走歪且无人报错。
             delta = classify_feedback(text, state.requirements, deps, _step_ctx(emit))
+            state.chosen_key = key  # 提意见即选定
             if delta.patches_requirements and delta.patch:
                 _patch_requirements(state, delta, emit)
             else:
@@ -193,6 +218,13 @@ def _safe_slot(angle, seed, reqs, tz, deps, emit, issues=(), avoid_poi_ids=()):
     以后新长出的一种失败模式，或者一个纯粹的 bug，照样能把另外两条已经跑
     完的候选一起拖垮。GENERATE 的候选列表推导、diversity 重跑回调、REFINE
     的单候选刷新，三处都经过这里，行为统一。
+
+    写 Task 21+ 的测试时注意：这层 except Exception 是故意宽泛的，连
+    FakeLlm 脚本用尽时抛出的 AssertionError 也会被吞成一个 FAILED 候选，
+    而不是让"脚本条数不够"以它本来的样子炸出来——调用方看到的只是一个
+    "失败了"的候选，不是"脚本写少了一条"的提示。写脚本化测试时自己把
+    每条候选线预期消耗的轮次数对齐，不要指望这里的兜底替你发现脚本不够
+    长（生产环境不受影响：兜底不收窄，这正是它本来的目的）。
     """
     try:
         return run_slot(
@@ -228,14 +260,18 @@ def _run_to_pause(state, deps, emit):
                 tz = _ensure_timezone(state, deps)
                 try:
                     angles = pick_angles(state.requirements, deps, _step_ctx(emit))
-                except ValueError as e:
-                    # pick_angles 在"一个能解析的角度都没有"或"key 重复"时
-                    # 抛裸 ValueError——没有安全的默认值可退（不像单个字段
-                    # 解析失败那样能当没给），但也不能任它逃出 advance 变成
-                    # 一截原始 traceback。收敛成一个 FAILED 占位候选，流程
-                    # 仍然停在一个合法的暂停态：用户看到的是"生成失败"而不
-                    # 是程序崩溃，还能用 AmendRequirements 补充信息再试一次
-                    # （若补充触发了真正的需求 patch，会重新走到这里重试）。
+                except (ValueError, ProviderError, LimitExceeded) as e:
+                    # 三种失败一视同仁地收敛：ValueError 是"一个能解析的
+                    # 角度都没有"或"key 重复"（没有安全的默认值可退，不像
+                    # 单个字段解析失败那样能当没给）；ProviderError 是模型
+                    # 传输层故障（Task 18 的归一化）；LimitExceeded 是撞了
+                    # schema 修复/超时/token 额度。三者都不能任它们逃出
+                    # advance 变成一截原始 traceback——pick_angles 没有 seed
+                    # 或候选可以退回，唯一的产出就是角度本身，所以收敛成一个
+                    # FAILED 占位候选，流程仍然停在一个合法的暂停态：用户
+                    # 看到的是"生成失败"而不是程序崩溃，还能用
+                    # AmendRequirements 补充信息再试一次（若补充触发了真正
+                    # 的需求 patch，会重新走到这里重试）。
                     emit(("angle_generation_failed", str(e)))
                     state.candidates = [
                         CandidateSlot(

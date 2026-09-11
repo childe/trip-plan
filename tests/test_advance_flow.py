@@ -2,6 +2,7 @@ from datetime import date
 
 import pytest
 
+from tripplan.agents.limits import LimitExceeded
 from tripplan.agents.steps import FeedbackDelta, Scale
 from tripplan.deps import Deps
 from tripplan.models.common import Field, Origin
@@ -9,6 +10,7 @@ from tripplan.models.issue import Issue
 from tripplan.models.itinerary import Angle, Itinerary
 from tripplan.models.requirements import DateRange, Party, Requirements
 from tripplan.orchestrator import advance
+from tripplan.providers.base import ProviderError
 from tripplan.providers.fake import FakeProvider
 from tripplan.state import (
     AmendRequirements,
@@ -532,3 +534,97 @@ def test_exhausted_candidate_is_selectable(wire):
     s.candidates[1].detail = "仍有硬伤"
     out = advance(s, _deps(), ChooseCandidate(s.revision, "B"))
     assert not isinstance(out, Rejected)
+
+
+# ---------- 协调者复审发现：外部依赖失败必须落在拒绝/修改二分律之外 ----------
+#
+# collect / classify_feedback 直接触达 LLM；一旦底层传输故障（归一为
+# ProviderError）或撞额度（LimitExceeded），既不能被静默吞掉伪装成一次
+# 正常的 state 变化，也不能在半路留下部分改动——异常必须原样穿透
+# advance，而且穿透之前不能有任何写回 state 的副作用留下痕迹。
+
+
+def test_classify_feedback_failure_does_not_mutate_chosen_key_or_bump_revision(
+    wire, monkeypatch
+):
+    """复现协调者给出的场景：GiveFeedback 先落 chosen_key 再分类，
+    分类失败时 chosen_key 已经被改写，revision 却没有递增。"""
+    import tripplan.orchestrator as orch
+
+    wire(_Fakes())
+
+    def _boom_classify(text, reqs, deps, ctx=None):
+        raise ProviderError("模型暂时不可用")
+
+    monkeypatch.setattr(orch, "classify_feedback", _boom_classify)
+
+    s = _at_choice()  # chosen_key 初始为 None
+    before_rev = s.revision
+
+    with pytest.raises(ProviderError):
+        advance(s, _deps(), GiveFeedback(before_rev, "A", "太赶了"))
+
+    assert s.chosen_key is None
+    assert s.revision == before_rev
+
+
+def test_pick_angles_provider_error_is_contained_like_value_error(wire, monkeypatch):
+    """pick_angles 的 ProviderError 应该和它自己的裸 ValueError 一样，
+    收敛成 FAILED 占位候选，而不是逃出 advance。"""
+    import tripplan.orchestrator as orch
+
+    wire(_Fakes())
+
+    def _boom_pick_angles(reqs, deps, ctx=None, n=3):
+        raise ProviderError("模型暂时不可达")
+
+    monkeypatch.setattr(orch, "pick_angles", _boom_pick_angles)
+
+    s = TripState.new("去京都", run_id="r1")
+    advance(s, _deps())
+    out = advance(s, _deps(), ConfirmRequirements(s.revision))  # 不应该抛异常
+
+    assert isinstance(out, NeedInput)
+    assert s.stage is Stage.AWAIT_CHOICE
+    assert any(c.status is SlotStatus.FAILED for c in s.candidates)
+
+
+def test_pick_angles_limit_exceeded_is_contained_like_value_error(wire, monkeypatch):
+    """同上，换成撞额度的 LimitExceeded。"""
+    import tripplan.orchestrator as orch
+
+    wire(_Fakes())
+
+    def _boom_pick_angles(reqs, deps, ctx=None, n=3):
+        raise LimitExceeded("schema 修复次数耗尽")
+
+    monkeypatch.setattr(orch, "pick_angles", _boom_pick_angles)
+
+    s = TripState.new("去京都", run_id="r1")
+    advance(s, _deps())
+    out = advance(s, _deps(), ConfirmRequirements(s.revision))  # 不应该抛异常
+
+    assert isinstance(out, NeedInput)
+    assert any(c.status is SlotStatus.FAILED for c in s.candidates)
+
+
+def test_collect_failure_propagates_and_leaves_state_unmutated(wire, monkeypatch):
+    """collect 失败要原样穿透 advance，且不留下任何部分改动——
+    这是刻意的第三种结局，不应该被伪装成 Rejected 或 NeedInput。"""
+    import tripplan.orchestrator as orch
+
+    wire(_Fakes())
+
+    def _boom_collect(raw_request, deps, ctx=None):
+        raise ProviderError("模型暂时不可达")
+
+    monkeypatch.setattr(orch, "collect", _boom_collect)
+
+    s = TripState.new("去京都", run_id="r1")
+    before = dumps(s)
+
+    with pytest.raises(ProviderError):
+        advance(s, _deps())
+
+    assert dumps(s) == before
+    assert s.revision == 0
