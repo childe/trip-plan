@@ -185,6 +185,53 @@ def test_timezone_of_unknown_city_raises(tmp_path):
         _provider(handler, tmp_path).timezone_of("虚构城")
 
 
+def test_http_error_message_does_not_leak_key(tmp_path):
+    """key 是每个请求的 query 参数，httpx 异常里天然带着完整 URL——
+    不能让它原样进 ProviderError 的消息，那是用户会看到、会截图的文本。"""
+
+    def handler(request):
+        return httpx.Response(500, text="boom")
+
+    with pytest.raises(ProviderError) as exc_info:
+        _provider(handler, tmp_path).search_poi("清水寺", "京都")
+    assert "test-key" not in str(exc_info.value)
+
+
+def test_route_missing_duration_becomes_provider_error(tmp_path):
+    """transit 条目字段不全（比如没有 duration）也要转 ProviderError，
+    不能让 KeyError 逃出去——run_slot 只兜 ProviderError。"""
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "status": "1",
+                "route": {"transits": [{"distance": "4200", "segments": []}]},
+            },
+        )
+
+    with pytest.raises(ProviderError):
+        _provider(handler, tmp_path).route(
+            LatLng(34.9949, 135.785),
+            LatLng(35.0036, 135.7786),
+            TravelMode.TRANSIT,
+            WHEN,
+        )
+
+
+def test_search_poi_missing_location_becomes_provider_error(tmp_path):
+    """POI 条目缺 location 字段同理，不能让 KeyError 逃出去。"""
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={"status": "1", "pois": [{"id": "B001", "name": "清水寺"}]},
+        )
+
+    with pytest.raises(ProviderError):
+        _provider(handler, tmp_path).search_poi("清水寺", "京都")
+
+
 @pytest.mark.slow
 def test_real_amap_smoke(tmp_path):
     """真实连通性。需要 AMAP_KEY 环境变量，默认不跑。"""

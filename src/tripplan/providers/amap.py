@@ -55,15 +55,32 @@ class AmapProvider:
 
     # ---------- 传输 ----------
 
+    def _redact(self, message: str) -> str:
+        """兜底：万一以后哪次改动又把 URL/key 带回了消息里，这里再抹一遍。
+
+        key 是每个请求的 query 参数，httpx 异常的 str() 里天然带着完整
+        URL——不能让它原样进 ProviderError 的消息，那是用户会看到、会
+        截图、会贴进 bug 报告的文本。
+        """
+        return message.replace(self.key, "***") if self.key else message
+
     def _get_json(self, path: str, params: dict) -> dict:
         try:
             resp = self.http.get(f"{_BASE}/{path}", params={**params, "key": self.key})
             resp.raise_for_status()
             data = resp.json()
+        except httpx.HTTPStatusError as e:
+            raise ProviderError(
+                self._redact(f"高德请求失败：HTTP {e.response.status_code}")
+            ) from e
         except httpx.HTTPError as e:
-            raise ProviderError(f"高德请求失败：{e}") from e
+            raise ProviderError(
+                self._redact(f"高德请求失败：{type(e).__name__}")
+            ) from e
         if data.get("status") != "1":
-            raise ProviderError(f"高德返回错误：{data.get('info', '未知')}")
+            raise ProviderError(
+                self._redact(f"高德返回错误：{data.get('info', '未知')}")
+            )
         return data
 
     def _get_bytes(self, path: str, params: dict) -> bytes:
@@ -71,8 +88,14 @@ class AmapProvider:
             resp = self.http.get(f"{_BASE}/{path}", params={**params, "key": self.key})
             resp.raise_for_status()
             return resp.content
+        except httpx.HTTPStatusError as e:
+            raise ProviderError(
+                self._redact(f"高德请求失败：HTTP {e.response.status_code}")
+            ) from e
         except httpx.HTTPError as e:
-            raise ProviderError(f"高德请求失败：{e}") from e
+            raise ProviderError(
+                self._redact(f"高德请求失败：{type(e).__name__}")
+            ) from e
 
     @staticmethod
     def _now() -> datetime:
@@ -93,19 +116,27 @@ class AmapProvider:
         fetched = self._now()
         out = []
         for p in raw.get("pois", []):
-            lng, lat = (float(x) for x in p["location"].split(","))
-            hours = (p.get("business") or {}).get("opentime_week") or None
-            out.append(
-                PoiFact(
-                    id=p["id"],
-                    name=p["name"],
-                    coords=LatLng(lat, lng),
-                    opening_hours=hours,
-                    ticket=None,
-                    source="amap:place/text",
-                    fetched_at=fetched,
+            try:
+                lng, lat = (float(x) for x in p["location"].split(","))
+                hours = (p.get("business") or {}).get("opentime_week") or None
+                out.append(
+                    PoiFact(
+                        id=p["id"],
+                        name=p["name"],
+                        coords=LatLng(lat, lng),
+                        opening_hours=hours,
+                        ticket=None,
+                        source="amap:place/text",
+                        fetched_at=fetched,
+                    )
                 )
-            )
+            except (KeyError, ValueError, TypeError) as e:
+                # status == "1" 不代表每个条目字段齐全——不能让 KeyError
+                # 逃出去：run_slot 只兜 ProviderError（Task 18），漏网的
+                # KeyError 会把整组候选一起炸穿，而不是只失败这一个。
+                raise ProviderError(
+                    self._redact(f"高德 POI 返回格式异常：{p!r}")
+                ) from e
         return out
 
     def route(
@@ -139,10 +170,17 @@ class AmapProvider:
             )
         best = transits[0]
         polyline = _first_polyline(best)
+        try:
+            duration_min = int(float(best["duration"]) // 60)
+            distance_m = int(float(best["distance"]))
+        except (KeyError, ValueError, TypeError) as e:
+            # 同上：字段缺失或类型不对不能变成 KeyError/ValueError 逃出去，
+            # 必须是 ProviderError，让 run_slot 把这一条候选降级而不是整组炸穿。
+            raise ProviderError(self._redact(f"高德路线返回格式异常：{best!r}")) from e
         return RouteObservation(
             mode=mode,
-            duration_min=int(float(best["duration"]) // 60),
-            distance_m=int(float(best["distance"])),
+            duration_min=duration_min,
+            distance_m=distance_m,
             polyline=polyline,
             source=f"amap:{path}",
             fetched_at=self._now(),
