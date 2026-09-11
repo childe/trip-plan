@@ -356,6 +356,18 @@ def main(argv=None) -> int:
     except MissingCredential as e:
         print(f"错误：{e}", file=sys.stderr)
         return 1
+    except TripNotFound as e:
+        # _cmd_resume / _cmd_render 只在启动时的 repo.load() 外侧兜住了这两个
+        # 类型，可是 save_if_revision 内部同样会检查存在性、同样会 _decode()
+        # 盘上的文件 —— 会话**中途**被另一个进程删掉/改坏时，异常是从
+        # drive() 的 CAS 循环里抛出来的，此前一路裸奔到用户脸上。repo.py 的
+        # 文档明说这两个类型存在的意义就是「给一句读得懂的话，而不是一截
+        # JSON 栈回溯」；这里把那两句话复用过来即可。
+        print(f"错误：找不到 {e}", file=sys.stderr)
+        return 1
+    except TripCorrupt as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -714,3 +714,61 @@ def test_a_lowercase_angle_key_no_longer_livelocks_the_choice_prompt(
     assert len(asked) == 1  # 一次就过，没有被拒后的重问
     assert state.stage is Stage.DONE
     assert state.chosen_key == "foodie"
+
+
+# ---------- 最终评审 C3：TripCorrupt / TripNotFound 不能是裸 traceback ----------
+#
+# 已有的两条测试（test_resume_reports_corrupt_state_readably /
+# test_render_...）覆盖的是「命令刚启动、repo.load() 就发现文件坏了」，那条
+# 路径由 _cmd_resume / _cmd_render 自己的 except 兜住。但 save_if_revision
+# 内部同样会 _decode() 盘上的文件，所以会话**中途**被别的进程改坏/删掉时，
+# 异常是从 drive() 的 CAS 循环里抛出来的 —— 那里此前无人接管。
+
+
+def _run_resume_with_a_hostile_ask(tmp_path, monkeypatch, sabotage):
+    """跑一次 resume，在「问人」的那一刻对盘上的 state.json 动手脚。
+
+    时序正是评审描述的那个：drive 先落盘（CAS 成功），再去问人；用户还在
+    盯着提示的时候，另一个进程把文件改坏或删掉；答完之后的那次
+    save_if_revision 就会撞上。
+    """
+    from tripplan.state import NeedInput
+
+    repo = FileRepo(tmp_path / "kyoto")
+    repo.create(_state(rev=1))
+
+    def fake_advance(s, deps, cmd=None, emit=None):
+        return NeedInput(InputKind.CONFIRM_REQUIREMENTS, s.requirements, s.revision)
+
+    def hostile_ask(need):
+        sabotage(repo.dir / "state.json")
+        return ConfirmRequirements(need.revision)
+
+    monkeypatch.setattr("tripplan.cli._advance", fake_advance)
+    monkeypatch.setattr("tripplan.cli.terminal_ask", hostile_ask)
+    monkeypatch.setattr("tripplan.cli.build_deps", lambda dry_run=False: _deps())
+    return main(["resume", str(repo.dir)])
+
+
+def test_state_corrupted_mid_session_is_reported_readably(
+    tmp_path, capsys, monkeypatch
+):
+    code = _run_resume_with_a_hostile_ask(
+        tmp_path,
+        monkeypatch,
+        lambda p: p.write_text("not json at all", encoding="utf-8"),
+    )
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "损坏" in err
+    assert "Traceback" not in err
+    assert "TripCorrupt" not in err
+
+
+def test_state_deleted_mid_session_is_reported_readably(tmp_path, capsys, monkeypatch):
+    code = _run_resume_with_a_hostile_ask(tmp_path, monkeypatch, lambda p: p.unlink())
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "找不到" in err
+    assert "Traceback" not in err
+    assert "TripNotFound" not in err
