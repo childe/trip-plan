@@ -575,6 +575,22 @@ def test_critic_tolerates_empty_verdict():
     )
 
 
+def test_critic_records_a_warning_when_the_issues_container_itself_is_unparseable():
+    """{"issues": null} 之前和合法的空验收（{"issues": []}）返回一模一样的
+    []——容器整个坏掉比"某一条点评解析不出来"更严重，却比后者留的痕还少，
+    一份点评（可能里面本来有 BLOCKING）就这么无声消失。必须能和空验收
+    区分开，且不能升级成 BLOCKING（否则一份解析不出来的点评自己就会触发
+    重写）。"""
+    issues = run_llm_critic(
+        None, Requirements(), _deps(_resp({"issues": None})), _ctx()
+    )
+    assert len(issues) == 1
+    assert issues[0].severity is Severity.WARNING
+    assert issues[0].code == "UNPARSEABLE_CRITIQUE"
+    # 与合法空验收（[]）必须能区分开，不能长得一样
+    assert issues != []
+
+
 def test_critic_skips_issue_missing_message_and_keeps_the_valid_one():
     """run_agent 只校验顶层 required（["issues"]），不会递归进每条 issue 的
     ["severity","message"]——缺 message 的一条点评是丢了一个意见，不该拖垮

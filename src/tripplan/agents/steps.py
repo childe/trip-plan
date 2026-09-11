@@ -326,8 +326,20 @@ def run_llm_critic(itin, reqs: Requirements, deps, ctx) -> list[Issue]:
     )
     try:
         raw_issues = _ensure_list(data["issues"])
-    except ParseError:
-        return []  # 容器都不对，等同于没产出任何点评——与"空验收"同等对待
+    except ParseError as e:
+        # 容器整个不对（比如 issues 是 null）比"某一条点评解析不出来"更严重，
+        # 不能比后者留的痕还少——之前这里直接 return []，和"合法的空验收"
+        # 长得一模一样，整份点评连同任何可能的 BLOCKING 都无声消失。
+        return [
+            Issue(
+                severity=Severity.WARNING,  # 不能是 BLOCKING——一份解析不出来
+                # 的点评本身不该触发重写
+                source=Source.RULE,
+                code="UNPARSEABLE_CRITIQUE",
+                message=f"issues 解析失败，整份点评无法使用：{e}",
+                where=None,
+            )
+        ]
     out = []
     unparseable = 0
     for raw in raw_issues:
