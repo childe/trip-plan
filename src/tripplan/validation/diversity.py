@@ -5,6 +5,7 @@ from typing import Callable
 
 from tripplan.models.facts import FactSnapshot
 from tripplan.models.itinerary import Category, Itinerary
+from tripplan.state import CandidateSlot
 
 DIVERSITY_THRESHOLD = 0.6
 
@@ -35,13 +36,15 @@ def jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / len(union)
 
 
-def _signature_of(slot) -> frozenset[str] | None:
+def _signature_of(slot: CandidateSlot) -> frozenset[str] | None:
     if slot.itinerary is None or slot.facts is None:
         return None
     return poi_signature(slot.itinerary, slot.facts)
 
 
-def too_similar(slots, threshold: float = DIVERSITY_THRESHOLD):
+def too_similar(
+    slots: list[CandidateSlot], threshold: float = DIVERSITY_THRESHOLD
+) -> list[tuple[int, int]]:
     """返回重合度超阈值的下标对，靠后的那个是待重跑的。"""
     pairs = []
     for i, j in combinations(range(len(slots)), 2):
@@ -54,24 +57,33 @@ def too_similar(slots, threshold: float = DIVERSITY_THRESHOLD):
 
 
 def enforce_diversity(
-    slots: list,
-    regenerate: Callable[[object, frozenset[str]], object],
+    slots: list[CandidateSlot],
+    regenerate: Callable[[CandidateSlot, frozenset[str]], CandidateSlot],
     emit=_noop,
     threshold: float = DIVERSITY_THRESHOLD,
-) -> list:
+) -> list[CandidateSlot]:
     """重合度超阈值时重跑靠后的那一份，至多一次。
+
+    每一对的 avoid 集合要在任何重跑发生之前、从原始签名一次性算好并快照。
+    重跑会替换 slots；如果中途现读 result[i]/result[j]，链式重叠（同一个下标
+    先当 j 被替换、随后又当 i 参与下一对比较）时，后面那次算出的 avoid 集
+    会读到已经被替换掉的邻居，而不是原本真正重叠的那份——重跑等于没给指导，
+    还会被误当作「已处理」。
 
     regenerate 是回调（slot, 需要避开的 POI id 集合）-> 新 slot，
     因此本模块不依赖 LLM 层。
     """
     result = list(slots)
-    retried: set[int] = set()
+    overlaps: list[tuple[int, int, frozenset[str]]] = []
     for i, j in too_similar(result, threshold):
+        si = _signature_of(result[i]) or frozenset()
+        sj = _signature_of(result[j]) or frozenset()
+        overlaps.append((i, j, si & sj))
+
+    retried: set[int] = set()
+    for i, j, overlap in overlaps:
         if j in retried:
             continue
-        overlap = (_signature_of(result[i]) or frozenset()) & (
-            _signature_of(result[j]) or frozenset()
-        )
         emit(("diversity_retry", result[j].angle.key, sorted(overlap)))
         retried.add(j)
         result[j] = regenerate(result[j], overlap)

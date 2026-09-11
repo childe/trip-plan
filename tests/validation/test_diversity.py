@@ -114,3 +114,64 @@ def test_enforce_is_noop_when_already_diverse(mk):
 
     slots = [_slot(mk, "A", ["B1"]), _slot(mk, "B", ["B2"])]
     assert enforce_diversity(slots, must_not_be_called, threshold=0.6) == slots
+
+
+def test_too_similar_excludes_exact_threshold_equality(mk):
+    """严格 `>`：恰好等于阈值不算「过于相似」。误改成 `>=` 会被此用例捕获。"""
+    slots = [
+        _slot(mk, "A", ["P1", "P2", "P3"]),
+        _slot(mk, "B", ["P1", "P2", "P3", "P4", "P5"]),
+    ]
+    sig_a = poi_signature(slots[0].itinerary, slots[0].facts)
+    sig_b = poi_signature(slots[1].itinerary, slots[1].facts)
+    assert jaccard(sig_a, sig_b) == 0.6
+    assert too_similar(slots, threshold=0.6) == []
+
+
+def test_enforce_avoid_set_for_chained_retry_uses_original_signatures(mk):
+    """链式重叠（A≈B、B≈C，A 与 C 不相似）时，重跑 C 用的 avoid 集必须来自
+    原始的 B∩C，而不是 B 已经被重跑替换之后的新签名——否则 C 的重跑毫无
+    指导，等于白跑一次还骗过了『已处理』的假象。"""
+    slots = [
+        _slot(mk, "A", ["X", "Y"]),  # sig={X,Y}
+        _slot(mk, "B", ["X", "Y", "Z"]),  # sig={X,Y,Z}
+        _slot(mk, "C", ["Y", "Z"]),  # sig={Y,Z}
+    ]
+    # jaccard(A,B)=2/3, jaccard(B,C)=2/3, jaccard(A,C)=1/3 —— 与复现报告一致的拓扑。
+    assert too_similar(slots, threshold=0.6) == [(0, 1), (1, 2)]
+
+    calls = []
+
+    def regenerate(slot, avoid_poi_ids):
+        calls.append((slot.angle.key, sorted(avoid_poi_ids)))
+        if slot.angle.key == "B":
+            return _slot(mk, "B", ["Q1", "Q2"])  # 与 C 毫无关系的新方案
+        return _slot(mk, slot.angle.key, ["Q3", "Q4"])
+
+    enforce_diversity(slots, regenerate, threshold=0.6)
+
+    assert [k for k, _ in calls] == ["B", "C"]
+    assert calls[0][1] == ["X", "Y"]  # 真正的 A∩B
+    assert calls[1][1] == ["Y", "Z"]  # 真正的 B∩C——不是重跑后的空集
+
+
+def test_enforce_retries_a_slot_flagged_by_two_pairs_only_once(mk):
+    """同一个下标同时是两对重叠中靠后的那个（j 相同）时，也只重跑一次——
+    覆盖 `if j in retried: continue` 这条此前没有用例跑到的分支。"""
+    slots = [
+        _slot(mk, "A", ["P1", "P2"]),  # sig={P1,P2}
+        _slot(mk, "B", ["P2", "P3"]),  # sig={P2,P3}
+        _slot(mk, "C", ["P1", "P2", "P3"]),  # sig={P1,P2,P3}
+    ]
+    # jaccard(A,B)=1/3（不触发），jaccard(A,C)=2/3，jaccard(B,C)=2/3 —— C 被两对同时命中。
+    assert too_similar(slots, threshold=0.6) == [(0, 2), (1, 2)]
+
+    calls = []
+
+    def regenerate(slot, avoid_poi_ids):
+        calls.append(slot.angle.key)
+        return _slot(mk, slot.angle.key, ["Q1", "Q2"])
+
+    out = enforce_diversity(slots, regenerate, threshold=0.6)
+    assert calls == ["C"]
+    assert poi_signature(out[2].itinerary, out[2].facts) == {"Q1", "Q2"}
