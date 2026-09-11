@@ -66,11 +66,15 @@ class FakeLlm:
         self.calls.append(
             RecordedCall(role, system, list(messages), list(tools) if tools else None)
         )
-        queue = self._by_role.get(role) if self._by_role else self._script
-        if not queue:
-            if self._by_role:
+        if self._by_role:
+            queue = self._by_role.get(role)
+            if queue is None:
                 raise AssertionError(f"该角色未脚本化：role={role}")
-            else:
+            if not queue:
+                raise AssertionError(f"脚本已用尽：role={role}")
+        else:
+            queue = self._script
+            if not queue:
                 raise AssertionError(f"脚本已用尽：role={role}")
         return queue.pop(0)
 

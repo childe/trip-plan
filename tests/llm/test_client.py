@@ -51,21 +51,33 @@ def test_fake_forbids_both_script_and_by_role():
         )
 
 
-def test_fake_distinguishes_no_script_vs_exhausted():
-    """角色未脚本化 vs 脚本已用尽的错误信息应该不同。"""
-    # 按角色脚本但某个角色缺失：应该说"未脚本化"
+def test_fake_no_script_for_role_in_by_role_mode():
+    """按角色模式中，某个角色完全没有脚本条目时，应该说"未脚本化"。"""
+    llm = FakeLlm(
+        by_role={Role.PLANNER: [LlmResponse("end_turn", "p", [], Usage(1, 1))]}
+    )
+    # CRITIC 不在 by_role 中
+    with pytest.raises(AssertionError, match="该角色未脚本化"):
+        llm.chat(Role.CRITIC, "sys", [], None)
+
+
+def test_fake_script_exhausted_for_role_in_by_role_mode():
+    """按角色模式中，某个角色的脚本用尽时，应该说"已用尽"。"""
     llm = FakeLlm(
         by_role={Role.PLANNER: [LlmResponse("end_turn", "p", [], Usage(1, 1))]}
     )
     llm.chat(Role.PLANNER, "sys", [], None)
-    with pytest.raises(AssertionError, match="该角色未脚本化"):
-        llm.chat(Role.CRITIC, "sys", [], None)
-
-    # 全局脚本用尽：应该说"已用尽"
-    llm2 = FakeLlm([LlmResponse("end_turn", "x", [], Usage(1, 1))])
-    llm2.chat(Role.PLANNER, "sys", [], None)
+    # PLANNER 在 by_role 中但已用尽
     with pytest.raises(AssertionError, match="脚本已用尽"):
-        llm2.chat(Role.PLANNER, "sys", [], None)
+        llm.chat(Role.PLANNER, "sys", [], None)
+
+
+def test_fake_script_exhausted_in_global_mode():
+    """全局脚本模式中，脚本用尽时，应该说"已用尽"。"""
+    llm = FakeLlm([LlmResponse("end_turn", "x", [], Usage(1, 1))])
+    llm.chat(Role.PLANNER, "sys", [], None)
+    with pytest.raises(AssertionError, match="脚本已用尽"):
+        llm.chat(Role.PLANNER, "sys", [], None)
 
 
 def test_tool_use_response_carries_calls():
