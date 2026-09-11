@@ -130,6 +130,16 @@ def drive(state, repo, deps, ask, out, persisted: int, advance_fn=None):
         outcome = advance_fn(state, deps, ask(outcome), _print_event)
         while isinstance(outcome, Rejected):
             out(f"⚠️ {outcome.reason.value}")
+            if outcome.current is None:
+                # 这个阶段压根不在等人（工作态被塞了一条命令）。走不到这里
+                # 才是常态——drive 只在收到 NeedInput 之后才发命令——但真到了
+                # 这一步，重新问是问不出来的：没有问题可问。说清楚并退出，
+                # 强过对着一个编出来的问题空转。
+                out(
+                    "⚠️ 当前阶段并不在等待输入，无法继续交互；"
+                    "请用 `trip resume <行程目录>` 重新接上。"
+                )
+                return None
             # 状态未变、revision 未变——advance 的校验分支保证了这一点。
             # 不能再走上面那次 save_if_revision：那是一次没有意义的重写，
             # 只会白白占用一次 CAS 窗口，让本来什么都没做错的这次调用在
@@ -282,9 +292,10 @@ def _drive_and_report(state, repo, args) -> int:
     deps = build_deps(dry_run=getattr(args, "dry_run", False))
     itinerary = drive(state, repo, deps, terminal_ask, print, persisted=state.revision)
     if itinerary is None:
-        # drive() 在这里返回 None 只有一种原因：某次 save_if_revision 输掉了
-        # CAS，说明盘上的 state 已经被别的进程改动，我们手上这份内存中的
-        # state 不再权威。这时候绝不能拿它去写 write_artifacts——那会让
+        # drive() 返回 None 的主因是某次 save_if_revision 输掉了 CAS：盘上的
+        # state 已经被别的进程改动，我们手上这份内存中的 state 不再权威。
+        # （另一个来源是拒绝循环拿到 current=None——那种情况同样没有可用的
+        # 结局可写。）这时候绝不能拿它去写 write_artifacts——那会让
         # itinerary.md/html 描述的是「我们这边以为的结局」，而 state.json
         # 里记的是赢得那场 CAS 的另一个进程的结局，两者对不上。
         return 1

@@ -110,15 +110,29 @@ def _check_candidate(state, cmd) -> RejectReason | None:
     return None
 
 
-def _pending(state) -> NeedInput:
-    """当前等待态对应的 NeedInput —— 纯函数，可反复调用。"""
+def _pending(state) -> NeedInput | None:
+    """当前等待态对应的 NeedInput —— 纯函数，可反复调用。
+
+    非等待态返回 None，不编造问题。原来这里的 else 分支对任何非
+    AWAIT_REQ_CONFIRM 的阶段都返回一个 CHOOSE_OR_FEEDBACK：工作态
+    （COLLECT/GENERATE/REFINE）下 state.candidates 是空列表，
+    render_candidates([]) 渲染出来的是
+
+        候选全部生成失败，没有可选的方案——请先修改需求后重试。
+
+    ——对一个从没开始生成过的行程而言，这不是"提示为空"，是一句**错误的
+    诊断**，而且是用户会照着去行动的那种。这个函数的职责是"报出当前等待
+    态对应的问题"，它没有发明一个等待态的余地。
+    """
     if state.stage is Stage.AWAIT_REQ_CONFIRM:
         return NeedInput(
             InputKind.CONFIRM_REQUIREMENTS, state.requirements, state.revision
         )
-    return NeedInput(
-        InputKind.CHOOSE_OR_FEEDBACK, list(state.candidates), state.revision
-    )
+    if state.stage is Stage.AWAIT_CHOICE:
+        return NeedInput(
+            InputKind.CHOOSE_OR_FEEDBACK, list(state.candidates), state.revision
+        )
+    return None
 
 
 def _empty_requirements():

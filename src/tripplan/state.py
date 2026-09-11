@@ -135,7 +135,12 @@ class NeedInput:
 @dataclass(frozen=True)
 class Rejected:
     reason: RejectReason
-    current: NeedInput  # 当前真正在等的东西，driver 可直接重新渲染
+    #: 当前真正在等的东西，driver 可直接重新渲染。
+    #: None 表示「这个阶段压根不在等人」——工作态（COLLECT/GENERATE/REFINE）
+    #: 被塞进一条命令时就是这种情形。宁可给 None 也不要编一个问题出来：
+    #: 一个没生成过任何东西的行程被渲染成「候选全部生成失败，没有可选的
+    #: 方案」是一句错误的诊断，比空白提示更糟——用户会照着它去改需求。
+    current: NeedInput | None
 
 
 Outcome = Done | NeedInput | Rejected

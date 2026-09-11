@@ -772,3 +772,33 @@ def test_state_deleted_mid_session_is_reported_readably(tmp_path, capsys, monkey
     assert "找不到" in err
     assert "Traceback" not in err
     assert "TripNotFound" not in err
+
+
+def test_driver_gives_up_readably_when_a_reject_carries_no_question(tmp_path, capsys):
+    """Rejected.current 为 None（工作态被塞了命令）时，重新问是问不出来的。
+    必须说清楚并退出，不能对着 None 再调一次 ask——那就是 AttributeError；
+    也不能退回去渲染一个编出来的问题。"""
+    from tripplan.state import NeedInput, Rejected, RejectReason
+
+    repo = FileRepo(tmp_path / "kyoto")
+    state = _state(rev=1)
+    repo.create(state)
+    asked = []
+
+    def fake_advance(s, deps, cmd=None, emit=None):
+        if cmd is None:
+            return NeedInput(InputKind.CONFIRM_REQUIREMENTS, s.requirements, s.revision)
+        return Rejected(RejectReason.WRONG_COMMAND_FOR_STAGE, None)
+
+    def ask(need):
+        asked.append(need)
+        return ConfirmRequirements(1)
+
+    lines = []
+    out = drive(
+        state, repo, _deps(), ask, lines.append, persisted=1, advance_fn=fake_advance
+    )
+
+    assert out is None  # 没有结局可写，_drive_and_report 会据此返回非零
+    assert len(asked) == 1  # 没有对着 None 再问一次
+    assert any("不在等待输入" in line for line in lines)

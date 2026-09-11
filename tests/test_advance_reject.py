@@ -292,3 +292,43 @@ def test_command_replayed_against_done_returns_done_not_rejected():
     assert isinstance(out, Done)
     assert out.itinerary.angle.key == "A"  # 不会改选
     assert s.chosen_key == "A"
+
+
+# ---------- 最终评审裁定 2：非等待态不许伪造一个问题 ----------
+
+
+@pytest.mark.parametrize(
+    "stage", [Stage.COLLECT, Stage.GENERATE, Stage.REFINE], ids=lambda s: s.value
+)
+def test_rejecting_in_a_working_stage_carries_no_fabricated_question(stage):
+    """_pending 原来的 else 分支对任何非 AWAIT_REQ_CONFIRM 的阶段都返回一个
+    CHOOSE_OR_FEEDBACK。工作态下 candidates 是空列表，render_candidates([])
+    渲染出来的是「候选全部生成失败，没有可选的方案——请先修改需求后重试。」
+    ——对一个从没开始生成过的行程而言这不是"提示为空"，是一句**错误的
+    诊断**，而且是用户会照着去改需求的那种。"""
+    from tripplan.render.candidates import render_candidates
+
+    s = TripState.new("去京都", run_id="r1")
+    s.stage, s.revision, s.requirements = stage, 4, _full_reqs()
+
+    out = advance(s, _deps(), ConfirmRequirements(4))
+
+    assert isinstance(out, Rejected)
+    assert out.reason is RejectReason.WRONG_COMMAND_FOR_STAGE
+    assert out.current is None
+    # 状态与 revision 都不许动（拒绝分支的老不变量，顺带守住）
+    assert s.stage is stage and s.revision == 4
+    # 反证那句错误诊断确实存在：拿同一批（空）候选去渲染就能看见它。
+    assert "候选全部生成失败" in render_candidates(list(s.candidates))
+
+
+@pytest.mark.parametrize("stage", list(AWAITING), ids=lambda s: s.value)
+def test_rejecting_in_an_awaiting_stage_still_carries_the_real_question(stage):
+    """反证：真正在等人的两个阶段照旧带着能重新渲染的 NeedInput。"""
+    s = _awaiting_confirm() if stage is Stage.AWAIT_REQ_CONFIRM else _awaiting_choice()
+    out = advance(s, _deps(), ConfirmRequirements(s.revision - 1))  # 陈旧 revision
+
+    assert isinstance(out, Rejected)
+    assert out.reason is RejectReason.STALE_REVISION
+    assert out.current is not None
+    assert out.current.revision == s.revision
