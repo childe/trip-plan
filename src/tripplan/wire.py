@@ -433,6 +433,17 @@ def decode_state(raw: dict) -> TripState:
         raise UnsupportedVersion(
             "state.json 缺少 format_version 字段；不是可识别的 state.json"
         )
+    if not isinstance(version, int) or isinstance(version, bool):
+        # 非整数版本号（最典型的是 "2" 带引号）此前直接落到下面的
+        # `version > FORMAT_VERSION`，str 与 int 比较抛 TypeError，被
+        # repo._decode 的兜底归为 TripCorrupt ——给用户的出路成了"删掉整个
+        # 行程目录"，而真相很可能是"这文件是更新版本的工具写的，该升级工具"。
+        # 版本号本身就是迁移契约，它一旦读不懂，这两条出路就必须分得清：
+        # _decode 的文档说这是唯一必须保住的区分。
+        raise UnsupportedVersion(
+            f"state.json 的 format_version 不是整数（{version!r}）：无法判断它属于"
+            "哪个版本。多半是更新版本的 tripplan 写的，请先升级工具再试"
+        )
     if version > FORMAT_VERSION:
         raise UnsupportedVersion(
             f"state.json 版本 {version} 高于本工具支持的 {FORMAT_VERSION}；"

@@ -802,3 +802,60 @@ def test_driver_gives_up_readably_when_a_reject_carries_no_question(tmp_path, ca
     assert out is None  # 没有结局可写，_drive_and_report 会据此返回非零
     assert len(asked) == 1  # 没有对着 None 再问一次
     assert any("不在等待输入" in line for line in lines)
+
+
+# ---------- 最终评审 M1 / M3：两条小的承诺落空 ----------
+
+
+def test_eof_on_stdin_is_reported_readably_not_as_a_traceback(
+    tmp_path, capsys, monkeypatch
+):
+    """`trip resume dir < /dev/null`、管道输入、提示上按 Ctrl-D —— input()
+    抛 EOFError，此前一路裸奔成 traceback。没有人可问不是程序出错。"""
+    from tripplan.state import NeedInput
+
+    repo = FileRepo(tmp_path / "kyoto")
+    repo.create(_state(rev=1))
+
+    def fake_advance(s, deps, cmd=None, emit=None):
+        return NeedInput(InputKind.CONFIRM_REQUIREMENTS, s.requirements, s.revision)
+
+    def eof(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("tripplan.cli._advance", fake_advance)
+    monkeypatch.setattr("tripplan.cli.build_deps", lambda dry_run=False: _deps())
+    monkeypatch.setattr("builtins.input", eof)
+
+    code = main(["resume", str(repo.dir)])
+
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "Traceback" not in err
+    assert "标准输入" in err
+    assert (repo.dir / "state.json").exists()  # 进度还在，目录没坏
+
+
+def test_string_format_version_is_unsupported_not_corrupt(tmp_path, capsys):
+    """`"format_version": "2"` 之前落到 `version > FORMAT_VERSION`，str 与 int
+    比较抛 TypeError，被 repo._decode 归为 TripCorrupt ——给用户的出路成了
+    「删掉整个行程目录」，而真相很可能是「这文件是更新版本的工具写的」。
+    wire format 的迁移承诺要求这两条出路必须分得清。"""
+    import json
+
+    from tripplan.repo import TripCorrupt
+    from tripplan.wire import UnsupportedVersion
+
+    repo = FileRepo(tmp_path / "kyoto")
+    repo.create(_state(rev=0))
+    raw = json.loads((repo.dir / "state.json").read_text(encoding="utf-8"))
+    raw["format_version"] = "2"
+    (repo.dir / "state.json").write_text(
+        json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+    )
+
+    with pytest.raises(UnsupportedVersion) as exc_info:
+        repo.load()
+    assert not isinstance(exc_info.value, TripCorrupt)
+    assert "升级" in str(exc_info.value)
+    assert "删除" not in str(exc_info.value)

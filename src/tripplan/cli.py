@@ -379,6 +379,17 @@ def main(argv=None) -> int:
     except TripCorrupt as e:
         print(f"错误：{e}", file=sys.stderr)
         return 1
+    except EOFError:
+        # `trip resume dir < /dev/null`、管道输入、或者在提示上按 Ctrl-D：
+        # input() 抛 EOFError，此前一路裸奔成 traceback。这不是程序出错，
+        # 是没有人可问了；进度的处境和 ProviderError 那条一样，说清楚即可。
+        print(
+            "错误：标准输入已结束（Ctrl-D 或非交互式输入），本次操作已中断。\n"
+            "上一步已经保存到磁盘的进度还在，行程目录没有损坏；"
+            "可以在交互式终端里用 `trip resume <行程目录>` 接着跑。",
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":
