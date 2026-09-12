@@ -95,10 +95,11 @@ class AnthropicClient:
         import anthropic
 
         cfg = self.configs[role]
+        # 不传 temperature/top_p/top_k：anthropic SDK 1.x 已从 messages.create
+        # 删掉这三个参数（当代模型收到采样参数会返回 400）。要控行为走提示词。
         kwargs = dict(
             model=cfg.model,
             max_tokens=cfg.max_tokens,
-            temperature=cfg.temperature,
             system=system,
             messages=messages,
         )

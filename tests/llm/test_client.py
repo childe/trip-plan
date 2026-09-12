@@ -1,8 +1,10 @@
+import inspect
 from unittest.mock import MagicMock, patch
 
 import anthropic
 import httpx
 import pytest
+from anthropic.resources.messages import Messages
 
 from tripplan.llm.client import AnthropicClient, FakeLlm, LlmResponse, ToolCall, Usage
 from tripplan.llm.config import DEFAULT_ROLES, Role, RoleConfig
@@ -197,6 +199,36 @@ def test_anthropic_client_wraps_transport_error_as_provider_error():
             client.chat(Role.PLANNER, "sys", [], None)
 
     assert exc_info.value.__cause__ is original  # 原始异常留痕，不是吞掉
+
+
+@pytest.mark.parametrize("tools", [None, [{"name": "search", "input_schema": {}}]])
+def test_anthropic_client_kwargs_accepted_by_real_sdk_signature(tools):
+    """chat() 拼出的 kwargs 必须能被真实 SDK 的 messages.create 接受。
+
+    上面那些测试把 messages.create 换成裸 MagicMock，它收下任意关键字——
+    所以 SDK 删掉某个参数（1.5.0 删了 temperature/top_p/top_k）时，整套
+    测试照样全绿，只有真实调用会炸 TypeError。这里绕开 mock，直接拿真实
+    签名做 bind。"""
+    mock_text = MagicMock()
+    mock_text.type = "text"
+    mock_text.text = "ok"
+
+    mock_response = MagicMock()
+    mock_response.content = [mock_text]
+    mock_response.stop_reason = "end_turn"
+    mock_response.usage.input_tokens = 1
+    mock_response.usage.output_tokens = 1
+
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        mock_client_instance = MagicMock()
+        MockAnthropic.return_value = mock_client_instance
+        mock_client_instance.messages.create.return_value = mock_response
+
+        AnthropicClient(DEFAULT_ROLES).chat(Role.CLASSIFIER, "sys", [], tools)
+        call_kwargs = mock_client_instance.messages.create.call_args[1]
+
+    # self 用 None 占位——只校验关键字名，不真的调用。
+    inspect.signature(Messages.create).bind(None, **call_kwargs)
 
 
 def test_anthropic_client_omits_tools_when_empty():

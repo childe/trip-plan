@@ -17,7 +17,6 @@ class Role(Enum):
 class RoleConfig:
     model: str
     max_tokens: int
-    temperature: float = 1.0
     #: True 时只喂最终产物，不喂上游角色的推理过程。critic 需要它来保持独立视角。
     independent_context: bool = False
 
@@ -30,7 +29,7 @@ DEFAULT_ROLES: dict[Role, RoleConfig] = {
         "claude-sonnet-5", max_tokens=4000, independent_context=True
     ),
     Role.ANGLE: RoleConfig("claude-sonnet-5", max_tokens=2000),
-    Role.CLASSIFIER: RoleConfig("claude-haiku-4-5", max_tokens=1000, temperature=0.0),
+    Role.CLASSIFIER: RoleConfig("claude-haiku-4-5", max_tokens=1000),
 }
 
 
