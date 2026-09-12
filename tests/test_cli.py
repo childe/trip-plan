@@ -344,6 +344,52 @@ def test_plan_without_amap_key_reports_readable_error(tmp_path, capsys):
     assert "Traceback" not in err
 
 
+# ---------- 缺 ANTHROPIC_API_KEY 不能是 SDK 深处的裸 TypeError ----------
+#
+# AMAP_KEY 在 build_deps 里是前置检查，ANTHROPIC_API_KEY 却一路没人查：
+# AnthropicClient 把 None 原样交给 anthropic SDK，而 SDK 直到第一次
+# messages.create 才校验凭据，抛的还是 TypeError——它不是 anthropic.APIError，
+# client.chat 的 except 接不住；也不是 ProviderError/LimitExceeded，main() 的
+# except 同样接不住。于是用户看到的是一条糊到脸上的 SDK 内部 traceback。
+
+
+def test_build_deps_missing_anthropic_key_is_readable_not_typeerror(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AMAP_KEY", "test-key-123")
+    monkeypatch.setenv("TRIPPLAN_CACHE", str(tmp_path / "cache"))
+    with pytest.raises(MissingCredential) as exc_info:
+        build_deps(dry_run=False)
+    message = str(exc_info.value)
+    assert "ANTHROPIC_API_KEY" in message
+    assert "--dry-run" in message
+
+
+def test_build_deps_treats_empty_anthropic_key_as_missing(tmp_path, monkeypatch):
+    """空字符串会被 anthropic SDK 原样收下（构造不报错），然后在第一次请求时
+    炸成同一个 TypeError。判空必须是 `not key` 而不是 `is None`。"""
+    monkeypatch.setenv("AMAP_KEY", "test-key-123")
+    monkeypatch.setenv("TRIPPLAN_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    with pytest.raises(MissingCredential) as exc_info:
+        build_deps(dry_run=False)
+    assert "ANTHROPIC_API_KEY" in str(exc_info.value)
+
+
+def test_plan_without_anthropic_key_reports_readable_error(
+    tmp_path, monkeypatch, capsys
+):
+    """用户实际撞见的那条路径：AMAP_KEY 配好了，ANTHROPIC_API_KEY 没配。"""
+    monkeypatch.setenv("AMAP_KEY", "test-key-123")
+    monkeypatch.setenv("TRIPPLAN_CACHE", str(tmp_path / "cache"))
+    code = main(["plan", "去芜湖骑车喝咖啡", "--dir", str(tmp_path / "wuhu")])
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "ANTHROPIC_API_KEY" in err
+    assert "TypeError" not in err
+    assert "Traceback" not in err
+
+
 # ---------- review round 2 —— item 1：CAS 输了不能拿输掉的 state 写产物 ----------
 
 

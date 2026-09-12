@@ -241,6 +241,19 @@ def build_deps(dry_run: bool = False) -> Deps:
             "如果只是想在没有凭据的情况下试跑工具，加 --dry-run。"
         )
 
+    # LLM 凭据同样要前置检查。anthropic SDK 收到 api_key=None 不会当场报错，
+    # 它把校验推迟到第一次 messages.create，然后抛一个裸 TypeError——那既不是
+    # anthropic.APIError（client.chat 的 except 接不住），也不是 ProviderError
+    # 或 LimitExceeded（main() 的 except 同样接不住），最终原样糊成一条 SDK
+    # 内部的 traceback。空字符串也会被 SDK 照单全收，所以判空用 not 而非
+    # is None——与上面 build_provider 里的 `if not amap_key` 同一套规矩。
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise MissingCredential(
+            "缺少环境变量 ANTHROPIC_API_KEY（Anthropic 的 API key，用于调用大模型）。"
+            "请先执行 `export ANTHROPIC_API_KEY=你的key` 再运行；"
+            "如果只是想在没有凭据的情况下试跑工具，加 --dry-run。"
+        )
+
     from tripplan.llm.client import AnthropicClient
     from tripplan.llm.config import load_config
 
