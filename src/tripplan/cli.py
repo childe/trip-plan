@@ -305,9 +305,16 @@ def _cmd_resume(args) -> int:
     print(f"已载入 rev {state.revision}，阶段 {state.stage.value}")
     if args.dry_run:
         # 与 _cmd_plan 的早返回对称。没有这一句的话，Deps(client=None) 会被
-        # 交给 advance()，COLLECT 阶段的 LLM 步骤炸出 AttributeError，
-        # 而它不在 main() 的 except 元组里——一条裸 traceback，比 argparse
-        # 干净拒绝更糟。而 §6.2 的凭据错误消息正好把用户指向这条路。
+        # 交给 advance()。已经推进到 COLLECT 及之后的行程会在 LLM 步骤炸出
+        # AttributeError: 'NoneType' object has no attribute 'chat'——一条
+        # 不在 main() except 元组里的裸 traceback，比 argparse 干净拒绝更糟。
+        # （停在 AWAIT_REQ_CONFIRM 的行程走的是另一条路：advance 在①校验
+        # 阶段就短路返回 _pending(state)，根本碰不到 deps.client；drive 转去
+        # terminal_ask()，非交互下 input() 撞 EOF，被 main() 的 EOFError 分支
+        # 接住返回 1。本文件的回归测试用的正是这种状态，它守住的是「退出码
+        # 不为 0」，不是这条 AttributeError——AttributeError 那条链要到
+        # COLLECT 阶段才成立，值得留着但不能算在这条测试头上。）
+        # 而 §6.2 的凭据错误消息正好把用户指向这条 --dry-run 逃生口。
         return 0
     return _drive_and_report(state, repo, args)
 

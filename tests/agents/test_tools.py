@@ -81,7 +81,7 @@ def test_tools_and_resolver_share_the_provider_cache():
 # ---------- 注册期契约：impl(**{}) 必抛 ----------
 #
 # openai backend 在 arguments 解析失败时产出 args={}，靠 impl(**{}) 抛
-# TypeError 走 runner.py:143-149 的错误回喂通道。参数全带默认值、零参数、
+# TypeError 走 runner.py:171-179 的错误回喂通道。参数全带默认值、零参数、
 # 纯 *args / **kwargs 三种工具都会让 impl(**{}) 静默成功——白烧一次
 # max_tool_calls 额度，结果被当成正常工具结果回喂，且不留任何痕迹。
 

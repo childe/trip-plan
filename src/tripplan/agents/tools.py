@@ -16,7 +16,7 @@ def check_tool_impls(impls: dict) -> None:
     """每个工具实现必须至少有一个必填参数。
 
     这条契约存在的唯一理由在 llm/backends/openai.py：arguments 解析失败时
-    backend 产出 args={}，靠 impl(**{}) 抛 TypeError 走 runner.py:143-149
+    backend 产出 args={}，靠 impl(**{}) 抛 TypeError 走 runner.py:171-179
     的「工具错误回喂给模型」通道。零参数、纯 *args、纯 **kwargs、或参数
     全带默认值的实现都会让 impl(**{}) 静默成功——白烧一次 max_tool_calls
     额度，坏结果被当成正常结果回喂，且不留任何痕迹。
