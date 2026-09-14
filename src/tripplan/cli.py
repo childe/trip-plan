@@ -36,12 +36,12 @@ from tripplan.state import (
 # fetch_day_maps 触网（调用 provider），所以它住在 tripplan.maps 而不是
 # render/ 下——render/ 里的模块一律不许碰网络（详见 tripplan/maps.py 的说明）。
 from tripplan.maps import fetch_day_maps
+from tripplan.llm.errors import ConfigError, MissingCredential  # noqa: F401
+
+# MissingCredential 从 llm.errors 重新导出：tests/test_cli.py 与下面的
+# except 都从 tripplan.cli 拿它，必须是同一个类对象。
 
 _SLUG_STRIP = re.compile(r"[^\w一-鿿\s-]", re.U)
-
-
-class MissingCredential(Exception):
-    """跑真实流程缺一个必须的环境变量凭据。给用户看得懂的名字和出路，不是 KeyError。"""
 
 
 def slugify(text: str) -> str:
@@ -376,6 +376,11 @@ def main(argv=None) -> int:
             "可以用 `trip resume <行程目录>` 接着跑（正在进行的这一步需要重来）。",
             file=sys.stderr,
         )
+        return 1
+    except ConfigError as e:
+        # 配置读不懂是用户的输入问题，不是程序 bug——给一句人话，
+        # 不要把 TOMLDecodeError / ValueError 的 traceback 糊到脸上。
+        print(f"错误：{e}", file=sys.stderr)
         return 1
     except MissingCredential as e:
         print(f"错误：{e}", file=sys.stderr)

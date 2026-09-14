@@ -905,3 +905,41 @@ def test_string_format_version_is_unsupported_not_corrupt(tmp_path, capsys):
     assert not isinstance(exc_info.value, TripCorrupt)
     assert "升级" in str(exc_info.value)
     assert "删除" not in str(exc_info.value)
+
+
+# ---------- ConfigError 必须被 main() 收口成可读中文 ----------
+#
+# 这几条必须先 setenv AMAP_KEY。build_deps 里 AMAP 的前置检查（cli.py:236-242）
+# 排在 load_config 之前，而 _no_real_credentials 会把 AMAP_KEY 清掉——不 setenv
+# 的话请求根本走不到配置解析，测试拿到的是「缺少环境变量 AMAP_KEY」，
+# 退出码非零、也没有 Traceback，两条断言全绿而 TOML 一个字节都没读过。
+# 这是设计文档 §15 点名的假绿陷阱。
+
+
+def test_config_error_from_bad_toml_is_readable(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AMAP_KEY", "test-key-123")
+    monkeypatch.setenv("TRIPPLAN_CACHE", str(tmp_path / "cache"))
+    bad = tmp_path / "bad.toml"
+    bad.write_text("[models.x\n", encoding="utf-8")  # 缺右方括号
+    monkeypatch.setenv("TRIPPLAN_CONFIG", str(bad))
+
+    code = main(["plan", "去芜湖", "--dir", str(tmp_path / "t")])
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "Traceback" not in err
+    assert str(bad) in err  # 断言确实读到了这个文件，而不是被 AMAP 拦下
+
+
+def test_config_error_from_unknown_model_ref_is_readable(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AMAP_KEY", "test-key-123")
+    monkeypatch.setenv("TRIPPLAN_CACHE", str(tmp_path / "cache"))
+    cfg = tmp_path / "roles.toml"
+    cfg.write_text('[roles.critic]\nmodel = "claude-sonnet-5"\n', encoding="utf-8")
+    monkeypatch.setenv("TRIPPLAN_CONFIG", str(cfg))
+
+    code = main(["plan", "去芜湖", "--dir", str(tmp_path / "t")])
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "Traceback" not in err
+    assert "未知的 model 引用" in err
+    assert "claude-sonnet-5" in err  # 报的是用户写的原文
