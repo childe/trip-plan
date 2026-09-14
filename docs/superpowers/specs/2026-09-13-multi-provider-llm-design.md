@@ -1,7 +1,7 @@
 # 多 provider LLM 接入设计
 
 日期：2026-09-13
-状态：待评审（第 12 稿，已吸收十一轮评审）
+状态：实施中（第 13 稿。前 12 稿经十一轮交叉评审；第 13 稿是实施期装上 `openai` 包后，据实测修正 §6.1 与 §8.1 中关于 openai 构造期行为的两处错误描述——那些段落原本标着"未离线实测"）
 
 > **贯穿全篇的一条铁律**（第 8 轮评审揪出的那类错误的根源）：
 > **异常类型决定数据能不能活下来，异常消息决定用户能不能看懂，两者不要混为一谈。**
@@ -227,7 +227,18 @@ client = anthropic.Anthropic(api_key=spec.key or None, base_url=spec.base_url or
 
 不做这一步，`${ANTHROPIC_API_KEY:-}` 展开出的空串会直接屏蔽 SDK 的整条解析链（`_client.py:185-199` 的 docstring 逐条列出了那 5 档）。
 
-**规则一对 openai 侧同样必需，而且失败得更隐蔽。** openai v1 的构造期判据是 `if api_key is None: raise OpenAIError(...)`，所以 `api_key=""` **不抛**——它会带着一个空 Bearer token 一路走到请求期撞 401，而 401 → `ProviderError` → 候选线 FAILED → `candidates.py:37` 那句「请先修改需求后重试」。anthropic 侧至少在构造期就有信号，openai 侧连信号都没有。（openai 未安装，此条据 v1 公开契约判断，实施时需实测确认。）
+**规则一对 openai 侧同样必需，但理由与前几稿写的相反（实施期实测修正）。**
+
+前几稿写的是「openai v1 的构造期判据是 `if api_key is None: raise`，所以 `api_key=""` 不抛，会带着空 Bearer token 撞请求期 401」。**装上包之后实测证伪**（openai 3.13.0）：
+
+```
+                  env 未设            env 已设
+api_key=None      抛 OpenAIError      构造成功，取到 env 值
+api_key=""        抛 OpenAIError      抛 OpenAIError   ← 空串从不触发 env 解析链
+api_key="sk-x"    构造成功            构造成功
+```
+
+空串不是"静默带病上路"，而是**当场抛**——比原以为的安全。但规则一（`key or None`）依然必需，只是理由换了：不转成 `None`，`${OPENAI_API_KEY:-}` 展开出的空串会让 SDK **拒绝去读环境变量**，于是配了 `OPENAI_API_KEY` 的用户反而起不来。
 
 **规则二：判据是"SDK 是否解析出了任何一种凭据"，不是 `auth_headers`。**
 
@@ -239,7 +250,19 @@ if not (client.api_key or client.auth_token or getattr(client, "credentials", No
 
 这与 SDK 自身 `_validate_headers` 的凭据判断等价（`_client.py:396` 在 `_token_cache is not None` 且请求头里没有 X-Api-Key/Authorization 时早返回放行；默认构造路径下 `_token_cache` 非空 ⟺ `credentials` 非空），因此不会误判 OAuth/WIF 用户；空串已在规则一归一成 `None`，也不会假阴性。
 
-**openai 侧的对称判据近乎死代码，真正生效的是构造期捕获。** `openai.OpenAI(api_key=None)` 在 `OPENAI_API_KEY` 未设置时**构造即抛** `OpenAIError`，能活着走到 `if not client.api_key` 的 client 必然已有 key。所以 §6.1 要求的人话消息必须挂在 §10.2 的构造期捕获通道上，不能指望那条 `if`。
+**openai 侧根本不做属性判据——判据就是"构造是否成功"。** 这是实施期实测后对本节的第二处修正。
+
+原方案想套用 anthropic 那套「构造后查 `client.api_key or ...`」。实测表明那样会误判：`OPENAI_ADMIN_KEY` 单独设置时**构造成功但 `client.api_key == ''`**，属性检查会把一个凭据完全正常的用户判成缺凭据——正是规则二存在的意义所要防的假阳性方向。而 SDK 的错误信息还列出了本设计原本没建模的其它通道：
+
+```
+Missing credentials. Please pass an `api_key`, `workload_identity`, `admin_api_key`, or set the ...
+```
+
+枚举环境变量（无论是构造前守卫还是构造后检查）都会随 SDK 新增通道而持续失效。
+
+**正确判据**：直接构造，构造期捕到 `openai.OpenAIError` 就是 SDK 在说"我解析不出任何凭据"，转成 `MissingCredential`。这一条的前提已实测确认——**构造期 `OpenAIError` 只有"缺凭据"一个成因**：坏 `base_url`、空 `base_url`、负 `timeout` 全部构造成功，不抛。
+
+两家因此是同一条原则的两种形态：**让 SDK 做凭据解析的权威，我们只读它的结论。** anthropic 的结论要读属性（它构造时不校验），openai 的结论就是构造本身成不成功。
 
 ### 6.2 错误消息的契约
 
@@ -404,7 +427,9 @@ class LlmConfig:
 **每个 backend 的构造流程钉死为三步**，让"缺凭据"与"其它构造失败"各有归宿，不靠从 SDK 异常里猜：
 
 1. **import**。`ImportError` → `ConfigError`，消息指明 `uv pip install 'tripplan[openai]'`。（第 4 稿把这条写在正文里却没进 §11 的清单、也没定类型——"provider 写了 openai 但没装包"是新用户用这个特性最可能撞到的一条路径，不能靠运气收口。）
-2. **凭据**。openai 侧**先判空再构造**：`spec.key` 与 `OPENAI_API_KEY` 都空 → 直接 `MissingCredential`（因为 `openai.OpenAI(api_key=None)` 构造即抛，抢在它之前判才能给出 §6.2 的人话消息）。anthropic 侧构造后按 §6.1 规则二判 → `MissingCredential`。
+2. **凭据**。两家形态不同，但都是「让 SDK 做权威，我们只读结论」：
+   - **openai**：`api_key=spec.key or None` 直接构造，**不做任何环境变量枚举**（既不在构造前守卫，也不在构造后查属性——两者都会误判 `OPENAI_ADMIN_KEY` / `workload_identity` 用户，详见 §6.1）。构造期捕到 `openai.OpenAIError` → `MissingCredential` 并套用 §6.2 的消息契约。前提已实测：构造期 `OpenAIError` 只有"缺凭据"一个成因。
+   - **anthropic**：SDK 构造时不校验，所以构造后按 §6.1 规则二查 `api_key or auth_token or credentials` → `MissingCredential`。
 3. **其余构造期异常**（`AnthropicError` / `OpenAIError`）→ `ConfigError`。
 
 **step 3 抛出的 `ConfigError` 必须套用 §6.2 的同一套消息契约**，不能把 SDK 的英文原文直接抛给用户。这一档不是理论情形：用户只要 export 过 `ANTHROPIC_CONFIG_DIR`（或家目录里有个指向坏 profile 的 `active_config`）却没有 key，构造期就会抛 `CredentialsError`（实测），而它本质上**就是缺凭据**——却因为发生在构造期而被 step 3 扫进 `ConfigError`。若消息直接透传，§6.2 承诺必须保住的"变量名 + `--dry-run`"两件事在这一档全部丢失。

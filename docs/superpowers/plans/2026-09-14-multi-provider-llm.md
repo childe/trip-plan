@@ -1709,10 +1709,14 @@ def backend():
 # ---------- 凭据 ----------
 
 
-def test_missing_key_raises_before_constructing(monkeypatch):
-    """openai.OpenAI(api_key=None) 在 OPENAI_API_KEY 未设时构造即抛
-    OpenAIError，抢在它之前判才能给出人话消息。"""
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+def test_construction_failure_becomes_missing_credential(monkeypatch):
+    """判据就是"构造成不成功"——不做任何环境变量枚举。
+
+    打真实的 openai.OpenAI（构造不发请求）：环境里没有任何凭据时它会抛
+    OpenAIError，我们把它转成带 §6.2 消息契约的 MissingCredential。
+    """
+    for var in ("OPENAI_API_KEY", "OPENAI_ADMIN_KEY"):
+        monkeypatch.delenv(var, raising=False)
     with pytest.raises(MissingCredential) as exc:
         OpenAIBackend(_spec(key=""), role=Role.CRITIC, model_ref="gpt5")
     message = str(exc.value)
@@ -1722,15 +1726,36 @@ def test_missing_key_raises_before_constructing(monkeypatch):
     assert "--dry-run" in message
 
 
+def test_admin_key_alone_is_accepted(monkeypatch):
+    """不许枚举环境变量：OPENAI_ADMIN_KEY 单独设置时 SDK 构造得起来
+    （但 client.api_key == ''），凭据完全正常的用户不能被判成缺凭据。
+
+    这是规则二在 openai 侧的形态——枚举 OPENAI_API_KEY 的实现会在这里红。
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-env")
+    OpenAIBackend(_spec(key=""))  # 不抛
+
+
 def test_empty_key_is_handed_to_sdk_as_none(monkeypatch):
-    """规则一对 openai 同样必需，而且失败得更隐蔽：v1 的构造期判据是
-    `if api_key is None: raise`，所以 api_key="" 不抛——它会带着一个空
-    Bearer token 一路走到请求期撞 401。"""
+    """规则一。空串不会静默带病上路（openai 3.13 对 api_key="" 当场抛），
+    但它会让 SDK **拒绝去读环境变量**——于是 ${OPENAI_API_KEY:-} 展开成
+    空串时，配了该变量的用户反而起不来。"""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
     with patch("openai.OpenAI") as MockOpenAI:
         MockOpenAI.return_value.api_key = "sk-env"
         OpenAIBackend(_spec(key=""))
         assert MockOpenAI.call_args.kwargs["api_key"] is None
+
+
+def test_non_empty_base_url_is_passed_through(monkeypatch):
+    """整个多 provider 特性的存在意义就是能指向内网网关；base_url 被静默
+    丢弃是无声的产品故障。"""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    with patch("openai.OpenAI") as MockOpenAI:
+        MockOpenAI.return_value.api_key = "sk-env"
+        OpenAIBackend(_spec(base_url="https://gw.internal/v1"))
+        assert MockOpenAI.call_args.kwargs["base_url"] == "https://gw.internal/v1"
 
 
 # ---------- 请求形状 ----------
@@ -1973,31 +1998,31 @@ class OpenAIBackend:
             ) from e
 
         self.spec = spec
-        self._role, self._model_ref = role, model_ref
 
-        import os
-
-        # 先判空再构造：openai.OpenAI(api_key=None) 在 OPENAI_API_KEY 未设时
-        # 构造即抛 OpenAIError，抢在它之前判才能给出 §6.2 的人话消息。
-        if not spec.key and not os.environ.get(ENV_HINT):
-            raise MissingCredential(
-                f"缺少凭据：{_where(role, model_ref)}（provider=openai）"
-                f"没有可用的 API key。"
-                f"请先执行 `export {_var_hint(spec)}=你的key` 再运行；"
-                "如果只是想在没有凭据的情况下试跑工具，加 --dry-run。"
-            )
         try:
-            # `or None` 同规则一：openai v1 的构造期判据是 `if api_key is None`，
-            # 所以 api_key="" 不抛——它会带着空 Bearer token 撞请求期 401。
+            # `or None` 是规则一。空串不会"静默带病上路"（实测：openai 3.13
+            # 对 api_key="" 当场抛），但它会让 SDK **拒绝去读环境变量**——
+            # 于是 ${OPENAI_API_KEY:-} 展开成空串时，配了该变量的用户反而起不来。
             self._client = openai.OpenAI(
                 api_key=spec.key or None,
                 base_url=spec.base_url or None,
             )
         except openai.OpenAIError as e:
-            raise ConfigError(
-                f"{_where(role, model_ref)} 的 OpenAI 客户端构造失败。"
-                f"请检查凭据配置（通常是 `export {_var_hint(spec)}=你的key`）；"
-                f"只想试跑工具就加 --dry-run。原始错误：{e}"
+            # 构造期 OpenAIError 就是 SDK 在说"我解析不出任何凭据"——实测确认
+            # 这是它在构造期的唯一成因（坏 base_url / 空 base_url / 负 timeout
+            # 全部构造成功，不抛）。
+            #
+            # 刻意**不做任何环境变量枚举**：既不在构造前守卫、也不在构造后查
+            # client.api_key。两者都会误判——OPENAI_ADMIN_KEY 单独设置时构造
+            # 成功但 client.api_key == ''，而 SDK 的凭据通道还有
+            # workload_identity 等，枚举会随 SDK 新增通道持续失效。让 SDK 做
+            # 权威，我们只读它的结论。
+            raise MissingCredential(
+                f"缺少凭据：{_where(role, model_ref)}（provider=openai）"
+                f"没有可用的 API key。"
+                f"请先执行 `export {_var_hint(spec)}=你的key` 再运行；"
+                "如果只是想在没有凭据的情况下试跑工具，加 --dry-run。"
+                f"（SDK 原文：{e}）"
             ) from e
 
     def chat(
