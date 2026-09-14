@@ -1,6 +1,7 @@
 import pytest
 
-from tripplan.llm.config import DEFAULT_ROLES, Role, load_config
+from tripplan.llm.config import DEFAULT_ROLES, Role, load_config, expand
+from tripplan.llm.errors import ConfigError
 
 
 def test_defaults_cover_every_role():
@@ -50,3 +51,50 @@ def test_load_config_rejects_unknown_field(tmp_path):
     path.write_text('[roles.critic]\nmdoel = "gpt-5"\n', encoding="utf-8")
     with pytest.raises(ValueError, match="无效"):
         load_config(path)
+
+
+def test_expand_uses_env_when_set(monkeypatch):
+    monkeypatch.setenv("TRIP_X", "hello")
+    assert expand("${TRIP_X}", "models.m.key") == "hello"
+
+
+def test_expand_falls_back_to_default_when_unset(monkeypatch):
+    monkeypatch.delenv("TRIP_X", raising=False)
+    assert expand("${TRIP_X:-gpt-5}", "models.m.name") == "gpt-5"
+
+
+def test_expand_raises_when_unset_and_no_default(monkeypatch):
+    monkeypatch.delenv("TRIP_X", raising=False)
+    with pytest.raises(ConfigError) as exc:
+        expand("${TRIP_X}", "models.gpt5.key")
+    message = str(exc.value)
+    assert "models.gpt5.key" in message
+    assert "TRIP_X" in message
+
+
+def test_expand_empty_default_is_legal(monkeypatch):
+    """${VAR:-} 的语义是「显式留空」，不是错误。内置默认配置靠它表达
+    「交给 SDK 自己解析凭据」。"""
+    monkeypatch.delenv("TRIP_X", raising=False)
+    assert expand("${TRIP_X:-}", "models.m.base_url") == ""
+
+
+def test_expand_treats_set_but_empty_env_as_defined(monkeypatch):
+    """`export X=` 是用户显式表达「我知道它，但留空」，与「拼写错了」
+    是两回事。判据是 os.environ.get(name) is None，不是真值判断。"""
+    monkeypatch.setenv("TRIP_X", "")
+    assert expand("${TRIP_X}", "models.m.key") == ""
+
+
+def test_expand_leaves_non_matching_text_literal(monkeypatch):
+    assert expand("claude-opus-5", "models.m.name") == "claude-opus-5"
+    assert expand("$NOT_A_VAR", "models.m.name") == "$NOT_A_VAR"
+    assert expand("price is $5", "models.m.name") == "price is $5"
+
+
+def test_expand_default_stops_at_first_brace(monkeypatch):
+    """不支持嵌套，默认值取到第一个 } 为止。写明规则比发明转义便宜，
+    但必须写明——否则三个实现者会发明三套规则。"""
+    monkeypatch.delenv("TRIP_A", raising=False)
+    monkeypatch.setenv("TRIP_B", "bee")
+    assert expand("${TRIP_A:-${TRIP_B}}", "models.m.name") == "${TRIP_B}"

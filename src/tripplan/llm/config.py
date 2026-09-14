@@ -1,9 +1,43 @@
 """按角色配置模型，而不是全局一个。"""
 
+import os
+import re
 import tomllib
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
+
+from tripplan.llm.errors import ConfigError
+
+#: 只认两个形状：${NAME} 与 ${NAME:-默认值}。默认值取到**第一个** } 为止，
+#: 不支持嵌套、不提供转义——`${A:-${B}}` 会取到 `${B` 为止。这些写法在
+#: key / url / 模型名里不存在，但规则必须写死，否则每个实现者会发明一套。
+_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def expand(value: str, where: str) -> str:
+    """展开 ${VAR} 与 ${VAR:-default}。
+
+    `where` 是出错时报给用户的位置（如 "models.gpt5.key"）。
+
+    判「变量是否已定义」用 `os.environ.get(name) is None` 而不是真值判断：
+    `export X=` 是用户显式表达"我知道它，但留空"，与"拼写错了"是两回事，
+    前者应当放行成空串，后者应当当场报错。
+    """
+
+    def _sub(m: re.Match) -> str:
+        name, default = m.group(1), m.group(2)
+        env = os.environ.get(name)
+        if env is not None:
+            return env
+        if default is not None:
+            return default
+        raise ConfigError(
+            f"{where} 引用了未设置的环境变量 {name}。"
+            f"请先 export 它，或在配置里写 ${{{name}:-默认值}} 给一个默认值。"
+        )
+
+    return _VAR.sub(_sub, value)
 
 
 class Role(Enum):
