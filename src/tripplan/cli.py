@@ -5,6 +5,7 @@ advance 在暂停时会自增 revision，拿自增后的值去 CAS 必然失败�
 """
 
 import argparse
+import logging
 import os
 import re
 import sys
@@ -223,6 +224,23 @@ def build_provider(dry_run: bool = False):
     return AmapProvider(key=amap_key, cache=cache)
 
 
+def _config_path() -> Path | None:
+    """TRIPPLAN_CONFIG 优先于 TRIPPLAN_ROLES（旧名，保留兼容）。
+
+    两者同时设置时提示一句，免得用户"改了文件却没生效"还查不出来。
+    """
+    new = os.environ.get("TRIPPLAN_CONFIG")
+    old = os.environ.get("TRIPPLAN_ROLES")
+    if new and old:
+        print(
+            f"提示：TRIPPLAN_CONFIG 与 TRIPPLAN_ROLES 都设置了，"
+            f"使用 TRIPPLAN_CONFIG（{new}），忽略 TRIPPLAN_ROLES（{old}）。",
+            file=sys.stderr,
+        )
+    chosen = new or old
+    return Path(chosen) if chosen else None
+
+
 def build_deps(dry_run: bool = False) -> Deps:
     from tripplan.providers.fake import FakeProvider
 
@@ -241,27 +259,14 @@ def build_deps(dry_run: bool = False) -> Deps:
             "如果只是想在没有凭据的情况下试跑工具，加 --dry-run。"
         )
 
-    # LLM 凭据同样要前置检查。anthropic SDK 收到 api_key=None 不会当场报错，
-    # 它把校验推迟到第一次 messages.create，然后抛一个裸 TypeError——那既不是
-    # anthropic.APIError（client.chat 的 except 接不住），也不是 ProviderError
-    # 或 LimitExceeded（main() 的 except 同样接不住），最终原样糊成一条 SDK
-    # 内部的 traceback。空字符串也会被 SDK 照单全收，所以判空用 not 而非
-    # is None——与上面 build_provider 里的 `if not amap_key` 同一套规矩。
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise MissingCredential(
-            "缺少环境变量 ANTHROPIC_API_KEY（Anthropic 的 API key，用于调用大模型）。"
-            "请先执行 `export ANTHROPIC_API_KEY=你的key` 再运行；"
-            "如果只是想在没有凭据的情况下试跑工具，加 --dry-run。"
-        )
-
-    from tripplan.llm.client import AnthropicClient
     from tripplan.llm.config import load_config
+    from tripplan.llm.router import RoutingClient
 
-    cfg_path = os.environ.get("TRIPPLAN_ROLES")
-    return Deps(
-        client=AnthropicClient(load_config(Path(cfg_path) if cfg_path else None)),
-        provider=provider,
-    )
+    # RoutingClient 在构造时就把每个被引用到的 model 的 backend 建出来并校验
+    # 凭据——不能拖到第一次 chat：那时抛出的 MissingCredential 会被
+    # orchestrator._safe_slot 吞成「候选线出现未处理异常」，下面 main() 的
+    # except MissingCredential 永远等不到。
+    return Deps(client=RoutingClient(load_config(_config_path())), provider=provider)
 
 
 # ---------- 子命令 ----------
@@ -341,6 +346,13 @@ def _cmd_render(args) -> int:
 
 
 def main(argv=None) -> int:
+    # 诊断日志默认完全静默。本设计里 backend 的旁路诊断（请求的 token 预算
+    # 与实际用量、工具参数解析失败的原文、base_url 形态提示）全部走 logging
+    # 的 debug 级——不加这个开关，那些信息永远没人看得见。
+    level = os.environ.get("TRIPPLAN_LOG", "").lower()
+    if level in ("debug", "info"):
+        logging.basicConfig(level=getattr(logging, level.upper()), stream=sys.stderr)
+
     parser = argparse.ArgumentParser(prog="trip", description="旅行规划")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
