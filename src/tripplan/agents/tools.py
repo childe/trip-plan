@@ -5,10 +5,39 @@
 工具负责参数校验与「转成 LLM 友好的结构」，Provider 只管取数。
 """
 
+import inspect
 from datetime import datetime
 
 from tripplan.models.common import LatLng, TravelMode
 from tripplan.providers.base import GeoProvider, ProviderError
+
+
+def check_tool_impls(impls: dict) -> None:
+    """每个工具实现必须至少有一个必填参数。
+
+    这条契约存在的唯一理由在 llm/backends/openai.py：arguments 解析失败时
+    backend 产出 args={}，靠 impl(**{}) 抛 TypeError 走 runner.py:143-149
+    的「工具错误回喂给模型」通道。零参数、纯 *args、纯 **kwargs、或参数
+    全带默认值的实现都会让 impl(**{}) 静默成功——白烧一次 max_tool_calls
+    额度，坏结果被当成正常结果回喂，且不留任何痕迹。
+
+    用显式 raise 而不是 assert：python -O 会把 assert 整条剥掉，那时这道
+    校验静默消失。
+    """
+    for name, fn in impls.items():
+        params = inspect.signature(fn).parameters.values()
+        has_required = any(
+            p.default is inspect.Parameter.empty
+            and p.kind
+            not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            for p in params
+        )
+        if not has_required:
+            raise ValueError(
+                f"工具 {name} 没有任何必填参数。llm/backends/openai.py 在工具"
+                "参数解析失败时依赖 impl(**{}) 抛 TypeError 来把错误回喂给模型；"
+                "没有必填参数会让那次调用静默成功。请至少保留一个必填参数。"
+            )
 
 
 def build_planning_tools(provider: GeoProvider, city: str):
@@ -87,4 +116,6 @@ def build_planning_tools(provider: GeoProvider, city: str):
             },
         },
     ]
-    return specs, {"search_poi": search_poi, "route_duration": route_duration}
+    impls = {"search_poi": search_poi, "route_duration": route_duration}
+    check_tool_impls(impls)
+    return specs, impls
