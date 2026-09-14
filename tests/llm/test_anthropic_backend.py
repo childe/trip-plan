@@ -177,6 +177,37 @@ def test_construction_failure_becomes_config_error(monkeypatch, tmp_path):
     assert "--dry-run" in message
 
 
+def test_config_error_never_echoes_the_resolved_key():
+    """安全契约：spec.key（解析后的明文密钥，不是 key_source）不能出现在
+    ConfigError 里。既有的泄漏测试只覆盖了「key_source × MissingCredential」
+    这一种组合；ConfigError 是构造期的另一条出路，同样要守住。"""
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        MockAnthropic.side_effect = anthropic.AnthropicError("boom")
+        with pytest.raises(ConfigError) as exc:
+            AnthropicBackend(_spec(key="sk-ant-REALSECRET999"))
+    assert "REALSECRET999" not in str(exc.value)
+
+
+def test_provider_error_never_echoes_the_resolved_key():
+    """同上，覆盖请求期的 ProviderError 这条出路。"""
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        inst = MockAnthropic.return_value
+        inst.api_key = "k"
+        inst.messages.create.side_effect = anthropic.APIConnectionError(
+            request=httpx.Request("POST", "https://api.anthropic.com")
+        )
+        with pytest.raises(ProviderError) as exc:
+            AnthropicBackend(_spec(key="sk-ant-REALSECRET999")).chat(
+                role=Role.PLANNER,
+                model_ref="opus",
+                system="s",
+                messages=[],
+                tools=None,
+                max_tokens=100,
+            )
+    assert "REALSECRET999" not in str(exc.value)
+
+
 # ---------- 请求形状 ----------
 
 

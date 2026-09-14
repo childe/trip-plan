@@ -3,6 +3,7 @@
 会让这个 patch 失效。"""
 
 import inspect
+import sys
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -11,7 +12,7 @@ import pytest
 
 from tripplan.llm.backends.openai import OpenAIBackend
 from tripplan.llm.config import ModelSpec, Role
-from tripplan.llm.errors import MissingCredential
+from tripplan.llm.errors import ConfigError, MissingCredential
 from tripplan.providers.base import ProviderError
 
 
@@ -160,6 +161,37 @@ def test_non_empty_base_url_is_passed_through():
         MockOpenAI.return_value.api_key = "sk-env"
         OpenAIBackend(_spec(base_url="https://gw.internal/v1"))
         assert MockOpenAI.call_args.kwargs["base_url"] == "https://gw.internal/v1"
+
+
+def test_config_error_never_echoes_the_resolved_key(monkeypatch):
+    """安全契约：spec.key（解析后的明文密钥，不是 key_source）不能出现在
+    ConfigError 里。openai 侧唯一的 ConfigError 来源是包未安装
+    （ImportError）——这条消息从不引用 spec.key，这里显式钉住它，防止
+    将来往这条消息里加诊断信息时不小心带上明文密钥。"""
+    monkeypatch.setitem(sys.modules, "openai", None)
+    with pytest.raises(ConfigError) as exc:
+        OpenAIBackend(_spec(key="sk-oai-REALSECRET999"))
+    assert "REALSECRET999" not in str(exc.value)
+
+
+def test_provider_error_never_echoes_the_resolved_key():
+    """同上，覆盖请求期的 ProviderError 这条出路。"""
+    with patch("openai.OpenAI") as MockOpenAI:
+        inst = MockOpenAI.return_value
+        inst.api_key = "k"
+        inst.chat.completions.create.side_effect = openai.APIConnectionError(
+            request=httpx.Request("POST", "https://gw.example.com")
+        )
+        with pytest.raises(ProviderError) as exc:
+            OpenAIBackend(_spec(key="sk-oai-REALSECRET999")).chat(
+                role=Role.PLANNER,
+                model_ref="gpt5",
+                system="s",
+                messages=[],
+                tools=None,
+                max_tokens=100,
+            )
+    assert "REALSECRET999" not in str(exc.value)
 
 
 # ---------- 请求形状 ----------

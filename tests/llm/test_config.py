@@ -79,7 +79,7 @@ def test_is_var_reference_false_for_literal_or_partial_match():
 @pytest.fixture(autouse=True)
 def _sealed_env(monkeypatch):
     """配置解析读环境变量，测试必须不依赖开发机上碰巧 export 过什么。"""
-    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TRIP_GPT_MODEL"):
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TRIP_GPT_MODEL", "TRIP_GW"):
         monkeypatch.delenv(var, raising=False)
 
 
