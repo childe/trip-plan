@@ -500,7 +500,7 @@ class LlmConfig:
 
 用 `ProviderError` 标记它的真实代价（第 2 稿这里写错了，说是"行程清零"）：`slot.py:87-89` 把 `itin`、`facts` **原样交给** `CandidateSlot`，只是 `status=FAILED` 且不回写 `itin.issues`。而下游 `render/candidates.py:15` 只在 `itinerary is None` 时标「无法选择」、`candidates.py:23` 只在 `EXHAUSTED` 时显示 `detail`（`orchestrator.py:108` 的 `_check_candidate` 同样只看 `itinerary is None`）。所以产出的是一个**看起来完全正常、可被用户选中、而失败原因被静默隐藏**的候选——比"清零"更糟。
 
-`runner.py:143-149` 对工具**执行**失败已有成熟通道：捕获异常 → `results.append(f"[{name}] 错误：{e}")` → 回喂给模型自己改正。参数解析失败走同一条路：backend 在解析失败时产出 `ToolCall(id, name, args={})`，`impl(**{})` 会因缺必填参数抛 `TypeError`，被既有的 `except Exception` 捕获并回喂。
+`runner.py` 里工具执行那段 `except Exception as e: results.append(f"[{name}] 错误：{e}")` 对工具**执行**失败已有成熟通道：捕获异常 → 回喂给模型自己改正（行号会随后续改动漂移，故以代码结构定位，不钉死行号）。参数解析失败走同一条路：backend 在解析失败时产出 `ToolCall(id, name, args={})`，`impl(**{})` 会因缺必填参数抛 `TypeError`，被既有的 `except Exception` 捕获并回喂。
 
 **这条通道依赖一个必须写明的前提：工具的参数必须全部必填。** 现有两个工具满足（`tools.py:15` 的 `search_poi(query)`、`tools.py:34-36` 的 `route_duration(...)` 五个参数全必填）。若将来新增的工具参数全带默认值，`impl(**{})` 会**静默执行一次无意义调用**、把结果当正常结果回喂、白烧一次 `max_tool_calls` 额度、且不留任何痕迹。
 
@@ -586,6 +586,26 @@ IdentityTokenFileError  是APIError子类=False  是AnthropicError子类=True
 backend 内部写 `import openai` 后使用 `openai.OpenAI(...)`，**不要** `from openai import OpenAI`——后者使 `patch("openai.OpenAI")` 失效。这与现有 `client.py:87` + `tests/llm/test_client.py:124` 的 `patch("anthropic.Anthropic")` 同构。
 
 `openai` 作为可选依赖：`[project.optional-dependencies] openai = ["openai>=1.0"]`，**同时加入 `dev` extra**（当前 `pyproject.toml:8` 只有 pytest/pytest-cov/black），否则 §15 的新测试文件在默认环境下是 collect error 而非 skip。
+
+### 10.5 Anthropic 侧归一化
+
+本节标题虽是「OpenAI 侧归一化」，但 §10.0.1 的标准其实是普适的：**任何会让响应解析抛出非 `ProviderError` 异常的空洞，都必须显式归一**。Anthropic 侧同样有两个这样的空洞，且成因与 OpenAI 侧完全一样——SDK 用宽松解析（`construct_type`），网关省略字段时得到的是 `None`，不是校验错误，没有 `APIResponseValidationError` 可捕。`base_url` 指向自建网关是本项目的一等功能（§14.1），网关的响应形状不再受 Anthropic 官方契约约束，这两个空洞是真实可达的（已用 `httpx2.MockTransport` 实测复现完整 HTTP 往返）。
+
+| 空洞 | 归一 |
+|---|---|
+| **`resp.content` 为 `None`**（网关省略 `content` 字段） | `blocks = resp.content or []`，后续对 `tool_use` / `text` 的遍历都改用 `blocks`。不归一则裸迭代 `None` 是 `TypeError` |
+| **`resp.usage` 为 `None`**（网关省略 `usage` 字段） | 归一成 `Usage(0, 0)` 并记一条 `logger.debug`。不归一则 `resp.usage.output_tokens` 是 `AttributeError`。**注意 `logger.debug(...)` 的参数是即时求值的**——归一判断必须放在这句 debug 日志之前，否则日志本身就会先炸 |
+
+两者都不归一的实测结果：
+
+```
+完整响应                   OK
+网关省略 usage             ★逃逸★ AttributeError: 'NoneType' object has no attribute 'output_tokens'
+网关省略 content           ★逃逸★ TypeError: 'NoneType' object is not iterable
+usage 为空对象（{}）        OK（SDK 给字段填了 None 默认值，不炸；此情形不需要额外防御）
+```
+
+两条逃逸都不是 `ProviderError`，会绕过 `run_slot` 直接落到 `orchestrator._safe_slot`——已生成的行程被硬编码成 `None` 丢弃，正是开篇铁律要防的那件事。
 
 ## 11. 配置错误必须可读
 

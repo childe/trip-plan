@@ -293,6 +293,80 @@ def test_hard_stop_reasons_become_provider_error(stop_reason, needle):
         assert needle in str(exc.value)
 
 
+# ---------- 响应形状归一化（Critical：网关可以省略字段） ----------
+
+_FULL_MESSAGE_BODY = {
+    "id": "msg_1",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-opus-5",
+    "content": [{"type": "text", "text": "hi"}],
+    "stop_reason": "end_turn",
+    "stop_sequence": None,
+    "usage": {"input_tokens": 10, "output_tokens": 5},
+}
+
+
+def _client_over_mock_transport(body: dict):
+    """真正走一次完整 HTTP 往返的 anthropic.Anthropic，响应体由我们控制。
+
+    单纯 mock `messages.create` 的返回值测不到这条路径：MagicMock 的属性
+    访问永远不是 None，测不出"SDK 用宽松解析（construct_type），网关省略
+    字段时字段变成 None、而不是抛校验错误——没有 APIResponseValidationError
+    可捕"这件事本身是真的。这里让真实 SDK 解析一份我们手工裁剪过的 JSON，
+    证明 resp.usage / resp.content 确实会是 None，不是臆测。
+    """
+    import httpx2
+
+    def handler(request):
+        return httpx2.Response(200, json=body, request=request)
+
+    transport = httpx2.MockTransport(handler)
+    return anthropic.Anthropic(
+        api_key="sk-test", http_client=httpx2.Client(transport=transport)
+    )
+
+
+def test_missing_usage_becomes_zero():
+    """网关省略 usage：SDK 把 resp.usage 解成 None（实测）。裸读
+    resp.usage.output_tokens 是 AttributeError——不是 ProviderError，会绕
+    过 run_slot 直接落到 orchestrator._safe_slot，把已生成的行程硬编码
+    丢弃。base_url 指向自建网关是本项目的一等功能，网关的响应形状不再受
+    Anthropic 官方契约约束，这条路径是真实可达的。"""
+    body = dict(_FULL_MESSAGE_BODY)
+    del body["usage"]
+    backend = AnthropicBackend(_spec())
+    backend._client = _client_over_mock_transport(body)
+    out = backend.chat(
+        role=Role.PLANNER,
+        model_ref="opus",
+        system="s",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=100,
+    )
+    assert (out.usage.input_tokens, out.usage.output_tokens) == (0, 0)
+
+
+def test_missing_content_becomes_empty():
+    """网关省略 content：SDK 把 resp.content 解成 None（实测）。裸迭代
+    None 是 TypeError——同样绕过 ProviderError，同样的后果。"""
+    body = dict(_FULL_MESSAGE_BODY)
+    del body["content"]
+    backend = AnthropicBackend(_spec())
+    backend._client = _client_over_mock_transport(body)
+    out = backend.chat(
+        role=Role.PLANNER,
+        model_ref="opus",
+        system="s",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=100,
+    )
+    assert out.tool_calls == []
+    assert out.text == ""
+
+
 # ---------- 请求期错误映射（铁律） ----------
 
 

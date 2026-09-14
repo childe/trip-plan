@@ -113,10 +113,17 @@ class AnthropicBackend:
             # 它们不是 APIError 子类，SDK 也明确不把它们包装成 APIConnectionError。
             raise ProviderError(str(e)) from e
 
+        # `resp.content` 与 `resp.usage` 都可能是 None：SDK 用宽松解析
+        # （construct_type）——网关省略字段时得到的是 None，不是校验错误，
+        # 没有 APIResponseValidationError 可捕。裸迭代 None / 裸读
+        # None.output_tokens 都不是 ProviderError，会绕过 run_slot 直接
+        # 落到 orchestrator._safe_slot 把已生成的行程丢弃（见本文件顶部
+        # 与设计文档 §10 的铁律）。base_url 指向自建网关是本项目的一等
+        # 功能，网关的响应形状不再受 Anthropic 契约约束，这两个空洞是
+        # 真实可达的（已用 httpx2.MockTransport 实测复现）。
+        blocks = resp.content or []
         calls = [
-            ToolCall(b.id, b.name, b.input)
-            for b in resp.content
-            if b.type == "tool_use"
+            ToolCall(b.id, b.name, b.input) for b in blocks if b.type == "tool_use"
         ]
         if not calls:
             if resp.stop_reason == "refusal":
@@ -124,20 +131,27 @@ class AnthropicBackend:
             if resp.stop_reason == "model_context_window_exceeded":
                 raise ProviderError("上下文窗口已超出：对话历史太长")
 
-        text = "".join(b.text for b in resp.content if b.type == "text")
+        text = "".join(b.text for b in blocks if b.type == "text")
+
+        usage = resp.usage
+        if usage is None:
+            logger.debug("上游未返回 usage，计量按 0 记")
+            counted = Usage(0, 0)
+        else:
+            counted = Usage(usage.input_tokens, usage.output_tokens)
         logger.debug(
             "anthropic 响应 model=%s stop_reason=%s requested_max_tokens=%d "
             "output_tokens=%d",
             self.spec.name,
             resp.stop_reason,
             max_tokens,
-            resp.usage.output_tokens,
+            counted.output_tokens,
         )
         return LlmResponse(
             stop_reason=_stop_reason(resp.stop_reason, bool(calls)),
             text=text,
             tool_calls=calls,
-            usage=Usage(resp.usage.input_tokens, resp.usage.output_tokens),
+            usage=counted,
         )
 
 

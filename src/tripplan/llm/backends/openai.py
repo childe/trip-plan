@@ -136,6 +136,18 @@ class OpenAIBackend:
         text = message.content or ""
         calls, notes = [], []
         for c in raw_calls:
+            # `ChatCompletionMessageCustomToolCall`（type="custom"）没有
+            # `.function` 字段——本项目的工具全部本地实现为 function
+            # tool，从未注册过 custom tool，模型不该收到这个选项，但网关/
+            # SDK 版本升级仍可能把它塞进响应。裸读 `c.function` 会抛
+            # AttributeError，不是 ProviderError，会绕过 run_slot 直接
+            # 落到 orchestrator._safe_slot 把已生成的行程丢弃。
+            if getattr(c, "type", "function") != "function":
+                raise ProviderError(
+                    f"{_where(role, model_ref)}（provider=openai）收到了不支持的"
+                    f"工具调用类型（type={c.type!r}）：本项目的工具全部是本地 "
+                    "function，不支持 custom tool。"
+                )
             args, note = _parse_arguments(c.function.arguments)
             calls.append(ToolCall(c.id, c.function.name, args))
             if note:

@@ -58,6 +58,7 @@ def _resp(
 def _call(name, arguments, cid="c1"):
     c = MagicMock()
     c.id = cid
+    c.type = "function"
     c.function.name, c.function.arguments = name, arguments
     return c
 
@@ -278,6 +279,24 @@ def test_missing_usage_becomes_zero(backend):
     mock.chat.completions.create.return_value = _resp(usage=None)
     out = _chat(b)
     assert (out.usage.input_tokens, out.usage.output_tokens) == (0, 0)
+
+
+def test_custom_tool_call_becomes_provider_error(backend):
+    """`ChatCompletionMessageCustomToolCall`（type="custom"）没有 `.function`
+    字段。本项目从未注册过 custom tool，但网关/SDK 版本升级仍可能把它塞进
+    响应；裸读 `c.function` 会抛 AttributeError，不是 ProviderError，会绕过
+    run_slot 直接落到 orchestrator._safe_slot 把已生成的行程丢弃。"""
+    b, mock = backend
+    custom_call = MagicMock(spec=["id", "type", "custom"])
+    custom_call.id = "c1"
+    custom_call.type = "custom"
+    custom_call.custom.name, custom_call.custom.input = "some_tool", "{}"
+    mock.chat.completions.create.return_value = _resp(
+        content=None, tool_calls=[custom_call]
+    )
+    with pytest.raises(ProviderError) as exc:
+        _chat(b)
+    assert "custom" in str(exc.value)
 
 
 def test_empty_arguments_string_becomes_empty_dict(backend):
