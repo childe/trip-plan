@@ -115,7 +115,14 @@ class OpenAIBackend:
         except openai.OpenAIError as e:
             # 捕基类不捕 APIError——openai 里 OpenAIError 是基类、APIError 是
             # 其子类，凭据刷新一类的错误不会是 APIError。
-            raise ProviderError(str(e)) from e
+            #
+            # 消息必须带上下文，不能是裸 str(e)：str(openai.APIConnectionError(...))
+            # 恰好总是 'Connection error.'——网关连不上是双 provider 时代最常见的
+            # 故障，裸消息会让用户连是哪个角色、哪个 model、哪个 provider 都猜
+            # 不出来。类型不变，仍是 ProviderError。
+            raise ProviderError(
+                f"{_where(role, model_ref)}（provider=openai）请求失败：{e}"
+            ) from e
 
         if not resp.choices:
             raise ProviderError("上游返回了空的 choices")

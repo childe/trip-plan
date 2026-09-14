@@ -371,12 +371,16 @@ def test_missing_content_becomes_empty():
 
 
 def test_api_error_becomes_provider_error():
+    """`str(anthropic.APIConnectionError(...))` 恰好总是 'Connection error.'——
+    这个分支不改消息就丢光全部上下文，网关连不上时用户只会看到
+    "外部依赖失败：Connection error."，猜不出是哪个角色、哪个 model、
+    哪个 provider。断言角色名与 model 名都必须出现在最终消息里。"""
     request = httpx.Request("POST", "https://api.anthropic.com")
     with patch("anthropic.Anthropic") as MockAnthropic:
         inst = MockAnthropic.return_value
         inst.api_key = "k"
         inst.messages.create.side_effect = anthropic.APIConnectionError(request=request)
-        with pytest.raises(ProviderError):
+        with pytest.raises(ProviderError) as exc:
             AnthropicBackend(_spec()).chat(
                 role=Role.PLANNER,
                 model_ref="opus",
@@ -385,6 +389,11 @@ def test_api_error_becomes_provider_error():
                 tools=None,
                 max_tokens=100,
             )
+        message = str(exc.value)
+        assert "planner" in message
+        assert "opus" in message
+        assert "anthropic" in message
+        assert "Connection error" in message  # SDK 原文仍要保留
 
 
 def test_non_api_error_vendor_exception_also_becomes_provider_error():

@@ -344,12 +344,20 @@ def test_adapter_diagnostic_is_appended_not_replacing_model_text(backend):
 
 
 def test_api_error_becomes_provider_error(backend):
+    """`str(openai.APIConnectionError(...))` 恰好总是 'Connection error.'——
+    不改消息就丢光全部上下文，网关连不上时用户看不出是哪个角色、哪个
+    model、哪个 provider。断言角色名与 model 名都必须出现在最终消息里。"""
     b, mock = backend
     mock.chat.completions.create.side_effect = openai.APIConnectionError(
         request=httpx.Request("POST", "https://gw.example.com")
     )
-    with pytest.raises(ProviderError):
+    with pytest.raises(ProviderError) as exc:
         _chat(b)
+    message = str(exc.value)
+    assert "planner" in message
+    assert "gpt5" in message
+    assert "openai" in message
+    assert "Connection error" in message  # SDK 原文仍要保留
 
 
 def test_non_api_error_vendor_exception_also_becomes_provider_error(backend):

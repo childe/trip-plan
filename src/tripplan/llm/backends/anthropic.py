@@ -111,7 +111,14 @@ class AnthropicBackend:
         except anthropic.AnthropicError as e:
             # 捕基类不捕 APIError：请求期刷新令牌失败会抛 CredentialsError 等，
             # 它们不是 APIError 子类，SDK 也明确不把它们包装成 APIConnectionError。
-            raise ProviderError(str(e)) from e
+            #
+            # 消息必须带上下文，不能是裸 str(e)：str(anthropic.APIConnectionError(...))
+            # 恰好总是 'Connection error.'——网关连不上是双 provider 时代最常见的
+            # 故障，比 401 常见得多，裸消息会让用户连是哪个角色、哪个 model、
+            # 哪个 provider 都猜不出来。类型不变，仍是 ProviderError。
+            raise ProviderError(
+                f"{_where(role, model_ref)}（provider=anthropic）请求失败：{e}"
+            ) from e
 
         # `resp.content` 与 `resp.usage` 都可能是 None：SDK 用宽松解析
         # （construct_type）——网关省略字段时得到的是 None，不是校验错误，
