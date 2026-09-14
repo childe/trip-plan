@@ -610,7 +610,7 @@ IdentityTokenFileError  是APIError子类=False  是AnthropicError子类=True
 
 backend 内部写 `import openai` 后使用 `openai.OpenAI(...)`，**不要** `from openai import OpenAI`——后者使 `patch("openai.OpenAI")` 失效。这与现有 `client.py:87` + `tests/llm/test_client.py:124` 的 `patch("anthropic.Anthropic")` 同构。
 
-`openai` 作为可选依赖：`[project.optional-dependencies] openai = ["openai>=1.0"]`，**同时加入 `dev` extra**（当前 `pyproject.toml:8` 只有 pytest/pytest-cov/black），否则 §15 的新测试文件在默认环境下是 collect error 而非 skip。
+`openai` 作为可选依赖：`[project.optional-dependencies] openai = ["openai>=3.13"]`（下限取实测验证过的版本：max_completion_tokens 需要远晚于 1.0 的 SDK，admin_api_key 凭据通道需要 3.x），**同时加入 `dev` extra**（当前 `pyproject.toml:8` 只有 pytest/pytest-cov/black），否则 §15 的新测试文件在默认环境下是 collect error 而非 skip。
 
 ## 11. 配置错误必须可读
 

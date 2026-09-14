@@ -6,7 +6,7 @@
 
 **Architecture:** 配置分两层——先定义一组 model（各带 provider、name、base_url、key，字符串字段支持 `${VAR:-default}` 展开），角色只引用 model 名。`RoutingClient` 实现现有的 `LlmClient` Protocol，按角色分派到对应 backend，因此 `steps.py` / `deps.py` 完全不动、`runner.py` 只动三处。两个 backend 各自把自家响应归一化成现有的 `LlmResponse`。
 
-**Tech Stack:** Python 3.12、`anthropic>=0.40`（实测于 1.5.0）、`openai>=1.0`（可选依赖，懒加载）、`tomllib`、pytest、dataclasses。
+**Tech Stack:** Python 3.12、`anthropic>=0.40`（实测于 1.5.0）、`openai>=3.13`（可选依赖，懒加载；实测于 3.13.0）、`tomllib`、pytest、dataclasses。
 
 **Spec:** `docs/superpowers/specs/2026-09-13-multi-provider-llm-design.md`（第 12 稿，经十一轮交叉评审）
 
@@ -1612,14 +1612,14 @@ git commit -m "feat(llm): Anthropic backend 迁移到 llm/backends/
 
 ```toml
 [project.optional-dependencies]
-openai = ["openai>=1.0"]
-dev = ["pytest>=8", "pytest-cov>=5", "black>=24", "openai>=1.0"]
+openai = ["openai>=3.13"]  # 下限=实测验证过的版本，见下方说明
+dev = ["pytest>=8", "pytest-cov>=5", "black>=24", "openai>=3.13"]
 ```
 
 `openai` 必须同时进 `dev`，否则本任务的测试文件在默认环境下是 **collect error** 而不是 skip。
 
 ```bash
-.venv/bin/uv pip install 'openai>=1.0'
+.venv/bin/uv pip install 'openai>=3.13'
 ```
 
 - [ ] **Step 2: 写失败测试**
