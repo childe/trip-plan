@@ -8,8 +8,8 @@ from tripplan.llm.errors import ConfigError, MissingCredential
 
 
 def test_missing_credential_is_the_same_class_from_both_paths():
-    """cli.py 重新导出它，所以 cli.py:380 的 except 与测试的 import
-    必须指向同一个类对象，否则 except 接不住。"""
+    """cli.py 重新导出它，所以 cli.py 里 `except MissingCredential` 那一段
+    与测试的 import 必须指向同一个类对象，否则 except 接不住。"""
     assert CliMissingCredential is MissingCredential
 
 

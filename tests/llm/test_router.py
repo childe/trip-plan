@@ -78,8 +78,9 @@ def test_backends_are_cached_by_provider_base_url_key():
 
 
 def test_all_referenced_backends_are_built_at_load_time():
-    """按需构造时 MissingCredential 会被 orchestrator.py:254 的
-    except Exception 吞成「候选线出现未处理异常」，cli.py:380 永远等不到。"""
+    """按需构造时 MissingCredential 会被 orchestrator.py 里 _safe_slot 的
+    except Exception 吞成「候选线出现未处理异常」，cli.py 里
+    `except MissingCredential` 那一段永远等不到。"""
     boom = []
 
     class _Boom(_Recorder):
@@ -93,7 +94,7 @@ def test_all_referenced_backends_are_built_at_load_time():
 
 
 def test_chat_signature_is_positional_compatible_with_protocol():
-    """runner.py:130 按位置调用 client.chat(role, system, messages, tools)。"""
+    """run_agent 按位置调用 client.chat(role, system, messages, tools)。"""
     client = _client(_config())
     out = client.chat(Role.PLANNER, "sys", [], None)
     assert isinstance(out, LlmResponse)

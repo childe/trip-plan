@@ -438,7 +438,7 @@ def test_no_hint_when_exhausted_by_tool_calls():
 
 
 def test_no_hint_when_interrupted_before_any_round():
-    """零轮真空为真。runner.py:129 的 ctx.check() 在 client.chat 之前，
+    """零轮真空为真。run_agent 循环开头的 ctx.check() 在 client.chat 之前，
     而 ctx 的作用域是整条候选线——第二、三次 run_agent 可能一次 chat 都
     没发出就被 deadline 打断。"""
     llm = FakeLlm([])

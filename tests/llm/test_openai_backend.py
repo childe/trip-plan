@@ -237,10 +237,11 @@ def test_tool_calls_decide_the_round_not_finish_reason(backend):
 
 
 def test_none_content_becomes_empty_string(backend):
-    """LlmResponse.text 的类型是 str。不归一则 runner.py:159 会把 None 塞进
-    messages，runner.py:154 的 text.strip() 抛 AttributeError——既不是
-    ProviderError 也不是 LimitExceeded，只会被 orchestrator 吞成
-    「候选线出现未处理异常」。"""
+    """LlmResponse.text 的类型是 str。不归一则 run_agent 里修复轮那句
+    `resp.text.strip() or "(空回复)"` 会把 None 塞进 messages，随后
+    `_parse_and_validate(resp.text, ...)` → `_load_json` → `text.strip()`
+    抛 AttributeError——既不是 ProviderError 也不是 LimitExceeded，只会被
+    orchestrator 吞成「候选线出现未处理异常」。"""
     b, mock = backend
     mock.chat.completions.create.return_value = _resp(content=None)
     assert _chat(b).text == ""
@@ -316,8 +317,8 @@ def test_broken_arguments_go_through_the_tool_error_channel(backend):
     EXHAUSTED 时显示 detail——产出的是一个看起来完整、可被用户选中、失败
     原因被静默隐藏的候选。比"清零"更糟。
 
-    改走 args={}：impl(**{}) 会因缺必填参数抛 TypeError，被 runner.py:148
-    的 except Exception 捕获并回喂给模型自己改正。
+    改走 args={}：impl(**{}) 会因缺必填参数抛 TypeError，被 run_agent 里
+    工具调用那段 except Exception 捕获并回喂给模型自己改正。
     """
     b, mock = backend
     mock.chat.completions.create.return_value = _resp(

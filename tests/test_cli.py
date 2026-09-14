@@ -995,9 +995,10 @@ def test_string_format_version_is_unsupported_not_corrupt(tmp_path, capsys):
 
 # ---------- ConfigError 必须被 main() 收口成可读中文 ----------
 #
-# 这几条必须先 setenv AMAP_KEY。build_deps 里 AMAP 的前置检查（cli.py:236-242）
-# 排在 load_config 之前，而 _no_real_credentials 会把 AMAP_KEY 清掉——不 setenv
-# 的话请求根本走不到配置解析，测试拿到的是「缺少环境变量 AMAP_KEY」，
+# 这几条必须先 setenv AMAP_KEY。build_deps 里 AMAP 的前置检查（构造
+# MissingCredential 那一段）排在 load_config 之前，而 _no_real_credentials
+# 会把 AMAP_KEY 清掉——不 setenv 的话请求根本走不到配置解析，测试拿到的是
+# 「缺少环境变量 AMAP_KEY」，
 # 退出码非零、也没有 Traceback，两条断言全绿而 TOML 一个字节都没读过。
 # 这是设计文档 §15 点名的假绿陷阱。
 

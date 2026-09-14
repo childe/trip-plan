@@ -184,9 +184,9 @@ def _parse_arguments(raw: str) -> tuple[dict, str | None]:
     """arguments 是 JSON 字符串。空串（部分网关对无参调用的返回）按 {} 处理。
 
     解析失败不抛 ProviderError——那会杀死整条候选线。产出 args={} 让
-    impl(**{}) 因缺必填参数抛 TypeError，走 runner.py:143-149 既有的
-    「工具错误回喂给模型」通道；同时把原文注入 text，让模型知道是自己的
-    JSON 坏了，而不是只看到"缺少必填参数"。
+    impl(**{}) 因缺必填参数抛 TypeError，走 run_agent 里工具调用那段
+    「except Exception 把错误回喂给模型」的既有通道；同时把原文注入
+    text，让模型知道是自己的 JSON 坏了，而不是只看到"缺少必填参数"。
     """
     if not raw:
         return {}, None

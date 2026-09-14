@@ -31,8 +31,9 @@ class RoutingClient:
 
         不按需构造：那样 critic 的 backend 要等第一次 critic 调用才构造，
         此时 planner 的 16000 token 已经花掉；更要命的是那时抛出的
-        MissingCredential 会被 orchestrator.py:254 的 except Exception 吞成
-        「候选线出现未处理异常」，cli.py:380 的 except 永远等不到它。
+        MissingCredential 会被 orchestrator.py 里 _safe_slot 的 except Exception
+        吞成「候选线出现未处理异常」，cli.py 里 `except MissingCredential` 那一段
+        永远等不到它。
 
         缓存键是 (provider, base_url, key)，不是 model 引用名——默认配置里
         三个 model 同端点同 key，按名缓存会开三份连接池。
@@ -60,8 +61,8 @@ class RoutingClient:
         return self._by_role[role]
 
     def chat(self, role: Role, system: str, messages: list, tools: list | None):
-        """位置参数顺序必须与 LlmClient Protocol 一致——runner.py:130
-        是按位置调用的。"""
+        """位置参数顺序必须与 LlmClient Protocol 一致——run_agent 里
+        `client.chat(role, system_prompt, messages, tools)` 是按位置调用的。"""
         rc = self._config.roles[role]
         return self._by_role[role].chat(
             role=role,
