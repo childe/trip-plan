@@ -8,6 +8,7 @@ from tripplan.llm.config import (
     Role,
     RoleConfig,
     expand,
+    is_var_reference,
     load_config,
 )
 from tripplan.llm.errors import ConfigError
@@ -60,6 +61,19 @@ def test_expand_default_stops_at_first_brace(monkeypatch):
     monkeypatch.delenv("TRIP_A", raising=False)
     monkeypatch.setenv("TRIP_B", "bee")
     assert expand("${TRIP_A:-${TRIP_B}}", "models.m.name") == "${TRIP_B}"
+
+
+def test_is_var_reference_true_for_a_whole_var_expression():
+    assert is_var_reference("${A}") is True
+    assert is_var_reference("${A:-x}") is True
+
+
+def test_is_var_reference_false_for_literal_or_partial_match():
+    """假值必须覆盖两类：纯字面量（用户写了明文密钥），以及文本里只是
+    包含 ${...} 但整体不是一个引用（拼接了两个变量）——is_var_reference
+    判的是「整段文本就是一个引用」，不是「文本里有没有引用」。"""
+    assert is_var_reference("sk-ant-literal-key") is False
+    assert is_var_reference("${A}${B}") is False
 
 
 @pytest.fixture(autouse=True)
