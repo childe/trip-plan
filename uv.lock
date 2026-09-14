@@ -381,6 +381,23 @@ wheels = [
 ]
 
 [[package]]
+name = "openai"
+version = "3.13.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpx2" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/40/f1/4874c4f7db30121885e6a763e2670b2fe1d76c79ed4732f8acbb51c8d96e/openai-3.13.0.tar.gz", hash = "sha256:a8f87a9b3b9c08eb446d68bd0a80e8ec907c4c35fdea63f4265c7b34b2de3a60", size = 1624217, upload-time = "2026-09-10T19:38:27.597Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/63/7f/ee9ebb7c5ab7abf016969faec7c748a91c1fd893078bfe1e5ba5d82e96c2/openai-3.13.0-py3-none-any.whl", hash = "sha256:e35b1f6fe99245e86e37504d9fad1ad2a363807307c424232c1d849bd0666c8e", size = 2009683, upload-time = "2026-09-10T19:38:25.855Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "26.3"
 source = { registry = "https://pypi.org/simple" }
@@ -595,8 +612,12 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "black" },
+    { name = "openai" },
     { name = "pytest" },
     { name = "pytest-cov" },
+]
+openai = [
+    { name = "openai" },
 ]
 
 [package.metadata]
@@ -604,10 +625,12 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.40" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=24" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "openai", marker = "extra == 'dev'", specifier = ">=3.13" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=3.13" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["openai", "dev"]
 
 [[package]]
 name = "truststore"
