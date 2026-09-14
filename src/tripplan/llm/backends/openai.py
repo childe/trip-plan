@@ -125,6 +125,11 @@ class OpenAIBackend:
         if getattr(message, "refusal", None):
             raise ProviderError(f"模型拒绝了本次请求：{message.refusal}")
         raw_calls = list(message.tool_calls or [])
+        # 归一化表写的是「content_filter → ProviderError」，这里多一个
+        # `not raw_calls` 前提：带 tool_calls 的 content_filter 更像网关噪音
+        # （部分网关在工具轮上把 finish_reason 误标成 content_filter，与
+        # 「判工具轮看 tool_calls 非空、不看 finish_reason」是同一条原则）。
+        # 有 tool_calls 就按工具轮走正常路径，不强行报错。
         if not raw_calls and choice.finish_reason == "content_filter":
             raise ProviderError("上游内容过滤拦截了本次生成")
 

@@ -77,30 +77,50 @@ def _chat(backend, **over):
 
 @pytest.fixture
 def backend():
+    """产出 (backend实例, 底层 mock 客户端) 二元组，而不是把 mock 挂到
+    backend 实例上——生产的 OpenAIBackend 对象不该带着测试专用的 `_mock`
+    属性,那会让被测对象的形状偏离真实运行时。"""
     with patch("openai.OpenAI") as MockOpenAI:
         MockOpenAI.return_value.api_key = "sk-test"
         b = OpenAIBackend(_spec())
-        b._mock = MockOpenAI.return_value
-        yield b
+        yield b, MockOpenAI.return_value
 
 
 # ---------- 凭据 ----------
 
 
-def test_construction_failure_becomes_missing_credential(monkeypatch):
+@pytest.mark.parametrize(
+    "key_source, expected_var",
+    [
+        ("${OPENAI_API_KEY}", "OPENAI_API_KEY"),
+        ("${COMPANY_GW_TOKEN}", "COMPANY_GW_TOKEN"),
+    ],
+)
+def test_construction_failure_becomes_missing_credential(
+    monkeypatch, key_source, expected_var
+):
     """判据就是"构造成不成功"——不做任何环境变量枚举。
 
     打真实的 openai.OpenAI（构造不发请求）：环境里没有任何凭据时它会抛
     OpenAIError，我们把它转成带 §6.2 消息契约的 MissingCredential。
+
+    断言 f"export {expected_var}" 而不是光秃秃的变量名：SDK 的英文原文本身
+    就含 "OPENAI_API_KEY"（"...set the `OPENAI_API_KEY` or `OPENAI_ADMIN_KEY`
+    environment variable"），单独断言变量名字符串在场，在 key_source 指向
+    别的变量名时也会被 SDK 原文"顺便"满足，测不出 _var_hint 有没有真的被用
+    进消息。第二组参数（COMPANY_GW_TOKEN，SDK 原文里根本不会出现的名字）
+    钉住这一点。
     """
     for var in ("OPENAI_API_KEY", "OPENAI_ADMIN_KEY"):
         monkeypatch.delenv(var, raising=False)
     with pytest.raises(MissingCredential) as exc:
-        OpenAIBackend(_spec(key=""), role=Role.CRITIC, model_ref="gpt5")
+        OpenAIBackend(
+            _spec(key="", key_source=key_source), role=Role.CRITIC, model_ref="gpt5"
+        )
     message = str(exc.value)
     assert "critic" in message
     assert "gpt5" in message
-    assert "OPENAI_API_KEY" in message
+    assert f"export {expected_var}" in message
     assert "--dry-run" in message
 
 
@@ -115,21 +135,26 @@ def test_admin_key_alone_is_accepted(monkeypatch):
     OpenAIBackend(_spec(key=""))  # 不抛
 
 
-def test_empty_key_is_handed_to_sdk_as_none(monkeypatch):
+def test_empty_key_is_handed_to_sdk_as_none():
     """规则一。空串不会静默带病上路（openai 3.13 对 api_key="" 当场抛），
     但它会让 SDK **拒绝去读环境变量**——于是 ${OPENAI_API_KEY:-} 展开成
-    空串时，配了该变量的用户反而起不来。"""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    空串时，配了该变量的用户反而起不来。
+
+    这里 patch 了 openai.OpenAI，SDK 根本不会真的去读环境变量，所以不设
+    OPENAI_API_KEY——断言的是我们传给 SDK 的 api_key 参数本身，与 env 无关。
+    """
     with patch("openai.OpenAI") as MockOpenAI:
         MockOpenAI.return_value.api_key = "sk-env"
         OpenAIBackend(_spec(key=""))
         assert MockOpenAI.call_args.kwargs["api_key"] is None
 
 
-def test_non_empty_base_url_is_passed_through(monkeypatch):
+def test_non_empty_base_url_is_passed_through():
     """整个多 provider 特性的存在意义就是能指向内网网关；base_url 被静默
-    丢弃是无声的产品故障。"""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    丢弃是无声的产品故障。
+
+    同上：patch 了 openai.OpenAI，不需要真实环境变量。
+    """
     with patch("openai.OpenAI") as MockOpenAI:
         MockOpenAI.return_value.api_key = "sk-env"
         OpenAIBackend(_spec(base_url="https://gw.internal/v1"))
@@ -140,19 +165,21 @@ def test_non_empty_base_url_is_passed_through(monkeypatch):
 
 
 def test_tools_field_omitted_when_none(backend):
-    backend._mock.chat.completions.create.return_value = _resp()
-    _chat(backend, tools=None)
-    kwargs = backend._mock.chat.completions.create.call_args.kwargs
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp()
+    _chat(b, tools=None)
+    kwargs = mock.chat.completions.create.call_args.kwargs
     assert "tools" not in kwargs  # 不是 "tools": None
 
 
 def test_tools_are_translated_to_function_shape(backend):
-    backend._mock.chat.completions.create.return_value = _resp()
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp()
     _chat(
-        backend,
+        b,
         tools=[{"name": "search_poi", "description": "d", "input_schema": {"a": 1}}],
     )
-    tools = backend._mock.chat.completions.create.call_args.kwargs["tools"]
+    tools = mock.chat.completions.create.call_args.kwargs["tools"]
     assert tools == [
         {
             "type": "function",
@@ -168,19 +195,21 @@ def test_tools_are_translated_to_function_shape(backend):
 def test_system_is_prepended_without_mutating_caller_list(backend):
     """run_agent 每轮复用同一个 messages list。原地 insert(0, ...) 会让
     system 消息逐轮累积。"""
-    backend._mock.chat.completions.create.return_value = _resp()
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp()
     caller_messages = [{"role": "user", "content": "hi"}]
-    _chat(backend, messages=caller_messages)
-    _chat(backend, messages=caller_messages)
+    _chat(b, messages=caller_messages)
+    _chat(b, messages=caller_messages)
     assert caller_messages == [{"role": "user", "content": "hi"}]
-    sent = backend._mock.chat.completions.create.call_args.kwargs["messages"]
+    sent = mock.chat.completions.create.call_args.kwargs["messages"]
     assert sent[0] == {"role": "system", "content": "sys"}
 
 
 def test_uses_max_completion_tokens(backend):
-    backend._mock.chat.completions.create.return_value = _resp()
-    _chat(backend, max_tokens=4000)
-    kwargs = backend._mock.chat.completions.create.call_args.kwargs
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp()
+    _chat(b, max_tokens=4000)
+    kwargs = mock.chat.completions.create.call_args.kwargs
     assert kwargs["max_completion_tokens"] == 4000
     assert "max_tokens" not in kwargs
     inspect.signature(openai.resources.chat.completions.Completions.create).bind(
@@ -195,12 +224,13 @@ def test_tool_calls_decide_the_round_not_finish_reason(backend):
     """多家网关会在带 tool_calls 的响应上给出 finish_reason="stop"/"length"。
     按 finish_reason 判会让这类响应被当成普通文本轮，tool_calls 非空却无人
     执行，模型空转到 max_tool_calls 或 deadline。"""
-    backend._mock.chat.completions.create.return_value = _resp(
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp(
         content=None,
         tool_calls=[_call("search_poi", '{"query": "芜湖"}')],
         finish_reason="stop",
     )
-    out = _chat(backend)
+    out = _chat(b)
     assert out.stop_reason == "tool_use"
     assert out.tool_calls[0].args == {"query": "芜湖"}
 
@@ -210,18 +240,20 @@ def test_none_content_becomes_empty_string(backend):
     messages，runner.py:154 的 text.strip() 抛 AttributeError——既不是
     ProviderError 也不是 LimitExceeded，只会被 orchestrator 吞成
     「候选线出现未处理异常」。"""
-    backend._mock.chat.completions.create.return_value = _resp(content=None)
-    assert _chat(backend).text == ""
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp(content=None)
+    assert _chat(b).text == ""
 
 
 def test_length_becomes_max_tokens_and_does_not_raise(backend):
     """归一成 max_tokens 让 runner 的修复轮照常工作。抛 ProviderError 会让
     一次普通的输出截断在 OpenAI 侧杀死整条候选线，而 Anthropic 侧只是进
     修复轮——那正是本设计承诺要消灭的 provider 分歧。"""
-    backend._mock.chat.completions.create.return_value = _resp(
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp(
         content="", finish_reason="length"
     )
-    assert _chat(backend).stop_reason == "max_tokens"
+    assert _chat(b).stop_reason == "max_tokens"
 
 
 @pytest.mark.parametrize(
@@ -233,25 +265,28 @@ def test_length_becomes_max_tokens_and_does_not_raise(backend):
     ],
 )
 def test_response_holes_become_provider_error(backend, kwargs, needle):
-    backend._mock.chat.completions.create.return_value = _resp(**kwargs)
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp(**kwargs)
     with pytest.raises(ProviderError) as exc:
-        _chat(backend)
+        _chat(b)
     assert needle in str(exc.value)
 
 
 def test_missing_usage_becomes_zero(backend):
     """计量失真好过整条候选线以无用诊断挂掉。"""
-    backend._mock.chat.completions.create.return_value = _resp(usage=None)
-    out = _chat(backend)
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp(usage=None)
+    out = _chat(b)
     assert (out.usage.input_tokens, out.usage.output_tokens) == (0, 0)
 
 
 def test_empty_arguments_string_becomes_empty_dict(backend):
     """部分网关对无参调用返回 "" 而非 "{}"。"""
-    backend._mock.chat.completions.create.return_value = _resp(
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp(
         content=None, tool_calls=[_call("t", "")]
     )
-    assert _chat(backend).tool_calls[0].args == {}
+    assert _chat(b).tool_calls[0].args == {}
 
 
 def test_broken_arguments_go_through_the_tool_error_channel(backend):
@@ -265,20 +300,22 @@ def test_broken_arguments_go_through_the_tool_error_channel(backend):
     改走 args={}：impl(**{}) 会因缺必填参数抛 TypeError，被 runner.py:148
     的 except Exception 捕获并回喂给模型自己改正。
     """
-    backend._mock.chat.completions.create.return_value = _resp(
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp(
         content=None, tool_calls=[_call("search_poi", '{"query": "京')]
     )
-    out = _chat(backend)
+    out = _chat(b)
     assert out.stop_reason == "tool_use"
     assert out.tool_calls[0].args == {}
     assert "[适配器]" in out.text
 
 
 def test_adapter_diagnostic_is_appended_not_replacing_model_text(backend):
-    backend._mock.chat.completions.create.return_value = _resp(
+    b, mock = backend
+    mock.chat.completions.create.return_value = _resp(
         content="我先查一下", tool_calls=[_call("search_poi", "{bad")]
     )
-    out = _chat(backend)
+    out = _chat(b)
     assert out.text.startswith("我先查一下")
     assert "[适配器]" in out.text
 
@@ -287,30 +324,31 @@ def test_adapter_diagnostic_is_appended_not_replacing_model_text(backend):
 
 
 def test_api_error_becomes_provider_error(backend):
-    backend._mock.chat.completions.create.side_effect = openai.APIConnectionError(
+    b, mock = backend
+    mock.chat.completions.create.side_effect = openai.APIConnectionError(
         request=httpx.Request("POST", "https://gw.example.com")
     )
     with pytest.raises(ProviderError):
-        _chat(backend)
+        _chat(b)
 
 
 def test_non_api_error_vendor_exception_also_becomes_provider_error(backend):
     """铁律"漏捕"一侧。写成 `except APIError` 的实现会让这个异常绕过
     ProviderError，落到 _safe_slot 把已生成的行程丢掉。"""
-    backend._mock.chat.completions.create.side_effect = openai.OpenAIError(
-        "凭据刷新失败"
-    )
+    b, mock = backend
+    mock.chat.completions.create.side_effect = openai.OpenAIError("凭据刷新失败")
     with pytest.raises(ProviderError):
-        _chat(backend)
+        _chat(b)
 
 
 def test_authentication_error_keeps_provider_error_type(backend):
+    b, mock = backend
     request = httpx.Request("POST", "https://gw.example.com")
-    backend._mock.chat.completions.create.side_effect = openai.AuthenticationError(
+    mock.chat.completions.create.side_effect = openai.AuthenticationError(
         "unauthorized", response=httpx.Response(401, request=request), body=None
     )
     with pytest.raises(ProviderError) as exc:
-        _chat(backend, role=Role.CRITIC, model_ref="gpt5")
+        _chat(b, role=Role.CRITIC, model_ref="gpt5")
     message = str(exc.value)
     assert "401" in message
     assert "critic" in message
