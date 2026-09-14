@@ -339,7 +339,7 @@ def _cmd_render(args) -> int:
     # render 必须纯粹：只读 state.json，不碰 advance，不写回 state。
     # 有 AMAP_KEY 就用真实 provider 补地图；没有就跳过地图——绝不能拿
     # FakeProvider 的占位图顶替。render 从不需要 LLM 凭据，所以走
-    # build_provider 而不是 build_deps，连 AnthropicClient 都不必碰。
+    # build_provider 而不是 build_deps，连 LLM 客户端都不必构造。
     write_artifacts(state, repo.dir, build_provider(dry_run=False), fmt=args.format)
     print(f"已写入 {repo.dir}")
     return 0

@@ -1,3 +1,4 @@
+import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -422,6 +423,48 @@ def test_trippan_config_wins_over_trippan_roles(tmp_path, monkeypatch, capsys):
     deps = build_deps(dry_run=False)
     assert deps.client._config.roles[Role.PLANNER].max_tokens == 111
     assert "TRIPPLAN_CONFIG" in capsys.readouterr().err
+
+
+def test_trippan_roles_alone_is_still_honored(tmp_path, monkeypatch, capsys):
+    """TRIPPLAN_ROLES 是旧名，Task 8 之前唯一的入口，设计 §4.2 把「保留兼容」
+    列为优先级第 2 档的正式承诺。只测「两者同设」（上一条测试）不够：把
+    `_config_path` 里的 `chosen = new or old` 改成 `chosen = new`，上一条测试
+    需要的只是 TRIPPLAN_CONFIG 生效，TRIPPLAN_ROLES 从头到尾没被读过也照样
+    通过——这条测试才是唯一钉住"单独设置 TRIPPLAN_ROLES 时它必须被读"的地方。
+    断言用具体的 max_tokens 数值（可证伪），不能只断言提示文案有没有出现。
+    """
+    monkeypatch.setenv("AMAP_KEY", "test-key-123")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("TRIPPLAN_CACHE", str(tmp_path / "cache"))
+    old = tmp_path / "old.toml"
+    old.write_text("[roles.planner]\nmax_tokens = 333\n", encoding="utf-8")
+    monkeypatch.setenv("TRIPPLAN_ROLES", str(old))
+
+    deps = build_deps(dry_run=False)
+    assert deps.client._config.roles[Role.PLANNER].max_tokens == 333
+    assert capsys.readouterr().err == ""  # 只设一个时不该有"两者同设"提示
+
+
+def test_trippan_log_default_leaves_root_logger_untouched(tmp_path):
+    """TRIPPLAN_LOG 缺省时 main() 不该往 root logger 上挂任何 handler——
+    设计 §10.3 点名要避免 debug 诊断与 `  · ` 事件流混排。不加这条测试的话，
+    把 main() 里的 `if level in ("debug", "info")` 改成无条件调用
+    `logging.basicConfig(...)`，595 条既有测试一条都不会红。
+
+    root logger 是进程全局状态，会被同一进程里跑过的其它测试/pytest 自己的
+    日志插件弄脏，所以先存档再清空，测试体里断言的是"main() 跑完之后"这个
+    受控起点有没有被碰过，跑完无论断言是否通过都要还原，不能把污染带给
+    后面的测试。
+    """
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    try:
+        main(["render", str(tmp_path / "nope")])  # 立刻在 repo.load() 处失败，不碰网络
+        assert root.handlers == []
+    finally:
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
 
 
 # ---------- review round 2 —— item 1：CAS 输了不能拿输掉的 state 写产物 ----------
