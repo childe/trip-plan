@@ -14,6 +14,12 @@ class LimitExceeded(Exception):
 class SlotLimits:
     max_rounds: int = 3
     max_tool_calls: int = 40  # 本 slot 累计
+    #: 跨 provider 混用时这只是一道**粗粒度熔断，不是可比的计量**：
+    #: OpenAI 推理模型的 completion_tokens 混着 reasoning tokens，同样"干一件
+    #: 事"的计数可能是 Anthropic 的数倍，这个阈值不再对应稳定语义，候选线会
+    #: 以看不出规律的方式提前 EXHAUSTED。
+    #: 另外，对省略 usage 的网关（backends/openai.py 把它归一成 Usage(0,0)），
+    #: 这道熔断根本不会触发，那条候选线只剩 deadline 兜底。
     max_output_tokens: int = 120_000  # 本 slot 累计
     max_schema_repairs: int = 2  # 每次 run_agent
     deadline_s: int = 600

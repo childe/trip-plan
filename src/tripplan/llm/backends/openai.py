@@ -1,0 +1,227 @@
+"""OpenAI 适配器。
+
+写法约束：内部用 `import openai` + `openai.OpenAI(...)`，**不要**
+`from openai import OpenAI`——后者会让测试里的 patch("openai.OpenAI") 失效。
+"""
+
+import json
+import logging
+
+from tripplan.llm.backends._shared import var_hint, where as _where
+from tripplan.llm.client import LlmResponse, ToolCall, Usage
+from tripplan.llm.config import ModelSpec, Role
+from tripplan.llm.errors import ConfigError, MissingCredential
+from tripplan.providers.base import ProviderError
+
+logger = logging.getLogger(__name__)
+
+ENV_HINT = "OPENAI_API_KEY"
+_MAX_DIAGNOSTIC = 200
+
+
+def _var_hint(spec: ModelSpec) -> str:
+    return var_hint(spec, ENV_HINT)
+
+
+class OpenAIBackend:
+    def __init__(
+        self,
+        spec: ModelSpec,
+        role: Role | None = None,
+        model_ref: str | None = None,
+    ) -> None:
+        try:
+            import openai
+        except ImportError as e:
+            raise ConfigError(
+                f"{_where(role, model_ref)} 的 provider 是 openai，"
+                "但 openai 包没有安装。请执行 "
+                "`uv pip install 'tripplan[openai]'`。"
+            ) from e
+
+        self.spec = spec
+
+        try:
+            # `or None` 是规则一。空串不会"静默带病上路"（实测：openai 3.13
+            # 对 api_key="" 当场抛），但它会让 SDK **拒绝去读环境变量**——
+            # 于是 ${OPENAI_API_KEY:-} 展开成空串时，配了该变量的用户反而起不来。
+            self._client = openai.OpenAI(
+                api_key=spec.key or None,
+                base_url=spec.base_url or None,
+            )
+        except openai.OpenAIError as e:
+            # 构造期 OpenAIError 就是 SDK 在说"我解析不出任何凭据"——实测确认
+            # 这是它在构造期的唯一成因（坏 base_url / 空 base_url / 负 timeout
+            # 全部构造成功，不抛）。
+            #
+            # 刻意**不做任何环境变量枚举**：既不在构造前守卫、也不在构造后查
+            # client.api_key。两者都会误判——OPENAI_ADMIN_KEY 单独设置时构造
+            # 成功但 client.api_key == ''，而 SDK 的凭据通道还有
+            # workload_identity 等，枚举会随 SDK 新增通道持续失效。让 SDK 做
+            # 权威，我们只读它的结论。
+            raise MissingCredential(
+                f"缺少凭据：{_where(role, model_ref)}（provider=openai）"
+                f"没有可用的 API key。"
+                f"请先执行 `export {_var_hint(spec)}=你的key` 再运行；"
+                "如果只是想在没有凭据的情况下试跑工具，加 --dry-run。"
+                f"（SDK 原文：{e}）"
+            ) from e
+
+    def chat(
+        self,
+        role: Role,
+        model_ref: str,
+        system: str,
+        messages: list,
+        tools: list | None,
+        max_tokens: int,
+    ) -> LlmResponse:
+        import openai
+
+        # 新建列表，不原地修改——run_agent 每轮复用同一个 messages list，
+        # insert(0, ...) 会让 system 消息逐轮累积。
+        payload = [{"role": "system", "content": system}, *messages]
+        kwargs = dict(
+            model=self.spec.name,
+            messages=payload,
+            max_completion_tokens=max_tokens,
+        )
+        if tools:
+            kwargs["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t["description"],
+                        "parameters": t["input_schema"],
+                    },
+                }
+                for t in tools
+            ]
+        try:
+            resp = self._client.chat.completions.create(**kwargs)
+        except openai.AuthenticationError as e:
+            raise ProviderError(
+                f"凭据被拒绝（401）：{_where(role, model_ref)}（provider=openai）。"
+                f"请检查 `{_var_hint(self.spec)}` 是否正确或已过期。原始错误：{e}"
+            ) from e
+        except openai.OpenAIError as e:
+            # 捕基类不捕 APIError——openai 里 OpenAIError 是基类、APIError 是
+            # 其子类，凭据刷新一类的错误不会是 APIError。
+            #
+            # 消息必须带上下文，不能是裸 str(e)：str(openai.APIConnectionError(...))
+            # 恰好总是 'Connection error.'——网关连不上是双 provider 时代最常见的
+            # 故障，裸消息会让用户连是哪个角色、哪个 model、哪个 provider 都猜
+            # 不出来。类型不变，仍是 ProviderError。
+            raise ProviderError(
+                f"{_where(role, model_ref)}（provider=openai）请求失败：{e}"
+            ) from e
+
+        if not resp.choices:
+            raise ProviderError("上游返回了空的 choices")
+        choice = resp.choices[0]
+        message = choice.message
+
+        if getattr(message, "refusal", None):
+            raise ProviderError(f"模型拒绝了本次请求：{message.refusal}")
+        raw_calls = list(message.tool_calls or [])
+        # 归一化表写的是「content_filter → ProviderError」，这里多一个
+        # `not raw_calls` 前提：带 tool_calls 的 content_filter 更像网关噪音
+        # （部分网关在工具轮上把 finish_reason 误标成 content_filter，与
+        # 「判工具轮看 tool_calls 非空、不看 finish_reason」是同一条原则）。
+        # 有 tool_calls 就按工具轮走正常路径，不强行报错。
+        if not raw_calls and choice.finish_reason == "content_filter":
+            raise ProviderError("上游内容过滤拦截了本次生成")
+
+        text = message.content or ""
+        calls, notes = [], []
+        for c in raw_calls:
+            # `ChatCompletionMessageCustomToolCall`（type="custom"）没有
+            # `.function` 字段——本项目的工具全部本地实现为 function
+            # tool，从未注册过 custom tool，模型不该收到这个选项，但网关/
+            # SDK 版本升级仍可能把它塞进响应。裸读 `c.function` 会抛
+            # AttributeError，不是 ProviderError，会绕过 run_slot 直接
+            # 落到 orchestrator._safe_slot 把已生成的行程丢弃。
+            #
+            # 判据必须是 `.function` 在不在，不能是 `type == "function"`：
+            # 网关省略 `type` 字段时，SDK 靠 `function` 字段猜出正确的
+            # union 成员（ChatCompletionMessageFunctionToolCall），但那个
+            # 对象的 `type` 属性本身是 **存在且为 None**——不是缺失，
+            # `getattr(c, "type", "function")` 拿到的是 None 不是默认值
+            # "function"，按 `type != "function"` 判会把这类完全正常、
+            # `.function` 齐全的调用也当场拒掉（实测复现过这个回归）。
+            # 这正是本文件在讲 content/usage 时点名的同一种宽松解析
+            # 陷阱：字段存在但值是 None，不能用「有没有默认值」去猜。
+            if getattr(c, "function", None) is None:
+                raise ProviderError(
+                    f"{_where(role, model_ref)}（provider=openai）收到了不支持的"
+                    f"工具调用类型（type={getattr(c, 'type', None)!r}）：本项目"
+                    "的工具全部是本地 function，不支持 custom tool。"
+                )
+            args, note = _parse_arguments(c.function.arguments)
+            calls.append(ToolCall(c.id, c.function.name, args))
+            if note:
+                notes.append(note)
+        if notes:
+            # 拼接不覆盖：模型可能在发起工具调用的同时也吐了文本。
+            # 前缀让这段适配器生成的文字在 assistant 历史里可辨认——
+            # 它会经补偿一进入历史，模型否则会以为那是自己说的话。
+            text = "\n".join(x for x in (text, *notes) if x)
+
+        usage = resp.usage
+        if usage is None:
+            logger.debug("上游未返回 usage，计量按 0 记")
+            counted = Usage(0, 0)
+        else:
+            # 字段级归一，不能只判 usage 本身是不是 None：网关返回空对象
+            # {} 或半残 usage（只给 prompt_tokens 不给 completion_tokens）
+            # 时，SDK 同样用宽松解析把缺的字段填成 None，不抛校验错误。
+            # Usage(None, ...) 在这里不会炸，但会在下一帧 ctx.charge()
+            # （Usage.__add__ 里的 int + None）抛 TypeError——不是
+            # ProviderError，绕过 run_slot 直接落到 orchestrator._safe_slot，
+            # 已生成的行程丢失。实测确认可达（见设计文档 §10.5）。
+            counted = Usage(usage.prompt_tokens or 0, usage.completion_tokens or 0)
+        logger.debug(
+            "openai 响应 model=%s finish_reason=%s requested_max_completion_tokens=%d "
+            "completion_tokens=%d",
+            self.spec.name,
+            choice.finish_reason,
+            max_tokens,
+            counted.output_tokens,
+        )
+        return LlmResponse(
+            stop_reason=_stop_reason(choice.finish_reason, bool(calls)),
+            text=text,
+            tool_calls=calls,
+            usage=counted,
+        )
+
+
+def _parse_arguments(raw: str) -> tuple[dict, str | None]:
+    """arguments 是 JSON 字符串。空串（部分网关对无参调用的返回）按 {} 处理。
+
+    解析失败不抛 ProviderError——那会杀死整条候选线。产出 args={} 让
+    impl(**{}) 因缺必填参数抛 TypeError，走 run_agent 里工具调用那段
+    「except Exception 把错误回喂给模型」的既有通道；同时把原文注入
+    text，让模型知道是自己的 JSON 坏了，而不是只看到"缺少必填参数"。
+    """
+    if not raw:
+        return {}, None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        brief = raw[:_MAX_DIAGNOSTIC]
+        logger.debug("工具参数不是合法 JSON：%s（%s）", brief, e)
+        return {}, f"[适配器] 上一轮的工具参数不是合法 JSON：{brief}"
+    if not isinstance(parsed, dict):
+        return {}, f"[适配器] 工具参数必须是 JSON 对象，实际是 {type(parsed).__name__}"
+    return parsed, None
+
+
+def _stop_reason(finish_reason: str | None, has_tool_calls: bool) -> str:
+    """判工具轮看 tool_calls 非空，不看 finish_reason。"""
+    if has_tool_calls:
+        return "tool_use"
+    if finish_reason == "length":
+        return "max_tokens"
+    return "end_turn"

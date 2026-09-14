@@ -76,3 +76,43 @@ def test_tools_and_resolver_share_the_provider_cache():
     _, impls = build_planning_tools(provider, city="京都")
     impls["search_poi"](query="清水寺")
     assert provider.call_log == ["search_poi"]
+
+
+# ---------- 注册期契约：impl(**{}) 必抛 ----------
+#
+# openai backend 在 arguments 解析失败时产出 args={}，靠 impl(**{}) 抛
+# TypeError 走 runner.py:171-179 的错误回喂通道。参数全带默认值、零参数、
+# 纯 *args / **kwargs 三种工具都会让 impl(**{}) 静默成功——白烧一次
+# max_tool_calls 额度，结果被当成正常工具结果回喂，且不留任何痕迹。
+
+import pytest
+
+from tripplan.agents.tools import check_tool_impls
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda: {},  # 零参数
+        lambda **kw: {},  # 纯 **kwargs
+        lambda *a: {},  # 纯 *args
+    ],
+)
+def test_tools_without_a_required_parameter_are_rejected(fn):
+    with pytest.raises(ValueError) as exc:
+        check_tool_impls({"bad": fn})
+    assert "bad" in str(exc.value)
+
+
+def test_tool_with_at_least_one_required_parameter_is_accepted():
+    """收紧到"至少一个必填"而不是"每个参数都无默认值"——后者会永久剥夺
+    工具作者写可选参数的自由，而 search_poi(query, limit=10) 完全满足
+    impl(**{}) 必抛。"""
+    check_tool_impls({"ok": lambda query, limit=10: {}})  # 不抛
+
+
+def test_real_planning_tools_satisfy_the_contract():
+    from tripplan.providers.fake import FakeProvider
+
+    _, impls = build_planning_tools(FakeProvider(), "芜湖")
+    check_tool_impls(impls)  # 不抛

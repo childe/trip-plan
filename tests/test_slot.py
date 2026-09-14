@@ -257,26 +257,21 @@ def test_raising_emit_does_not_break_the_loop(mk, monkeypatch):
 
 
 def test_transport_error_surfaces_as_failed_not_propagating(mk):
-    """anthropic.APIError（连接失败/429/5xx）必须在 llm/client.py 里就转成
-    ProviderError——不然它既不是 ProviderError 也不是 LimitExceeded，会原样
-    穿过 run_slot，带崩这一条候选线（以及已经跑完的另外两条）。这里不
-    monkeypatch generate/revise/critic，走的是真实 AnthropicClient。"""
-    import anthropic
-    import httpx
+    """run_slot 必须把 ProviderError 收成 FAILED，不能让它炸穿这条候选线
+    （以及已经跑完的另外两条）。
 
-    from tripplan.llm.client import AnthropicClient
-    from tripplan.llm.config import DEFAULT_ROLES
+    「厂商异常转成 ProviderError」那一半不在这里测——它是 backend 的职责，
+    由 tests/llm/test_anthropic_backend.py 直接覆盖（APIError 与非 APIError
+    的厂商异常各一条）。这里只测 run_slot 这一层的契约，所以用最小 stub
+    而不是真实 backend：一条测试只测一件事。
+    """
+    from tripplan.providers.base import ProviderError
 
-    class _RaisingMessages:
-        def create(self, **kwargs):
-            raise anthropic.APIConnectionError(
-                request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-            )
+    class _RaisingClient:
+        def chat(self, role, system, messages, tools):
+            raise ProviderError("连接失败")
 
-    client = AnthropicClient(DEFAULT_ROLES, api_key="test-key")
-    client._client = type("FakeAnthropic", (), {"messages": _RaisingMessages()})()
-
-    deps = Deps(client=client, provider=FakeProvider(pois={}))
+    deps = Deps(client=_RaisingClient(), provider=FakeProvider(pois={}))
     slot = run_slot(angle=ANGLE, seed=None, reqs=_reqs(), tz=TZ, deps=deps)
 
     assert slot.status is SlotStatus.FAILED

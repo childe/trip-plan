@@ -5,6 +5,7 @@ advance 在暂停时会自增 revision，拿自增后的值去 CAS 必然失败�
 """
 
 import argparse
+import logging
 import os
 import re
 import sys
@@ -36,12 +37,12 @@ from tripplan.state import (
 # fetch_day_maps 触网（调用 provider），所以它住在 tripplan.maps 而不是
 # render/ 下——render/ 里的模块一律不许碰网络（详见 tripplan/maps.py 的说明）。
 from tripplan.maps import fetch_day_maps
+from tripplan.llm.errors import ConfigError, MissingCredential  # noqa: F401
+
+# MissingCredential 从 llm.errors 重新导出：tests/test_cli.py 与下面的
+# except 都从 tripplan.cli 拿它，必须是同一个类对象。
 
 _SLUG_STRIP = re.compile(r"[^\w一-鿿\s-]", re.U)
-
-
-class MissingCredential(Exception):
-    """跑真实流程缺一个必须的环境变量凭据。给用户看得懂的名字和出路，不是 KeyError。"""
 
 
 def slugify(text: str) -> str:
@@ -223,6 +224,23 @@ def build_provider(dry_run: bool = False):
     return AmapProvider(key=amap_key, cache=cache)
 
 
+def _config_path() -> Path | None:
+    """TRIPPLAN_CONFIG 优先于 TRIPPLAN_ROLES（旧名，保留兼容）。
+
+    两者同时设置时提示一句，免得用户"改了文件却没生效"还查不出来。
+    """
+    new = os.environ.get("TRIPPLAN_CONFIG")
+    old = os.environ.get("TRIPPLAN_ROLES")
+    if new and old:
+        print(
+            f"提示：TRIPPLAN_CONFIG 与 TRIPPLAN_ROLES 都设置了，"
+            f"使用 TRIPPLAN_CONFIG（{new}），忽略 TRIPPLAN_ROLES（{old}）。",
+            file=sys.stderr,
+        )
+    chosen = new or old
+    return Path(chosen) if chosen else None
+
+
 def build_deps(dry_run: bool = False) -> Deps:
     from tripplan.providers.fake import FakeProvider
 
@@ -241,14 +259,14 @@ def build_deps(dry_run: bool = False) -> Deps:
             "如果只是想在没有凭据的情况下试跑工具，加 --dry-run。"
         )
 
-    from tripplan.llm.client import AnthropicClient
     from tripplan.llm.config import load_config
+    from tripplan.llm.router import RoutingClient
 
-    cfg_path = os.environ.get("TRIPPLAN_ROLES")
-    return Deps(
-        client=AnthropicClient(load_config(Path(cfg_path) if cfg_path else None)),
-        provider=provider,
-    )
+    # RoutingClient 在构造时就把每个被引用到的 model 的 backend 建出来并校验
+    # 凭据——不能拖到第一次 chat：那时抛出的 MissingCredential 会被
+    # orchestrator._safe_slot 吞成「候选线出现未处理异常」，下面 main() 的
+    # except MissingCredential 永远等不到。
+    return Deps(client=RoutingClient(load_config(_config_path())), provider=provider)
 
 
 # ---------- 子命令 ----------
@@ -285,6 +303,19 @@ def _cmd_resume(args) -> int:
         print(f"错误：{e}", file=sys.stderr)
         return 1
     print(f"已载入 rev {state.revision}，阶段 {state.stage.value}")
+    if args.dry_run:
+        # 与 _cmd_plan 的早返回对称。没有这一句的话，Deps(client=None) 会被
+        # 交给 advance()。已经推进到 COLLECT 及之后的行程会在 LLM 步骤炸出
+        # AttributeError: 'NoneType' object has no attribute 'chat'——一条
+        # 不在 main() except 元组里的裸 traceback，比 argparse 干净拒绝更糟。
+        # （停在 AWAIT_REQ_CONFIRM 的行程走的是另一条路：advance 在①校验
+        # 阶段就短路返回 _pending(state)，根本碰不到 deps.client；drive 转去
+        # terminal_ask()，非交互下 input() 撞 EOF，被 main() 的 EOFError 分支
+        # 接住返回 1。本文件的回归测试用的正是这种状态，它守住的是「退出码
+        # 不为 0」，不是这条 AttributeError——AttributeError 那条链要到
+        # COLLECT 阶段才成立，值得留着但不能算在这条测试头上。）
+        # 而 §6.2 的凭据错误消息正好把用户指向这条 --dry-run 逃生口。
+        return 0
     return _drive_and_report(state, repo, args)
 
 
@@ -321,13 +352,20 @@ def _cmd_render(args) -> int:
     # render 必须纯粹：只读 state.json，不碰 advance，不写回 state。
     # 有 AMAP_KEY 就用真实 provider 补地图；没有就跳过地图——绝不能拿
     # FakeProvider 的占位图顶替。render 从不需要 LLM 凭据，所以走
-    # build_provider 而不是 build_deps，连 AnthropicClient 都不必碰。
+    # build_provider 而不是 build_deps，连 LLM 客户端都不必构造。
     write_artifacts(state, repo.dir, build_provider(dry_run=False), fmt=args.format)
     print(f"已写入 {repo.dir}")
     return 0
 
 
 def main(argv=None) -> int:
+    # 诊断日志默认完全静默。本设计里 backend 的旁路诊断（请求的 token 预算
+    # 与实际用量、工具参数解析失败的原文、base_url 形态提示）全部走 logging
+    # 的 debug 级——不加这个开关，那些信息永远没人看得见。
+    level = os.environ.get("TRIPPLAN_LOG", "").lower()
+    if level in ("debug", "info"):
+        logging.basicConfig(level=getattr(logging, level.upper()), stream=sys.stderr)
+
     parser = argparse.ArgumentParser(prog="trip", description="旅行规划")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -339,6 +377,9 @@ def main(argv=None) -> int:
 
     r = sub.add_parser("resume", help="接着上次的进度继续")
     r.add_argument("dir")
+    r.add_argument(
+        "--dry-run", action="store_true", help="只载入并报告状态，不调 LLM 与高德"
+    )
     r.set_defaults(func=_cmd_resume)
 
     d = sub.add_parser("render", help="从 state.json 重新生成产物")
@@ -363,6 +404,11 @@ def main(argv=None) -> int:
             "可以用 `trip resume <行程目录>` 接着跑（正在进行的这一步需要重来）。",
             file=sys.stderr,
         )
+        return 1
+    except ConfigError as e:
+        # 配置读不懂是用户的输入问题，不是程序 bug——给一句人话，
+        # 不要把 TOMLDecodeError / ValueError 的 traceback 糊到脸上。
+        print(f"错误：{e}", file=sys.stderr)
         return 1
     except MissingCredential as e:
         print(f"错误：{e}", file=sys.stderr)

@@ -1,11 +1,9 @@
 """LLM 访问层。测试时整个替换成 FakeLlm。"""
 
-import os
 from dataclasses import dataclass
 from typing import Protocol
 
-from tripplan.llm.config import DEFAULT_ROLES, Role, RoleConfig
-from tripplan.providers.base import ProviderError
+from tripplan.llm.config import Role
 
 
 @dataclass(frozen=True)
@@ -78,48 +76,3 @@ class FakeLlm:
             if not queue:
                 raise AssertionError(f"脚本已用尽：role={role}")
         return queue.pop(0)
-
-
-class AnthropicClient:
-    def __init__(
-        self, configs: dict[Role, RoleConfig] | None = None, api_key: str | None = None
-    ) -> None:
-        import anthropic
-
-        self.configs = configs or DEFAULT_ROLES
-        self._client = anthropic.Anthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY")
-        )
-
-    def chat(self, role, system, messages, tools) -> LlmResponse:
-        import anthropic
-
-        cfg = self.configs[role]
-        kwargs = dict(
-            model=cfg.model,
-            max_tokens=cfg.max_tokens,
-            temperature=cfg.temperature,
-            system=system,
-            messages=messages,
-        )
-        if tools:
-            kwargs["tools"] = tools
-        try:
-            resp = self._client.messages.create(**kwargs)
-        except anthropic.APIError as e:
-            # 连接失败 / 429 / 5xx / 鉴权失败：外部依赖挂了，不是我们的 bug。
-            # 转成 ProviderError 让 run_slot 兜住，而不是原样炸穿整条候选线。
-            raise ProviderError(str(e)) from e
-
-        text = "".join(b.text for b in resp.content if b.type == "text")
-        calls = [
-            ToolCall(b.id, b.name, b.input)
-            for b in resp.content
-            if b.type == "tool_use"
-        ]
-        return LlmResponse(
-            stop_reason=resp.stop_reason,
-            text=text,
-            tool_calls=calls,
-            usage=Usage(resp.usage.input_tokens, resp.usage.output_tokens),
-        )

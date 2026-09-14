@@ -84,3 +84,25 @@ def test_all_candidates_failed_prompts_amendment_not_an_empty_choice():
     out = render_candidates([placeholder])
     assert "选一份（）" not in out
     assert "改" in out or "需求" in out
+
+
+def test_failed_slot_that_still_has_an_itinerary_shows_why_it_failed():
+    """revise/critic 轮挂掉时 slot.py:86-89 会保住已生成的 itin，于是
+    itinerary 非空、status=FAILED——当前实现（candidates.py:23 只认
+    EXHAUSTED）下 detail 完全不显示，而 candidates.py:33 照常把它列进
+    可选项。用户会选中一份中途挂掉的行程而毫不知情。
+
+    注意与已有的 test_failed_candidate_is_shown_but_marked_unselectable
+    的区别：那条用的是 has_itin=False，走的是 candidates.py:15 那个分支。
+    """
+    out = render_candidates(
+        [
+            _slot(
+                "D",
+                SlotStatus.FAILED,
+                detail="外部依赖失败：凭据被拒绝（401）",
+                has_itin=True,
+            )
+        ]
+    )
+    assert "401" in out
