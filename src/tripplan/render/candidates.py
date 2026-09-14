@@ -20,7 +20,13 @@ def render_candidates(slots) -> str:
         acts = sum(len(d.activities) for d in slot.itinerary.days)
         lines.append(f"{days} 天 / {acts} 项安排")
 
-        if slot.status is SlotStatus.EXHAUSTED and slot.detail:
+        # FAILED 也要显示 detail：revise/critic 轮挂掉时 slot.py:86-89 会保住
+        # 已生成的 itin，于是 itinerary 非空、走不到上面那个 ⚠️ 分支。不显示
+        # detail 的话，用户拿到的是一份看起来完整、可直接选中、失败原因被
+        # 静默隐藏的行程——与本模块 docstring 的承诺直接冲突。
+        # 只补显示，不改可选性：一份"主体已生成、critic 挂了"的行程，
+        # 用户看到 ⚠️ 之后仍然可以选它，比强行剥夺选择更合理。
+        if slot.status in (SlotStatus.EXHAUSTED, SlotStatus.FAILED) and slot.detail:
             lines.append(f"⚠️ {slot.detail}")
 
         if slot.itinerary.issues:
