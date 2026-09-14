@@ -9,6 +9,7 @@ import pytest
 from anthropic.resources.messages import Messages
 
 from tripplan.llm.backends.anthropic import AnthropicBackend
+from tripplan.llm.client import Usage
 from tripplan.llm.config import ModelSpec, Role
 from tripplan.llm.errors import ConfigError, MissingCredential
 from tripplan.providers.base import ProviderError
@@ -396,6 +397,37 @@ def test_missing_content_becomes_empty():
     )
     assert out.tool_calls == []
     assert out.text == ""
+
+
+@pytest.mark.parametrize(
+    "usage_body",
+    [
+        pytest.param({}, id="usage为空对象"),
+        pytest.param({"input_tokens": 3}, id="usage只给了input_tokens"),
+    ],
+)
+def test_partial_usage_fields_become_zero_not_none(usage_body):
+    """usage 对象存在，但字段本身缺失（网关返回 {} 或只给一半）时，SDK
+    同样用宽松解析把缺的字段填成 None，不抛校验错误。Usage(None, ...) 不
+    会在 chat() 里炸，但会在下一帧 ctx.charge()（Usage.__add__ 里的
+    int + None）抛 TypeError——不是 ProviderError，绕过 run_slot 直接
+    落到 orchestrator._safe_slot，已生成的行程丢失。必须按字段归一成 0，
+    不能只判 usage 本身是不是 None。"""
+    body = dict(_FULL_MESSAGE_BODY)
+    body["usage"] = usage_body
+    backend = AnthropicBackend(_spec())
+    backend._client = _client_over_mock_transport(body)
+    out = backend.chat(
+        role=Role.PLANNER,
+        model_ref="opus",
+        system="s",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=100,
+    )
+    assert out.usage.input_tokens is not None
+    assert out.usage.output_tokens is not None
+    Usage(0, 0) + out.usage  # 不抛 TypeError——这是 ctx.charge() 实际做的事
 
 
 # ---------- 请求期错误映射（铁律） ----------

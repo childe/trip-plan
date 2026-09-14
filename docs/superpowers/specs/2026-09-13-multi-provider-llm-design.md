@@ -589,23 +589,27 @@ backend 内部写 `import openai` 后使用 `openai.OpenAI(...)`，**不要** `f
 
 ### 10.5 Anthropic 侧归一化
 
-本节标题虽是「OpenAI 侧归一化」，但 §10.0.1 的标准其实是普适的：**任何会让响应解析抛出非 `ProviderError` 异常的空洞，都必须显式归一**。Anthropic 侧同样有两个这样的空洞，且成因与 OpenAI 侧完全一样——SDK 用宽松解析（`construct_type`），网关省略字段时得到的是 `None`，不是校验错误，没有 `APIResponseValidationError` 可捕。`base_url` 指向自建网关是本项目的一等功能（§14.1），网关的响应形状不再受 Anthropic 官方契约约束，这两个空洞是真实可达的（已用 `httpx2.MockTransport` 实测复现完整 HTTP 往返）。
+§10 的标题虽是「OpenAI 侧归一化」，但 §10.0.1 的标准其实是普适的：**任何会让响应解析抛出非 `ProviderError` 异常的空洞，都必须显式归一**。Anthropic 侧同样有这样的空洞，且成因与 OpenAI 侧完全一样——SDK 用宽松解析（`construct_type`），网关省略字段时得到的是 `None`，不是校验错误，没有 `APIResponseValidationError` 可捕。`base_url` 指向自建网关是本项目的一等功能（§14.1），网关的响应形状不再受 Anthropic 官方契约约束，这些空洞是真实可达的（已用 `httpx2.MockTransport` 实测复现完整 HTTP 往返）。
 
 | 空洞 | 归一 |
 |---|---|
 | **`resp.content` 为 `None`**（网关省略 `content` 字段） | `blocks = resp.content or []`，后续对 `tool_use` / `text` 的遍历都改用 `blocks`。不归一则裸迭代 `None` 是 `TypeError` |
 | **`resp.usage` 为 `None`**（网关省略 `usage` 字段） | 归一成 `Usage(0, 0)` 并记一条 `logger.debug`。不归一则 `resp.usage.output_tokens` 是 `AttributeError`。**注意 `logger.debug(...)` 的参数是即时求值的**——归一判断必须放在这句 debug 日志之前，否则日志本身就会先炸 |
+| **`resp.usage` 存在，但 `input_tokens` / `output_tokens` 单个或全部为 `None`**（网关返回空对象 `{}` 或半残 `usage`） | 按字段归一：`Usage(usage.input_tokens or 0, usage.output_tokens or 0)`。**不能只判 `usage is None`**——见下方实测，这条空洞不在 `chat()` 里炸，而是在下一帧 `ctx.charge()` 里炸 |
 
-两者都不归一的实测结果：
+三种空洞不归一的实测结果：
 
 ```
 完整响应                   OK
 网关省略 usage             ★逃逸★ AttributeError: 'NoneType' object has no attribute 'output_tokens'
 网关省略 content           ★逃逸★ TypeError: 'NoneType' object is not iterable
-usage 为空对象（{}）        OK（SDK 给字段填了 None 默认值，不炸；此情形不需要额外防御）
+usage 为空对象（{}）        chat() 本身不炸，产出 Usage(input_tokens=None, output_tokens=None)
+usage 只给了一半字段        chat() 本身不炸，产出 Usage(input_tokens=3, output_tokens=None)
 ```
 
-两条逃逸都不是 `ProviderError`，会绕过 `run_slot` 直接落到 `orchestrator._safe_slot`——已生成的行程被硬编码成 `None` 丢弃，正是开篇铁律要防的那件事。
+**`usage` 为空对象/半残这一条曾经被本节错误地记成「OK，不需要额外防御」——这是假的，而且假在关键处：只验证 `chat()` 不抛就下结论，测不到下一帧才发生的炸裂。** `chat()` 返回的 `Usage(None, ...)` 会在 `runner.py` 的 `ctx.charge(resp.usage)` → `Usage.__add__`（`client.py` 里的 `self.input_tokens + other.input_tokens`）处抛 `TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'`——同样不是 `ProviderError`，同样绕过 `run_slot` 直接落到 `orchestrator._safe_slot`，已生成的行程丢失。可达性与前两条空洞同一套威胁模型：一个重新序列化了精简 `usage` 的代理，至少和整个省略 `usage` 一样常见。openai 侧同构（`prompt_tokens` / `completion_tokens`），已一并按字段归一。
+
+四条空洞（含 openai 侧的 custom tool call、content=None）都不是 `ProviderError`，都会绕过 `run_slot` 直接落到 `orchestrator._safe_slot`——已生成的行程被硬编码成 `None` 丢弃，正是开篇铁律要防的那件事。
 
 ## 11. 配置错误必须可读
 

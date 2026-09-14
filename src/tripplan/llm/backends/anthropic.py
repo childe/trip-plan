@@ -136,7 +136,14 @@ class AnthropicBackend:
             logger.debug("上游未返回 usage，计量按 0 记")
             counted = Usage(0, 0)
         else:
-            counted = Usage(usage.input_tokens, usage.output_tokens)
+            # 字段级归一，不能只判 usage 本身是不是 None：网关返回空对象
+            # {} 或半残 usage（只给 input_tokens 不给 output_tokens）时，
+            # SDK 同样用宽松解析把缺的字段填成 None，不抛校验错误。
+            # Usage(None, ...) 在这里不会炸，但会在下一帧 ctx.charge()
+            # （Usage.__add__ 里的 int + None）抛 TypeError——不是
+            # ProviderError，绕过 run_slot 直接落到 orchestrator._safe_slot，
+            # 已生成的行程丢失。实测确认可达（见设计文档 §10.5）。
+            counted = Usage(usage.input_tokens or 0, usage.output_tokens or 0)
         logger.debug(
             "anthropic 响应 model=%s stop_reason=%s requested_max_tokens=%d "
             "output_tokens=%d",

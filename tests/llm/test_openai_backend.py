@@ -11,6 +11,7 @@ import openai
 import pytest
 
 from tripplan.llm.backends.openai import OpenAIBackend
+from tripplan.llm.client import Usage
 from tripplan.llm.config import ModelSpec, Role
 from tripplan.llm.errors import ConfigError, MissingCredential
 from tripplan.providers.base import ProviderError
@@ -86,6 +87,28 @@ def backend():
         MockOpenAI.return_value.api_key = "sk-test"
         b = OpenAIBackend(_spec())
         yield b, MockOpenAI.return_value
+
+
+def _openai_client_over_mock_transport(body: dict):
+    """真正走一次完整 HTTP 往返的 openai.OpenAI，响应体由我们控制。
+
+    单纯 mock `chat.completions.create` 的返回值测不到 SDK 自己的宽松
+    解析行为（construct_type）——无论是"discriminated union 靠 function
+    字段猜出正确成员、但 type 属性本身是存在且为 None"，还是"usage 对象
+    存在但字段缺失时缺的字段被填成 None"。这里让真实 SDK 解析一份我们
+    手工裁剪过的 JSON，证明这些行为是真的，不是臆测（与
+    test_anthropic_backend.py 里 `_client_over_mock_transport` 的用意
+    相同）。
+    """
+    import httpx2
+
+    def handler(request):
+        return httpx2.Response(200, json=body, request=request)
+
+    transport = httpx2.MockTransport(handler)
+    return openai.OpenAI(
+        api_key="sk-test", http_client=httpx2.Client(transport=transport)
+    )
 
 
 # ---------- 凭据 ----------
@@ -314,6 +337,43 @@ def test_missing_usage_becomes_zero(backend):
     assert (out.usage.input_tokens, out.usage.output_tokens) == (0, 0)
 
 
+@pytest.mark.parametrize(
+    "usage_body",
+    [
+        pytest.param({}, id="usage为空对象"),
+        pytest.param({"prompt_tokens": 3}, id="usage只给了prompt_tokens"),
+    ],
+)
+def test_partial_usage_fields_become_zero_not_none(usage_body):
+    """usage 对象存在，但字段本身缺失（网关返回 {} 或只给一半）时，SDK
+    同样用宽松解析把缺的字段填成 None，不抛校验错误——不是单纯 mock
+    `create` 返回值能测出来的行为，用真实 openai.OpenAI 走一次完整 HTTP
+    往返。Usage(None, ...) 不会在 chat() 里炸，但会在下一帧
+    ctx.charge()（Usage.__add__ 里的 int + None）抛 TypeError——不是
+    ProviderError，绕过 run_slot 直接落到 orchestrator._safe_slot，已生成
+    的行程丢失。必须按字段归一成 0，不能只判 usage 本身是不是 None。"""
+    body = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gpt-5",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": usage_body,
+    }
+    backend = OpenAIBackend(_spec())
+    backend._client = _openai_client_over_mock_transport(body)
+    out = _chat(backend)
+    assert out.usage.input_tokens is not None
+    assert out.usage.output_tokens is not None
+    Usage(0, 0) + out.usage  # 不抛 TypeError——这是 ctx.charge() 实际做的事
+
+
 def test_custom_tool_call_becomes_provider_error(backend):
     """`ChatCompletionMessageCustomToolCall`（type="custom"）没有 `.function`
     字段。本项目从未注册过 custom tool，但网关/SDK 版本升级仍可能把它塞进
@@ -330,26 +390,6 @@ def test_custom_tool_call_becomes_provider_error(backend):
     with pytest.raises(ProviderError) as exc:
         _chat(b)
     assert "custom" in str(exc.value)
-
-
-def _openai_client_over_mock_transport(body: dict):
-    """真正走一次完整 HTTP 往返的 openai.OpenAI，响应体由我们控制。
-
-    用于证明"网关省略 tool_call 的 type 字段时，SDK 靠 function 字段猜出
-    正确的 union 成员，但结果对象的 type 属性本身是存在且为 None"这件事
-    是真的，不是臆测——单纯 mock chat.completions.create 的返回值测不到
-    SDK 的 discriminated union 解析行为（这与 test_anthropic_backend.py
-    里 `_client_over_mock_transport` 的用意相同）。
-    """
-    import httpx2
-
-    def handler(request):
-        return httpx2.Response(200, json=body, request=request)
-
-    transport = httpx2.MockTransport(handler)
-    return openai.OpenAI(
-        api_key="sk-test", http_client=httpx2.Client(transport=transport)
-    )
 
 
 def _tool_call_response_body(tool_call_extra: dict) -> dict:
