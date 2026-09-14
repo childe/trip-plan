@@ -245,6 +245,15 @@ def test_resume_reports_missing_trip(tmp_path, capsys):
     assert "找不到" in capsys.readouterr().err
 
 
+def test_resume_dry_run_reports_state_without_calling_llm(tmp_path, mk, capsys):
+    repo = FileRepo(tmp_path / "kyoto")
+    repo.create(_state())
+    code = main(["resume", str(repo.dir), "--dry-run"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "已载入" in out
+
+
 def test_render_reads_state_and_writes_files(tmp_path):
     repo = FileRepo(tmp_path / "kyoto")
     state = _state(Stage.AWAIT_CHOICE)

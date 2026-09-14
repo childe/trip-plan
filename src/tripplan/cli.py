@@ -303,6 +303,12 @@ def _cmd_resume(args) -> int:
         print(f"错误：{e}", file=sys.stderr)
         return 1
     print(f"已载入 rev {state.revision}，阶段 {state.stage.value}")
+    if args.dry_run:
+        # 与 _cmd_plan 的早返回对称。没有这一句的话，Deps(client=None) 会被
+        # 交给 advance()，COLLECT 阶段的 LLM 步骤炸出 AttributeError，
+        # 而它不在 main() 的 except 元组里——一条裸 traceback，比 argparse
+        # 干净拒绝更糟。而 §6.2 的凭据错误消息正好把用户指向这条路。
+        return 0
     return _drive_and_report(state, repo, args)
 
 
@@ -364,6 +370,9 @@ def main(argv=None) -> int:
 
     r = sub.add_parser("resume", help="接着上次的进度继续")
     r.add_argument("dir")
+    r.add_argument(
+        "--dry-run", action="store_true", help="只载入并报告状态，不调 LLM 与高德"
+    )
     r.set_defaults(func=_cmd_resume)
 
     d = sub.add_parser("render", help="从 state.json 重新生成产物")
