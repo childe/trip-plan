@@ -1024,8 +1024,8 @@ git commit -m "feat(llm): 配置改为两层——先定义 model，角色再引
 
 **Files:**
 - Create: `src/tripplan/llm/backends/__init__.py`（空）、`src/tripplan/llm/backends/anthropic.py`
-- Modify: `src/tripplan/llm/client.py`（删除 `AnthropicClient` 类，保留其余）
-- Test: `tests/llm/test_anthropic_backend.py`（新建）；`tests/llm/test_client.py` 改写；`tests/test_slot.py:259-284` 改写
+- Test: `tests/llm/test_anthropic_backend.py`（新建）
+- **不碰**：`src/tripplan/llm/client.py`、`tests/llm/test_client.py`、`tests/test_slot.py` —— 三者都已在 Task 3 处理完毕（见下面 Step 4/5）
 
 **Interfaces:**
 - Consumes: `ModelSpec`、`ConfigError`、`MissingCredential`、`LlmResponse` / `Usage` / `ToolCall`
@@ -1548,19 +1548,13 @@ def _stop_reason(raw: str | None, has_tool_calls: bool) -> str:
     return "end_turn"
 ```
 
-- [ ] **Step 4: 从 `client.py` 删掉 `AnthropicClient`**
+- [ ] **Step 4 / Step 5：已在 Task 3 完成，本任务不做**
 
-删除 `src/tripplan/llm/client.py` 中 `class AnthropicClient:` 整个类（含 `__init__` 与 `chat`），以及文件顶部因此不再需要的 `import os` 与 `from tripplan.llm.config import DEFAULT_ROLES, Role, RoleConfig` / `from tripplan.providers.base import ProviderError`。保留 `Usage` / `ToolCall` / `LlmResponse` / `LlmClient` / `RecordedCall` / `FakeLlm`。
+从 `client.py` 删掉 `AnthropicClient`、以及从 `tests/llm/test_client.py` 删掉它的那几条测试，**已经在 Task 3 一并做完**。
 
-`LlmClient` Protocol 需要 `Role`，改成：
+原因：`client.py` 也消费 `DEFAULT_ROLES`（顶部 import + `AnthropicClient.__init__` 里的 `configs or DEFAULT_ROLES`），而 Task 3 要删掉那个符号。不一起删，Task 3 结束时会留下 9 个测试模块 collection error，交不出一个可独立测试的交付物，后续任务还得在破树上开工。
 
-```python
-from tripplan.llm.config import Role
-```
-
-- [ ] **Step 5: 改写 `tests/llm/test_client.py`**
-
-删除其中全部针对 `AnthropicClient` 的测试（它们已被 `test_anthropic_backend.py` 覆盖），保留 `FakeLlm` 的那几条。删掉不再使用的 import（`inspect`、`anthropic`、`httpx`、`Messages`、`AnthropicClient`、`RoleConfig`、`ProviderError`、`DEFAULT_ROLES`）。
+本任务**不要碰** `src/tripplan/llm/client.py` 与 `tests/llm/test_client.py`。
 
 - [ ] **Step 6: 不动 `tests/test_slot.py`**
 
