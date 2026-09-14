@@ -112,6 +112,14 @@ def _repair_prompt(err: SchemaError, schema: dict) -> str:
     )
 
 
+_MAX_ARGS_IN_HISTORY = 200
+
+
+def _brief_args(args: dict) -> str:
+    s = json.dumps(args, ensure_ascii=False, default=str)
+    return s if len(s) <= _MAX_ARGS_IN_HISTORY else s[:_MAX_ARGS_IN_HISTORY] + "…"
+
+
 def run_agent(
     system_prompt: str,
     user_prompt: str,
@@ -124,39 +132,88 @@ def run_agent(
 ) -> dict:
     messages: list[dict] = [{"role": "user", "content": user_prompt}]
     repairs = 0
+    # §13 的诊断需要知道：本次调用里有没有出现过「非工具轮」，以及它们是不是
+    # 全都返回了空文本。作用域是**本次 run_agent 调用**，不是整条候选线——
+    # 取 slot 作用域的话，generate 只要出过一次正常文本就永久置假，功能几乎
+    # 永不触发。
+    non_tool_rounds = 0
+    blank_non_tool_rounds = 0
 
-    while True:
-        ctx.check()  # 超 deadline / token / 取消 → 抛
-        resp = client.chat(role, system_prompt, messages, tools)
-        ctx.charge(resp.usage)
+    try:
+        while True:
+            ctx.check()  # 超 deadline / token / 取消 → 抛
+            resp = client.chat(role, system_prompt, messages, tools)
+            ctx.charge(resp.usage)
 
-        if resp.stop_reason == "tool_use":
-            ctx.charge_tool_calls(len(resp.tool_calls))
-            ctx.check()  # 本轮工具调用若把额度打穿，这一轮工具一个都不执行
-            messages.append({"role": "assistant", "content": resp.text or "(tool_use)"})
-            results = []
-            for call in resp.tool_calls:
-                impl = tool_impls.get(call.name)
-                if impl is None:
-                    results.append(f"[{call.name}] 错误：没有这个工具")
-                    continue
-                try:
-                    results.append(
-                        f"[{call.name}] "
-                        + json.dumps(impl(**call.args), ensure_ascii=False, default=str)
-                    )
-                except Exception as e:  # 工具报错交回模型，不炸穿这条线
-                    results.append(f"[{call.name}] 错误：{e}")
-            messages.append({"role": "user", "content": "\n".join(results)})
-            continue
+            if resp.stop_reason == "tool_use":
+                ctx.charge_tool_calls(len(resp.tool_calls))
+                ctx.check()  # 本轮工具调用若把额度打穿，这一轮工具一个都不执行
+                # 改动 1：把工具调用本身也拍平进 assistant 文本。不这么做的话，
+                # OpenAI 的推理模型发起工具调用时 content 恒为 None，这一轮在
+                # 历史里就只剩字面 "(tool_use)"，模型下一轮不知道自己查的是哪
+                # 个词，会重复调用——而 max_tool_calls 是整条候选线的累计额度
+                # （limits.py:16）。args 截断 200 字符：完整 JSON 会显著加长
+                # planner 的历史，抬高撞上上下文窗口上限的概率。
+                calls_text = "\n".join(
+                    f"(调用工具) {c.name}({_brief_args(c.args)})"
+                    for c in resp.tool_calls
+                )
+                content = (
+                    "\n".join(x for x in (resp.text, calls_text) if x) or "(tool_use)"
+                )
+                messages.append({"role": "assistant", "content": content})
+                results = []
+                for call in resp.tool_calls:
+                    impl = tool_impls.get(call.name)
+                    if impl is None:
+                        results.append(f"[{call.name}] 错误：没有这个工具")
+                        continue
+                    try:
+                        results.append(
+                            f"[{call.name}] "
+                            + json.dumps(
+                                impl(**call.args), ensure_ascii=False, default=str
+                            )
+                        )
+                    except Exception as e:  # 工具报错交回模型，不炸穿这条线
+                        results.append(f"[{call.name}] 错误：{e}")
+                messages.append({"role": "user", "content": "\n".join(results)})
+                continue
 
-        try:
-            return _parse_and_validate(resp.text, output_schema)
-        except SchemaError as e:
-            repairs += 1
-            if repairs > ctx.limits.max_schema_repairs:
-                raise LimitExceeded(f"schema 修复 {repairs} 次仍失败：{e}") from e
-            messages.append({"role": "assistant", "content": resp.text})
-            messages.append(
-                {"role": "user", "content": _repair_prompt(e, output_schema)}
-            )
+            non_tool_rounds += 1
+            if not resp.text.strip():
+                blank_non_tool_rounds += 1
+
+            try:
+                return _parse_and_validate(resp.text, output_schema)
+            except SchemaError as e:
+                repairs += 1
+                if repairs > ctx.limits.max_schema_repairs:
+                    raise LimitExceeded(f"schema 修复 {repairs} 次仍失败：{e}") from e
+                # 改动 2：.strip() 不能省——Anthropic 对空 content 返回 400，
+                # 对纯空白同样，而 "   " 是 truthy，裸 or 兜不住。
+                messages.append(
+                    {"role": "assistant", "content": resp.text.strip() or "(空回复)"}
+                )
+                messages.append(
+                    {"role": "user", "content": _repair_prompt(e, output_schema)}
+                )
+    except LimitExceeded as e:
+        # 三个条件全部满足才追加：本次调用、至少一个非工具轮、所有非工具轮都是
+        # 空文本。少任何一条都会误报——工具空转烧穿额度时每轮 text 也都是空的
+        # （OpenAI 推理模型工具轮 content 恒为 None），而零轮时「每轮都空」
+        # 真空成立。
+        #
+        # 另有三类必须先被 backend 归一成 ProviderError、根本到不了这里：
+        # refusal、content_filter、model_context_window_exceeded。三者都会产出
+        # 「非工具轮 text 全空」从而满足谓词，但真因与 max_tokens 无关。
+        #
+        # 不带 max_tokens 的具体数值：run_agent 这一层拿不到 per-role 的
+        # max_tokens（ctx.limits 是 SlotLimits，client 是只有 chat 的
+        # Protocol），为一条诊断改 Protocol 代价不成比例。报角色名即可。
+        if non_tool_rounds > 0 and blank_non_tool_rounds == non_tool_rounds:
+            raise LimitExceeded(
+                f"{e}（本次调用（角色 {role.value}）的每一轮非工具响应都是空文本，"
+                "该角色的 max_tokens 可能被推理预算吃光）"
+            ) from e
+        raise

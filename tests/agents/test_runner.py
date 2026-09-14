@@ -378,3 +378,81 @@ def test_property_without_a_declared_type_accepts_anything():
 def test_unknown_type_keyword_is_ignored_rather_than_rejecting_everything():
     schema = {"type": "object", "properties": {"x": {"type": "date-time"}}}
     assert _parse_and_validate('{"x": "2026-10-01"}', schema) == {"x": "2026-10-01"}
+
+
+# ---------- §13：推理预算耗尽的诊断谓词 ----------
+#
+# 谓词必须精确，否则会复制它本要修的那个毛病——诊断与真实原因无关。
+
+
+def test_hint_added_when_every_non_tool_round_is_blank():
+    llm = FakeLlm(
+        [
+            LlmResponse("end_turn", "", [], Usage(1, 1)),
+            LlmResponse("end_turn", "", [], Usage(1, 1)),
+            LlmResponse("end_turn", "", [], Usage(1, 1)),
+        ]
+    )
+    ctx = SlotContext(SlotLimits(max_schema_repairs=1), emit=lambda *a, **k: None)
+    with pytest.raises(LimitExceeded) as exc:
+        run_agent(
+            system_prompt="s",
+            user_prompt="u",
+            tools=None,
+            output_schema={"type": "object", "required": []},
+            role=Role.CLASSIFIER,
+            ctx=ctx,
+            client=llm,
+            tool_impls={},
+        )
+    message = str(exc.value)
+    assert "classifier" in message
+    assert "推理预算" in message
+    # 不带具体数值——run_agent 这一层拿不到 per-role max_tokens
+    assert "1000" not in message
+
+
+def test_no_hint_when_exhausted_by_tool_calls():
+    """工具轮误报。OpenAI 推理模型发起工具调用时 content 恒为 None，经
+    归一化成 ""，于是「每一轮 text 都空」为真——但真因是工具空转烧穿
+    max_tool_calls，与 max_tokens 毫无关系。"""
+    llm = FakeLlm(
+        [
+            LlmResponse("tool_use", "", [ToolCall("c", "probe", {})], Usage(1, 1))
+            for _ in range(5)
+        ]
+    )
+    ctx = SlotContext(SlotLimits(max_tool_calls=2), emit=lambda *a, **k: None)
+    with pytest.raises(LimitExceeded) as exc:
+        run_agent(
+            system_prompt="s",
+            user_prompt="u",
+            tools=None,
+            output_schema={"type": "object", "required": []},
+            role=Role.PLANNER,
+            ctx=ctx,
+            client=llm,
+            tool_impls={"probe": lambda: {}},
+        )
+    assert "推理预算" not in str(exc.value)
+
+
+def test_no_hint_when_interrupted_before_any_round():
+    """零轮真空为真。runner.py:129 的 ctx.check() 在 client.chat 之前，
+    而 ctx 的作用域是整条候选线——第二、三次 run_agent 可能一次 chat 都
+    没发出就被 deadline 打断。"""
+    llm = FakeLlm([])
+    ctx = SlotContext(SlotLimits(max_output_tokens=0), emit=lambda *a, **k: None)
+    ctx.charge(Usage(0, 1))  # 预先把额度打满
+    with pytest.raises(LimitExceeded) as exc:
+        run_agent(
+            system_prompt="s",
+            user_prompt="u",
+            tools=None,
+            output_schema={"type": "object", "required": []},
+            role=Role.PLANNER,
+            ctx=ctx,
+            client=llm,
+            tool_impls={},
+        )
+    assert "推理预算" not in str(exc.value)
