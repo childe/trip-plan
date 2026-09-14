@@ -8,8 +8,9 @@ TypeError），而 OAuth profile / WIF 的 auth_headers 恒为空（假阳性，
 
 import logging
 
+from tripplan.llm.backends._shared import var_hint, where as _where
 from tripplan.llm.client import LlmResponse, ToolCall, Usage
-from tripplan.llm.config import ModelSpec, Role, is_var_reference
+from tripplan.llm.config import ModelSpec, Role
 from tripplan.llm.errors import ConfigError, MissingCredential
 from tripplan.providers.base import ProviderError
 
@@ -19,18 +20,8 @@ logger = logging.getLogger(__name__)
 ENV_HINT = "ANTHROPIC_API_KEY"
 
 
-def _where(role: Role | None, model_ref: str | None) -> str:
-    if role is None or model_ref is None:
-        return "某个 model"
-    return f"角色 {role.value} 使用的 model「{model_ref}」"
-
-
 def _var_hint(spec: ModelSpec) -> str:
-    """只有 key_source 确实是个 ${...} 引用时才报它——用户写字面量 key 时
-    key_source 就是明文密钥本身，原样吐出去就是泄漏。"""
-    if is_var_reference(spec.key_source):
-        return spec.key_source.strip("${}").split(":-")[0]
-    return ENV_HINT
+    return var_hint(spec, ENV_HINT)
 
 
 class AnthropicBackend:

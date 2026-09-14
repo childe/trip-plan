@@ -7,8 +7,9 @@
 import json
 import logging
 
+from tripplan.llm.backends._shared import var_hint, where as _where
 from tripplan.llm.client import LlmResponse, ToolCall, Usage
-from tripplan.llm.config import ModelSpec, Role, is_var_reference
+from tripplan.llm.config import ModelSpec, Role
 from tripplan.llm.errors import ConfigError, MissingCredential
 from tripplan.providers.base import ProviderError
 
@@ -18,16 +19,8 @@ ENV_HINT = "OPENAI_API_KEY"
 _MAX_DIAGNOSTIC = 200
 
 
-def _where(role: Role | None, model_ref: str | None) -> str:
-    if role is None or model_ref is None:
-        return "某个 model"
-    return f"角色 {role.value} 使用的 model「{model_ref}」"
-
-
 def _var_hint(spec: ModelSpec) -> str:
-    if is_var_reference(spec.key_source):
-        return spec.key_source.strip("${}").split(":-")[0]
-    return ENV_HINT
+    return var_hint(spec, ENV_HINT)
 
 
 class OpenAIBackend:
