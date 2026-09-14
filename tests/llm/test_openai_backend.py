@@ -332,6 +332,68 @@ def test_custom_tool_call_becomes_provider_error(backend):
     assert "custom" in str(exc.value)
 
 
+def _openai_client_over_mock_transport(body: dict):
+    """真正走一次完整 HTTP 往返的 openai.OpenAI，响应体由我们控制。
+
+    用于证明"网关省略 tool_call 的 type 字段时，SDK 靠 function 字段猜出
+    正确的 union 成员，但结果对象的 type 属性本身是存在且为 None"这件事
+    是真的，不是臆测——单纯 mock chat.completions.create 的返回值测不到
+    SDK 的 discriminated union 解析行为（这与 test_anthropic_backend.py
+    里 `_client_over_mock_transport` 的用意相同）。
+    """
+    import httpx2
+
+    def handler(request):
+        return httpx2.Response(200, json=body, request=request)
+
+    transport = httpx2.MockTransport(handler)
+    return openai.OpenAI(
+        api_key="sk-test", http_client=httpx2.Client(transport=transport)
+    )
+
+
+def _tool_call_response_body(tool_call_extra: dict) -> dict:
+    return {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gpt-5",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "call_1", **tool_call_extra}],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+
+
+def test_tool_call_with_missing_type_field_still_works():
+    """回归防线：网关省略 tool_call 的 `type` 字段时，SDK 仍能靠
+    `function` 字段猜出 `ChatCompletionMessageFunctionToolCall`——但那个
+    对象的 `type` 属性本身是**存在且为 None**，不是缺失。
+
+    曾经的实现 `getattr(c, "type", "function") != "function"` 会把这种
+    `.function` 齐全、完全正常的调用误判成 custom tool 当场拒掉：`getattr`
+    的默认值只在属性**不存在**时才生效，而这里属性存在、只是值是 None，
+    `None != "function"` 为真，正常调用被回归性地拒绝。判据必须换成
+    `.function` 在不在，不能是 `type` 等不等于 "function"。"""
+    body = _tool_call_response_body(
+        {"function": {"name": "search_poi", "arguments": '{"query": "x"}'}}
+    )
+    backend = OpenAIBackend(_spec())
+    backend._client = _openai_client_over_mock_transport(body)
+    out = _chat(backend)
+    assert out.stop_reason == "tool_use"
+    assert out.tool_calls[0].name == "search_poi"
+    assert out.tool_calls[0].args == {"query": "x"}
+
+
 def test_empty_arguments_string_becomes_empty_dict(backend):
     """部分网关对无参调用返回 "" 而非 "{}"。"""
     b, mock = backend

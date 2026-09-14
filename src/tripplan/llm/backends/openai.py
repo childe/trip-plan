@@ -142,11 +142,21 @@ class OpenAIBackend:
             # SDK 版本升级仍可能把它塞进响应。裸读 `c.function` 会抛
             # AttributeError，不是 ProviderError，会绕过 run_slot 直接
             # 落到 orchestrator._safe_slot 把已生成的行程丢弃。
-            if getattr(c, "type", "function") != "function":
+            #
+            # 判据必须是 `.function` 在不在，不能是 `type == "function"`：
+            # 网关省略 `type` 字段时，SDK 靠 `function` 字段猜出正确的
+            # union 成员（ChatCompletionMessageFunctionToolCall），但那个
+            # 对象的 `type` 属性本身是 **存在且为 None**——不是缺失，
+            # `getattr(c, "type", "function")` 拿到的是 None 不是默认值
+            # "function"，按 `type != "function"` 判会把这类完全正常、
+            # `.function` 齐全的调用也当场拒掉（实测复现过这个回归）。
+            # 这正是本文件在讲 content/usage 时点名的同一种宽松解析
+            # 陷阱：字段存在但值是 None，不能用「有没有默认值」去猜。
+            if getattr(c, "function", None) is None:
                 raise ProviderError(
                     f"{_where(role, model_ref)}（provider=openai）收到了不支持的"
-                    f"工具调用类型（type={c.type!r}）：本项目的工具全部是本地 "
-                    "function，不支持 custom tool。"
+                    f"工具调用类型（type={getattr(c, 'type', None)!r}）：本项目"
+                    "的工具全部是本地 function，不支持 custom tool。"
                 )
             args, note = _parse_arguments(c.function.arguments)
             calls.append(ToolCall(c.id, c.function.name, args))
