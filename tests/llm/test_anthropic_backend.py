@@ -89,6 +89,16 @@ def test_empty_base_url_is_handed_to_sdk_as_none():
         assert MockAnthropic.call_args.kwargs["base_url"] is None
 
 
+def test_non_empty_base_url_is_passed_through_unchanged():
+    """base_url 是整个多 provider 特性存在的意义之一——指向内网网关。
+    如果被静默丢弃（例如实现写成无条件 base_url=None），用户会在毫无
+    提示的情况下打到公网端点，这是严重但无声的产品故障。"""
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        MockAnthropic.return_value.api_key = "k"
+        AnthropicBackend(_spec(base_url="https://gw.internal"))
+        assert MockAnthropic.call_args.kwargs["base_url"] == "https://gw.internal"
+
+
 def test_no_credential_anywhere_raises_missing_credential():
     """规则二：判据是 SDK 是否解析出了任何一种凭据，不是 auth_headers。
     这里打真实的 anthropic.Anthropic（构造不发请求），因为 MagicMock 的
@@ -106,6 +116,30 @@ def test_auth_token_alone_is_accepted(monkeypatch):
     """ANTHROPIC_API_KEY 不是唯一凭据来源。只配 AUTH_TOKEN 的用户必须能跑。"""
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "bearer-abc")
     AnthropicBackend(_spec(key=""))  # 不抛
+
+
+def test_credentials_alone_is_accepted():
+    """OAuth profile / WIF 场景：SDK 把凭据放进 credentials 属性，
+    api_key 与 auth_token 都是 None。这条必须放行，不能被判成缺凭据——
+    这正是规则二要防的假阳性方向（曾用 getattr(..., None) 兜底，一旦
+    SDK 重命名该属性就会静默把这类用户判成缺凭据）。"""
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        inst = MockAnthropic.return_value
+        inst.api_key = None
+        inst.auth_token = None
+        inst.credentials = object()  # 任意非 None 的 provider 对象
+        AnthropicBackend(_spec(key=""))  # 不抛
+
+
+def test_credentials_none_alongside_empty_api_key_and_auth_token_raises():
+    """三者都为空（或 None）才是真正的缺凭据。"""
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        inst = MockAnthropic.return_value
+        inst.api_key = None
+        inst.auth_token = None
+        inst.credentials = None
+        with pytest.raises(MissingCredential):
+            AnthropicBackend(_spec(key=""), role=Role.PLANNER, model_ref="opus")
 
 
 def test_literal_key_is_never_echoed_in_message():

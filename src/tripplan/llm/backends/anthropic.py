@@ -43,7 +43,6 @@ class AnthropicBackend:
         import anthropic
 
         self.spec = spec
-        self._role, self._model_ref = role, model_ref
         try:
             # `or None` 是规则一：空串会被 SDK 当成"显式给了凭据"，
             # 从而跳过整条 API_KEY → AUTH_TOKEN → profile → WIF 的解析链。
@@ -61,9 +60,7 @@ class AnthropicBackend:
             ) from e
 
         if not (
-            self._client.api_key
-            or self._client.auth_token
-            or getattr(self._client, "credentials", None)
+            self._client.api_key or self._client.auth_token or self._client.credentials
         ):
             raise MissingCredential(
                 f"缺少凭据：{_where(role, model_ref)}（provider=anthropic）"
