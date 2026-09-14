@@ -384,12 +384,14 @@ git commit -m "feat(llm): 配置值支持 \${VAR} 与 \${VAR:-default} 展开"
 
 - [ ] **Step 1: 写失败测试**
 
-把 `tests/llm/test_config.py` 中以下内容**删除**：
-- `test_defaults_cover_every_role`（第 6-7 行，依赖 `DEFAULT_ROLES` 符号）
+**这是"删三条 + 追加新的"，不是整份替换。** Task 2 刚写进 `tests/llm/test_config.py` 的 7 条 expand 测试必须原样保留——它们覆盖的是 §5 的展开语义。
+
+从 `tests/llm/test_config.py` **删除**下面这三条，其余一律保留：
+- `test_defaults_cover_every_role`（第 6-7 行，依赖即将消失的 `DEFAULT_ROLES` 符号；下面有同名新版）
 - `test_critic_defaults_to_independent_context`（第 15-17 行，纯 change detector：断言两个常量值，没有任何行为依赖它，只会在有意修改时失败，永远抓不到 bug）
 - `test_planner_and_critic_use_different_models`（第 10-12 行，新语义下比的是 `"opus" != "sonnet"`，**会继续变绿但不再测 §8.2 声明的约束**）
 
-然后写入新测试（保留 Task 2 的 expand 测试）：
+然后追加：
 
 ```python
 from pathlib import Path
@@ -968,6 +970,36 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/llm/test_config.py -q
 ```
 预期：全部 passed
 
+- [ ] **Step 4b: 改写 `tests/test_slot.py:259-284`**
+
+删除 `DEFAULT_ROLES` 会打断 `test_slot.py:268` 的导入，所以这条测试在本任务一并改写。整条替换为：
+
+```python
+def test_transport_error_surfaces_as_failed_not_propagating(mk):
+    """run_slot 必须把 ProviderError 收成 FAILED，不能让它炸穿这条候选线
+    （以及已经跑完的另外两条）。
+
+    「厂商异常转成 ProviderError」那一半不在这里测——它是 backend 的职责，
+    由 tests/llm/test_anthropic_backend.py 直接覆盖（APIError 与非 APIError
+    的厂商异常各一条）。这里只测 run_slot 这一层的契约，所以用最小 stub
+    而不是真实 backend：一条测试只测一件事。
+    """
+    from tripplan.providers.base import ProviderError
+
+    class _RaisingClient:
+        def chat(self, role, system, messages, tools):
+            raise ProviderError("连接失败")
+
+    deps = Deps(client=_RaisingClient(), provider=FakeProvider(pois={}))
+    slot = run_slot(angle=ANGLE, seed=None, reqs=_reqs(), tz=TZ, deps=deps)
+
+    assert slot.status is SlotStatus.FAILED
+    assert slot.itinerary is None
+    assert "外部依赖失败" in slot.detail
+```
+
+顺手删掉该文件里因此不再使用的 `import anthropic` / `import httpx`（如果没有别的测试用到）。
+
 - [ ] **Step 5: 跑 Task 1 留下的两条**
 
 ```bash
@@ -1530,58 +1562,9 @@ from tripplan.llm.config import Role
 
 删除其中全部针对 `AnthropicClient` 的测试（它们已被 `test_anthropic_backend.py` 覆盖），保留 `FakeLlm` 的那几条。删掉不再使用的 import（`inspect`、`anthropic`、`httpx`、`Messages`、`AnthropicClient`、`RoleConfig`、`ProviderError`、`DEFAULT_ROLES`）。
 
-- [ ] **Step 6: 改写 `tests/test_slot.py:259-284`**
+- [ ] **Step 6: 不动 `tests/test_slot.py`**
 
-现有内容（`tests/test_slot.py:259-284`）整条替换为：
-
-```python
-def test_transport_error_surfaces_as_failed_not_propagating(mk):
-    """厂商异常（连接失败/429/5xx）必须在 backend 里就转成 ProviderError——
-    不然它既不是 ProviderError 也不是 LimitExceeded，会原样穿过 run_slot，
-    带崩这一条候选线（以及已经跑完的另外两条）。这里不 monkeypatch
-    generate/revise/critic，走的是真实 AnthropicBackend。"""
-    import anthropic
-    import httpx
-
-    from tripplan.llm.backends.anthropic import AnthropicBackend
-    from tripplan.llm.config import ModelSpec, Role, RoleConfig
-    from tripplan.llm.router import RoutingClient
-    from tripplan.llm.config import LlmConfig
-
-    class _RaisingMessages:
-        def create(self, **kwargs):
-            raise anthropic.APIConnectionError(
-                request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-            )
-
-    spec = ModelSpec(
-        provider="anthropic",
-        name="claude-opus-5",
-        base_url="",
-        key="test-key",
-        name_source="claude-opus-5",
-        key_source="${ANTHROPIC_API_KEY}",
-    )
-    config = LlmConfig(
-        models={"opus": spec},
-        roles={role: RoleConfig("opus", 1000) for role in Role},
-    )
-    client = RoutingClient(config)
-    # 只替换传输层，不碰我们自己的归一化逻辑
-    for backend in client._by_key.values():
-        backend._client = type(
-            "FakeAnthropic", (), {"messages": _RaisingMessages()}
-        )()
-
-    deps = Deps(client=client, provider=FakeProvider(pois={}))
-    slot = run_slot(angle=ANGLE, seed=None, reqs=_reqs(), tz=TZ, deps=deps)
-
-    assert slot.status is SlotStatus.FAILED
-    assert slot.itinerary is None
-    assert "外部依赖失败" in slot.detail
-```
-
-注意这条测试的 config 里四个角色都指向同一个 `"opus"`——`_check_critic` 不会跑（那是 `load_config` 的职责，这里直接构造 `LlmConfig`），所以不会被 critic≠planner 拦下。
+该文件已在 Task 3 改写完毕（`DEFAULT_ROLES` 消失时一并处理）。本任务**不要碰它**——「厂商异常转成 ProviderError」这一半由本任务的 `test_api_error_becomes_provider_error` 与 `test_non_api_error_vendor_exception_also_becomes_provider_error` 直接覆盖，那是比端到端串一遍更精确的位置。
 
 - [ ] **Step 7: 跑测试**
 
@@ -2293,11 +2276,21 @@ from tripplan.llm.client import LlmResponse
 from tripplan.llm.config import LlmConfig, Role
 
 
-def _default_factories() -> dict:
-    from tripplan.llm.backends.anthropic import AnthropicBackend
-    from tripplan.llm.backends.openai import OpenAIBackend
+def _default_factory(provider: str):
+    """按 provider 惰性解析 backend 类——用到哪个才 import 哪个。
 
-    return {"anthropic": AnthropicBackend, "openai": OpenAIBackend}
+    不一次性 import 两个：openai 是可选依赖，只用 anthropic 的用户不该因为
+    router 顺手 import 了 openai backend 模块而被牵连。
+    """
+    if provider == "anthropic":
+        from tripplan.llm.backends.anthropic import AnthropicBackend
+
+        return AnthropicBackend
+    if provider == "openai":
+        from tripplan.llm.backends.openai import OpenAIBackend
+
+        return OpenAIBackend
+    raise KeyError(provider)  # load_config 已经挡住了非法 provider
 
 
 class RoutingClient:
@@ -2313,7 +2306,7 @@ class RoutingClient:
         三个 model 同端点同 key，按名缓存会开三份连接池。
         """
         self._config = config
-        self._factories = factories or _default_factories()
+        self._factories = factories or {}
         self._by_key: dict[tuple, object] = {}
         self._by_role: dict[Role, object] = {}
         # 逐 (role, model) 校验，而不是逐 backend：一个 backend 对应多个角色，
@@ -2323,7 +2316,9 @@ class RoutingClient:
             cache_key = (spec.provider, spec.base_url, spec.key)
             backend = self._by_key.get(cache_key)
             if backend is None:
-                factory = self._factories[spec.provider]
+                factory = self._factories.get(spec.provider) or _default_factory(
+                    spec.provider
+                )
                 backend = factory(spec, role=role, model_ref=rc.model)
                 self._by_key[cache_key] = backend
             self._by_role[role] = backend
