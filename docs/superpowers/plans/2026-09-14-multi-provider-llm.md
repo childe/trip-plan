@@ -3237,23 +3237,36 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q
 
 - [ ] **实跑四种凭据场景**（对照设计文档 §6.3 的三档语义）
 
+> **别用 `.venv/bin/trip`。** venv 里的 editable install 指向**主检出**的 `src`，不是 worktree——实测 `.venv/bin/python -c "import tripplan.cli; print(...)"` 解析到 `/Users/jialiu/Projects/trip-plan/src/tripplan/cli.py`。用它验证等于在验**旧代码**，而且会静默地"通过"。
+>
+> pytest 不受影响（`pyproject.toml` 的 `pythonpath = ["src"]` 相对 rootdir），**只有手工跑 CLI 才会踩**。下面统一用显式 `PYTHONPATH` + `python -m`：
+
 ```bash
+cd <worktree>
+W=$PWD/src
+V=/Users/jialiu/Projects/trip-plan/.venv/bin/python
+run() { env PYTHONPATH="$W" PYTHONDONTWRITEBYTECODE=1 "$@" "$V" -m tripplan.cli; }
+
+# 先确认自己验的是 worktree 的代码，不是主检出的
+PYTHONPATH="$W" "$V" -c "import tripplan.cli as m; print(m.__file__)"
+# 必须打印 <worktree>/src/tripplan/cli.py
+
 # 1. 什么都没配 → 可读的中文 + 变量名 + --dry-run
-env -u ANTHROPIC_API_KEY AMAP_KEY=fake .venv/bin/trip plan '去芜湖' --dir /tmp/t1
+run env -u ANTHROPIC_API_KEY AMAP_KEY=fake plan '去芜湖' --dir /tmp/t1
 
-# 2. 只有 AUTH_TOKEN（不能被挡）
-env -u ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN=fake AMAP_KEY=fake \
-  .venv/bin/trip plan '去芜湖' --dir /tmp/t2
+# 2. 只有 AUTH_TOKEN（不能被挡）——这条验的是被删掉那道检查引入的回归确实没了
+run env -u ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN=fake AMAP_KEY=fake plan '去芜湖' --dir /tmp/t2
 
-# 3. --dry-run 逃生口
-env -u ANTHROPIC_API_KEY -u AMAP_KEY .venv/bin/trip plan '去芜湖' --dry-run --dir /tmp/t3
-env -u ANTHROPIC_API_KEY -u AMAP_KEY .venv/bin/trip resume /tmp/t3 --dry-run
+# 3. --dry-run 逃生口（plan 与 resume 两条都要）
+run env -u ANTHROPIC_API_KEY -u AMAP_KEY plan '去芜湖' --dry-run --dir /tmp/t3
+run env -u ANTHROPIC_API_KEY -u AMAP_KEY resume /tmp/t3 --dry-run
 
 # 4. 坏配置 → ConfigError，不是裸 traceback
 printf '[roles.critic]\nmodel = "claude-sonnet-5"\n' > /tmp/bad.toml
-env TRIPPLAN_CONFIG=/tmp/bad.toml AMAP_KEY=fake ANTHROPIC_API_KEY=sk-x \
-  .venv/bin/trip plan '去芜湖' --dir /tmp/t4
+run env TRIPPLAN_CONFIG=/tmp/bad.toml AMAP_KEY=fake ANTHROPIC_API_KEY=sk-x plan '去芜湖' --dir /tmp/t4
 ```
+
+（`run()` 那个 shell 函数把 `env` 的参数顺序绕开了；若嫌绕，直接每条写全 `env PYTHONPATH="$W" ... "$V" -m tripplan.cli plan ...` 也一样。）
 
 - [ ] **实跑一次真正的异厂交叉评审**（需要两家真 key，可选）
 
