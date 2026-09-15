@@ -1,7 +1,7 @@
 # Web 界面替代 CLI —— 设计
 
 日期：2026-09-15
-状态：已与用户确认；已按 r1 评审意见修订，待复评
+状态：已与用户确认；已按 r1 / r2 评审意见修订，待复评
 
 ## 1. 背景与动机
 
@@ -64,7 +64,7 @@ Web 层是 `orchestrator` 的**第二个 driver**，与 CLI 平级。
 |---|---|
 | `src/tripplan/web/app.py` | Flask 应用工厂 + 路由。只做「鉴权 → 校验参数 → 调 registry → 渲染」 |
 | `src/tripplan/web/jobs.py` | `JobRegistry` / `TripJob` / `run_command()`：起线程、per-trip 互斥、全局上限、取消令牌、job 生命周期 |
-| `src/tripplan/web/events.py` | `EventLog`：序号分配、`events.jsonl` 追加与回读（历史）、内存 live ring（增量轮询） |
+| `src/tripplan/web/events.py` | `EventLog`：序号分配、`events.jsonl` 追加与回读（历史）、内存 live ring（增量轮询）；对外两个出口 `snapshot()` / `since(n)`（见 §5.5） |
 | `src/tripplan/web/view.py` | 结构化 view model：把 `Requirements` / `CandidateSlot` 摊成模板能直接遍历的字段（见 §6.1） |
 | `src/tripplan/web/templates/` | Jinja2：列表页、详情页 |
 | `src/tripplan/web/static/` | CSS + 轮询用的原生 JS |
@@ -79,8 +79,10 @@ HTTP（鉴权、CSRF、取字段、302），后台线程只负责调度，「loa
 - `cli.py`：删 `plan` / `resume` / `terminal_ask` / 交互版 `drive` / `_resolve_candidate_key`；
   新增 `trip web`；`render` 原样保留
 - `write_artifacts()` 从 `cli.py` 抽到 `src/tripplan/artifacts.py`，并拆成
-  `stage_artifacts()` / `publish()` / `discard()` 三步（见 §4.1）。抽出去是为了
-  避免 `web/` 反向依赖 `cli/`；`trip render` 改调同一套，两条路的发布语义不分叉
+  `stage_artifacts(state, dir, provider, stage_id)` / `publish()` / `discard()` 三步
+  （见 §4.1）。抽出去是为了避免 `web/` 反向依赖 `cli/`；`trip render` 改调同一套，
+  两条路的发布语义不分叉。`stage_id` 让每个写者只碰 `.staging/<stage_id>/`，
+  Web 侧传 `job_id`，`trip render` 自己生成一个 uuid
 - `agents/limits.py`：新增 `Cancelled` 异常（**不继承** `LimitExceeded`，理由见 §4.3）；
   `SlotContext` 加取消令牌
 - `orchestrator.advance()` / `slot.run_slot()`：各加一个可选的取消令牌参数
@@ -142,8 +144,9 @@ def run_command(trips_root, tid, cmd, deps, job) -> JobOutcome:
 
     staged = None
     if isinstance(outcome, Done):
-        staged = stage_artifacts(state, repo.dir, deps.provider)
-        # 写进 <trip>/.staging/，不是最终路径。这一步慢（要拉高德静态图）
+        staged = stage_artifacts(state, repo.dir, deps.provider, job.job_id)
+        # 写进 <trip>/.staging/<job_id>/ —— 这一次 job 私有的目录，不是最终路径，
+        # 也不是同一 trip 共享的暂存区（理由见下）。这一步慢（要拉高德静态图）
         # 也可能失败；失败只记进 JobOutcome，绝不影响下面的 CAS 判定
 
     if job.cancel_token.is_set():
@@ -169,11 +172,34 @@ def run_command(trips_root, tid, cmd, deps, job) -> JobOutcome:
 用户点进去看到的是 404 或半截文件。更糟的是进程在这中间崩掉：`state.json` 已经是
 `DONE`，产物却永远不存在，之后每次进详情页都是一个死链。
 
-所以：**慢且可能失败的那部分（渲染 + 拉图）挪到 CAS 之前**，写进 `.staging/`；
-CAS 成功后只剩一串 `os.replace`（同文件系统内原子改名）+ 写一个
+所以：**慢且可能失败的那部分（渲染 + 拉图）挪到 CAS 之前**，写进
+`.staging/<job_id>/`；CAS 成功后只剩一串 `os.replace`（同文件系统内原子改名）+ 写一个
 `artifacts.json`（`{"revision": N, "files": [...]}`）。代价是 CAS 窗口被拉长了一次
 产物生成的时间——但 CAS 输掉本来就是罕见情况，而「DONE 却 404」是每次崩溃都会
 永久留下的伤。
+
+**暂存目录必须按 job 隔离，不能是同一 trip 共享的 `.staging/`**：`.staging/` 里的文件名
+是固定的（`itinerary.html`、地图图片……），共享一个目录等于让两个写者互相踩。§4.2 的
+per-trip 互斥**管不到这件事**——它是**进程内**的一把锁，而同一个行程目录下同时会有
+第二个写者：
+
+- `trip render <dir>`（§7）走的正是同一条 `stage_artifacts()` + `publish()`，它是**另一个
+  进程**，Web 进程的 registry 对它一无所知；
+- 用户完全可能对同一个 `trips/` 起两个 `trip web`（§6.4 的单进程是纪律，不是强制）。
+
+共享目录下的两种坏结局都是静默的：**(a)** 写者 A 暂存完、还没 CAS，写者 B 用另一份
+state 把 `.staging/itinerary.html` 覆盖掉，A 的 CAS 成功后 `publish()` 发布的是 B 的成稿——
+`artifacts.json` 的 revision 与 `state.json` 完全对得上，就绪判定（`artifact_ready`）一路
+绿灯，但 HTML 讲的是另一份行程；**(b)** 败者的 `discard()` 删掉的是胜者刚放进去的文件，
+`publish()` 于是搬了个空。两种情况都不会报错，也检测不出来。
+
+因此纪律是：`stage_artifacts()` 收一个调用方给的 `stage_id`（Web 侧就是 `TripJob.job_id`，
+`trip render` 自己现生成一个 uuid），只往 `.staging/<stage_id>/` 里写；`publish()` / `discard()`
+**只能操作自己那个子目录**，并在结束时删掉它。`publish()` 里 `artifacts.json` **最后写**，
+它是整个发布动作的提交点。`.staging/` 下的孤儿子目录（进程崩在中途留下的）由 `trip web` **启动时**扫一次删掉，
+**只删 mtime 超过 1 小时的**——启动那一刻本进程没有任何 job，但别的进程（一个正在跑的
+`trip render`）可能正往自己的子目录里写，按时间设个下限就不会误删活人的暂存件。
+删错的代价本来也有限：暂存内容不是任何权威状态，大不了重建一次。
 
 **产物就绪的判定与重建**：详情页不靠 `stage is DONE` 决定要不要给链接，靠
 `artifact_ready` = `artifacts.json` 存在 **且** 其 `revision` 等于 `state.revision`
@@ -195,7 +221,19 @@ running ──┬─→ succeeded
 
 - **没有 `queued` 态**：全局满载时直接 503，不排队（§4.2）。排队要额外引入队列超时、
   取消排队中的 job、以及「按钮点了但什么都没发生」的解释成本，对一个家用服务不值。
-- `status_version`：单调递增整数，job 每次状态变化 +1。前端只认它（§6.3）。
+- `job_id`：创建 job 时生成的 uuid4 hex，**永不复用**。它同时是暂存目录名（§4.1）
+  和前端的身份判据（下一条）。
+- `status_version`：单调递增整数，**在单个 job 内部**每次状态变化 +1，从 1 开始。
+  **它单独不足以当变化判据**：它是 per-job 的，新 job 从 1 重新开始，于是「老 job 的
+  running(1)」与「另一个新 job 的 running(1)」在前端看来一模一样。真实的坏场景是：
+  某个标签页挂在后台（浏览器把定时器节流到分钟级），这期间 job A 失败了、用户在另一个
+  标签页又发了一条命令起了 job B——老标签页醒来一看还是 `running(1)`，判定「没变化」，
+  于是既不刷新也不显示 A 的失败，停在一个过期页面上。失败/拒绝/取消这三种终态**不改
+  `revision`**，所以 `revision` 那一路也兜不住。
+  因此对外暴露的身份是 **`(job_id, status_version)` 这个二元组**，前端比较二元组而不是
+  单个整数（§6.3）；`job_id` 变了就一定是另一次命令，无条件刷新。
+- **终态 durable 事件带 `job_id`**：重启后回读 `events.jsonl` 也能把终态对到具体某一次
+  命令上，而不是只知道「有过一次失败」。
 - **线程体必须 `try/except/finally` 收尾**。`except BaseException` 兜住任何未预料的
   异常并转成 `failed`；`finally` 里无条件置终态 + flush `EventLog`。少了这层，一个
   没想到的异常会让 job 永远停在 `running`，详情页的按钮就永久置灰了，用户除了重启
@@ -206,16 +244,35 @@ running ──┬─→ succeeded
   发生了什么」，而不是一片空白。
 - **保留与替换**：终态 job 留在 registry 里供轮询读取，直到 (a) 同一 trip 的下一个命令
   到来时被新 job 替换，或 (b) 终态超过 30 分钟被清理线程丢弃（丢了也不损失信息，
-  终态已经在 `events.jsonl` 里）。`running` 的 job 永远不会被清理。
+  终态已经在 `events.jsonl` 里）。**active 的 job（见下面 `active` 的定义）永远不会被
+  清理**——`cancelling` 也算 active，它的线程还活着。
 
 ### 4.2 并发约束
 
+先定死一个谓词，下面所有约束都用它，**不许有任何一处写成只判断 `running`**：
+
+```python
+active = job.status in {"running", "cancelling"}
+```
+
+**为什么 `cancelling` 必须算 active**：取消不是立刻生效的，也没有时延上界（§4.3）——
+一个 `cancelling` 的 job，它的线程可能还卡在一次已经发出去的 LLM 请求上，还在烧钱，
+还握着那个 trip 的 state。如果互斥和全局计数只看 `running`，那么用户一点「取消」，
+两个保证会**同时**失效：同一个 trip 立刻能起第二个 job（两个线程对同一份 state 跑
+`advance`，正是互斥要防的浪费），全局名额也立刻被释放出来（点三下取消再点三下确认，
+六个线程一起烧）。`cancelling` 是**正在退出**，不是**已经退出**。
+
 | 约束 | 保证方式 |
 |---|---|
-| 同一 trip 同时只有一个 job | `JobRegistry` 用一把锁护住 dict；已有 running job 则拒绝（409），页面按钮同时置灰 |
-| 不同 trip 可并行，但**有全局上限** | 同一把锁里数 running job；达到 `TRIPPLAN_WEB_MAX_JOBS`（默认 3）则拒绝（503） |
+| 同一 trip 同时只有一个 job | `JobRegistry` 用一把锁护住 dict；该 trip 已有 **active** job 则拒绝（409），页面按钮同时置灰 |
+| 不同 trip 可并行，但**有全局上限** | 同一把锁里数 **active** job；达到 `TRIPPLAN_WEB_MAX_JOBS`（默认 3）则拒绝（503） |
+| 名额只在线程真正退出时归还 | 线程体 `finally` 里置终态（§4.1.1），**那一刻**才从 active 集合里移出——不是在收到取消请求那一刻 |
 | 后台线程不占 waitress 线程池 | 自己 `threading.Thread`；请求线程只负责登记后立刻返回 |
 | Web 层必须单进程 | 见 §6.4 |
+
+同一个谓词还管着另外两处，一并写死：**产物重建的前置条件**（§6.2 的
+`POST /trips/<tid>/artifacts` 要求该 trip 无 active job）和**终态 job 的清理**
+（§4.1.1，active 的不清理）。
 
 为什么 per-trip 必须互斥：用户手快点两下「确认」会让两个线程同时对同一个 state 跑
 `advance()`。`repo` 的 CAS 保证数据不会坏——但输掉的那个线程**已经把 LLM 的钱烧完了**
@@ -360,7 +417,7 @@ patch 进去、`state.revision` 还没递增。异常从这里穿出去，留下
    `EventLog` 再开一个出口（浏览器的 `Last-Event-ID` 就是 `seq`），轮询那条路一行
    不用动。它返回的不只是事件列表，还有 `first_seq` / `stream_epoch` /
    `reset_required`（§5.5）——正是 `durable=False` 出现之后判断「客户端的游标还有效
-   吗」所必需的，两种传输方式都要用。初始快照走另一个出口（读磁盘），见 §5.5。
+   吗」所必需的，两种传输方式都要用。初始快照走另一个出口 `snapshot()`，见 §5.5。
 
 **下期的实现路径（本期不实现，但设计不挡它）**：`ctx.emit` 已经一路传到
 `run_agent()` 的调用现场——`steps._plan()` 与 `steps.run_llm_critic()` 都持有 `ctx`。
@@ -388,12 +445,15 @@ patch 进去、`state.revision` 还没递增。异常从这里穿出去，留下
 
 | 来源 | 内容 | 服务谁 |
 |---|---|---|
-| `events.jsonl`（磁盘） | 全部 `durable=True` 历史 | 详情页服务端渲染时的**初始快照** |
-| live ring（内存，容量 N=2000） | 最近 N 条事件，含 `durable=False` | `?since=N` 的**增量轮询** |
+| `events.jsonl`（磁盘） | 全部 `durable=True` 历史 | `snapshot()` 的主体 |
+| live ring（内存，容量 N=2000） | 最近 N 条事件，含 `durable=False` | `?since=N` 的**增量轮询**；并给 `snapshot()` 补上尾巴 |
 
-「浏览器刷新后接着上次」的实现**不靠前端缓存，靠服务端有日志**：详情页渲染时从
-**磁盘**读全部 durable 历史写进 HTML，刷新后一进来就是完整的；前端拿页面里最后一条的
-`seq` 往后接增量。
+两个出口：`EventLog.snapshot()`（详情页服务端渲染时的**初始快照**，磁盘历史 + ring
+当前内容归并，锁内完成，见下）和 `EventLog.since(n)`（增量）。
+
+「浏览器刷新后接着上次」的实现**不靠前端缓存，靠服务端有日志**：详情页渲染时调
+`snapshot()` 把历史写进 HTML，刷新后一进来就是完整的；前端拿快照给出的 `cursor`
+往后接增量（**不是**自己数页面上最后一条的 `seq`——理由见下一小节第 2 点）。
 
 #### 游标可能失效，不许静默漏事件
 
@@ -409,6 +469,32 @@ patch 进去、`state.revision` 还没递增。异常从这里穿出去，留下
 两者都用同一个出口解决：响应带 `first_seq` 与 `stream_epoch`（进程启动时生成的随机
 串），并在 `since < first_seq` 或客户端持有的 epoch 与当前不符时置 `reset_required: true`。
 前端见到它就 `location.reload()` 重新取一份完整快照，**宁可多刷一次，不接受静默漏事件**。
+
+#### reset 必须保证收敛：快照的游标要落在 high-water mark 上
+
+「reset → reload → 重取快照」这条路**只有在新快照给出的游标一定不再触发 reset 时才成立**，
+而「快照 = 磁盘 durable 历史」给不出这个保证。反例（下期 token 事件一开就是常态）：ring
+被一批 `durable=False` 的事件挤爆，`first_seq` 涨到 5000；这些事件不在 `events.jsonl` 里，
+所以 reload 后新页面从磁盘拿到的最大 seq 还是 4000；前端带 `since=4000` 再问一次，
+`4000 < 5000` 又是 `reset_required` ——**一个每秒 reload 一次、永远读不完内容的死循环**，
+比静默漏事件更糟。
+
+所以初始快照的定义收紧为，且这是 `EventLog` 的接口契约而不是调用方的自觉：
+
+1. `EventLog.snapshot()` **在 `EventLog` 自己的锁内**完成三件事：读 durable 历史、取当前
+   live ring 的全部内容、按 `seq` 归并去重，返回 `(events, cursor, first_seq, stream_epoch)`。
+   `cursor` 是**此刻的 high-water mark**（已分配出去的最大 seq），不是「磁盘上的最大 seq」。
+   在锁内取是必要的：否则「读完磁盘」与「读 ring」之间新写入的事件会掉进缝里，
+   快照和游标对不上，v1 的批量 flush 延迟就足以制造这条缝。
+2. 详情页把 `cursor` 写进 HTML，前端从它往后要增量。因为 `cursor ≥ ring.last_seq ≥
+   first_seq`，紧接着的那次 `?since=cursor` **在构造上不可能再触发 reset**。唯一还能触发
+   的是「这中间进程又重启了」（epoch 变），那是真的换了一条流，reload 本来就该发生。
+3. 轮询接口在置 `reset_required: true` 时**一并返回 `resume_seq`**（= 当前 high-water mark）。
+   前端不想整页 reload 时（下期 SSE）可以直接跳到 `resume_seq` 续上——代价是承认中间那段
+   丢了，但这是**明示**的丢，不是静默吞掉。v1 前端简单起见仍走 `location.reload()`。
+
+**收敛性就是这样保证的**：任何一次 reset 之后，客户端的游标都被推到当前 high-water mark，
+而 high-water mark 永远 ≥ `first_seq`。最多刷新一次，然后恢复正常轮询。
 
 这个能力与传输方式无关：轮询用 `?since=N`，SSE 用 `Last-Event-ID`，同一份数据两种取法
 （SSE 下 epoch 变化对应重新 `retry` 并丢弃 `Last-Event-ID`）。
@@ -441,12 +527,13 @@ patch 进去、`state.revision` 还没递增。异常从这里穿出去，留下
 |---|---|
 | `AWAIT_REQ_CONFIRM` | 需求卡（模板遍历 `ReqCardVM`）+ 「确认」按钮 + 「说要改什么」textarea |
 | `AWAIT_CHOICE` | 候选列表（模板遍历 `CandidateVM`）+ 每条候选一个「选它」按钮 + 提意见 textarea |
-| `COLLECT` / `GENERATE` / `REFINE`，且有 job 在跑 | 「正在工作」+ 取消按钮 + 进度区（其余按钮置灰） |
-| `COLLECT` / `GENERATE` / `REFINE`，但**没有** job | 「上一步没有跑完」+ 「继续」按钮（发 `cmd=None` 的命令）。服务重启、`503` 被拒、线程异常挂掉，三种情况都落在这里——必须有出路，不能是一个永远转圈的假进度条 |
+| `COLLECT` / `GENERATE` / `REFINE`，且有 **active** job（§4.2） | 「正在工作」+ 取消按钮 + 进度区（其余按钮置灰）。`cancelling` 时取消按钮也置灰，文案换成「已请求停止…」 |
+| `COLLECT` / `GENERATE` / `REFINE`，但**没有 active** job | 「上一步没有跑完」+ 「继续」按钮（发 `cmd=None` 的命令）。服务重启、`503` 被拒、线程异常挂掉，三种情况都落在这里——必须有出路，不能是一个永远转圈的假进度条 |
 | `DONE` + `artifact_ready` | 成稿摘要 + 跳 `/trips/<tid>/itinerary` 的链接 |
 | `DONE` + 产物未就绪 | 成稿摘要 + 「产物待重建」+ 重建按钮（§4.1），**不给死链** |
 
-页面底部固定一块**进度区**，服务端渲染时写入全部 durable 历史事件（见 §5.5）。
+页面底部固定一块**进度区**，服务端渲染时写入 `EventLog.snapshot()` 的结果，并把快照
+给出的 `cursor` 一并写进页面供轮询起步（见 §5.5）。
 
 #### 不复用 CLI 的 Markdown 渲染器
 
@@ -496,7 +583,7 @@ status、detail、issues……都是独立字段），模板遍历字段、自�
 - `request` 为空 → `400`，回列表页并保留已输入内容
 - `request` 超长（见 §6.5 的字段上限）→ `400`，同样保留内容
 - `TripExists` → `409`，提示「已存在」并给直达链接
-- 全局 job 数满 → `503`（§4.2）。此时**行程目录已经建好**，提示「已创建，但服务器
+- 全局 **active** job 数满 → `503`（§4.2）。此时**行程目录已经建好**，提示「已创建，但服务器
   正忙，稍后进去点『继续』」并给直达链接——不静默丢掉用户刚敲的那段需求
 
 #### `POST /trips/<tid>/commands` —— 提交命令
@@ -520,8 +607,10 @@ feedback → GiveFeedback(expected_revision, angle_key, text)
 （`kind` 留空 = 「继续」，对应 `cmd=None`，用于上一行提到的「有 stage、没 job」。）
 
 - 成功 → `302 /trips/<tid>`，后台线程跑 `run_command(...)`
-- 该行程已有 job 在跑 → `409`（按钮本已置灰，这是兜底）
-- 全局 job 数满 → `503`，详情页顶部提示「服务器正忙」，按钮不置灰（可以再点）
+- 该行程已有 **active**（`running` **或 `cancelling`**，§4.2）job → `409`（按钮本已置灰，
+  这是兜底）。**`cancelling` 也挡**：那个线程还没退出，放第二个进来就是两个线程同时
+  对一份 state 跑 `advance`
+- 全局 **active** job 数满 → `503`，详情页顶部提示「服务器正忙」，按钮不置灰（可以再点）
 - `text` 超长（§6.5）→ `400`，回详情页并保留输入
 - `advance` 返回 `Rejected` → **不是 HTTP 错误**，job 进 `rejected` 终态并记下
   `reason`，详情页顶部显示告警条
@@ -535,7 +624,11 @@ CLI 里 `_resolve_candidate_key()` 那整块「大小写兜底」逻辑（连同
 - 输入：CSRF 隐藏字段
 - 行为：设置 job 的取消令牌，job 状态 `running` → `cancelling`（`status_version` +1）
 - 输出：`302 /trips/<tid>`，页面显示「已请求停止，将在当前这一步结束后生效」
-- 没有 job 在跑 → `302` 回详情页，什么也不做（幂等，重复点不报错）
+- 没有 job 在跑 → `302` 回详情页，什么也不做（幂等，重复点不报错）；已经是
+  `cancelling` 时同样是 no-op，**不再 +1 `status_version`**（否则每点一下都让所有标签页
+  白刷一次）
+- **`cancelling` 期间该 trip 仍然被互斥挡着**（§4.2）：页面不会因为「已请求停止」就把
+  按钮放开，否则用户会以为可以立刻开始下一步，实际拿到 409
 - 语义见 §4.3：不是立刻生效，也不承诺时延
 
 #### `POST /trips/<tid>/artifacts` —— 重建产物
@@ -543,9 +636,12 @@ CLI 里 `_resolve_candidate_key()` 那整块「大小写兜底」逻辑（连同
 - 输入：CSRF 隐藏字段
 - 行为：从 `state.json` 重跑 `stage_artifacts()` + `publish()`，**不碰 LLM**，
   与 `trip render` 同一条代码路径（§4.1）
-- 前置：`stage is DONE`，且该 trip 没有 job 在跑；否则 `409`
+- 前置：`stage is DONE`，且该 trip **没有 active job**（§4.2 的谓词，含 `cancelling`）；
+  否则 `409`。理由同上：那个还没退出的线程可能正在往自己的暂存目录里写、马上要
+  `publish()`，此时插一次重建就是两个发布者抢同一份最终产物
 - 输出：`302 /trips/<tid>`
-- 会拉高德静态地图，可能慢：同样走后台线程 + 一个 job（占全局名额），页面轮询等它
+- 会拉高德静态地图，可能慢：同样走后台线程 + 一个 job（**占全局 active 名额**），
+  页面轮询等它
 
 ### 6.3 数据类（JSON，供轮询）
 
@@ -565,7 +661,9 @@ CLI 里 `_resolve_candidate_key()` 那整块「大小写兜底」逻辑（连同
   "last_seq": 12,
   "stream_epoch": "8f3ac1d2",
   "reset_required": false,
-  "job": {"status": "running", "status_version": 4, "kind": null, "message": null},
+  "resume_seq": null,
+  "job": {"id": "3f9a1c...", "status": "running", "status_version": 4,
+          "kind": null, "message": null},
   "stage": "GENERATE",
   "revision": 7,
   "artifact_ready": false
@@ -578,15 +676,19 @@ CLI 里 `_resolve_candidate_key()` 那整块「大小写兜底」逻辑（连同
   一句中文；`rejected` 时是 `RejectReason`。后台线程接住的
   `ProviderError` / `LimitExceeded` 在这里暴露，对应 `cli.main()` 里那两个 except 分支
   的职责。
-- `job.status_version`：见 §4.1.1。
-- `reset_required` / `first_seq` / `stream_epoch`：见 §5.5。
+- `job.id` / `job.status_version`：见 §4.1.1。**这两个字段必须一起看**：
+  `status_version` 是 per-job 的，换了 job 就从 1 重来。`job.status` 为 `none` 时
+  `job.id` 也是 `null`。
+- `reset_required` / `resume_seq` / `first_seq` / `stream_epoch`：见 §5.5。
+  `resume_seq` 只在 `reset_required` 为 true 时非空。
 
 **前端逻辑只有四条**，刻意做得极薄：
 
-1. 每秒拉一次，带上本地 `last_seq` 与 `epoch`
+1. 每秒拉一次，带上本地游标（初值是快照的 `cursor`，§5.5）与 `epoch`
 2. `events` 里的新事件追加到进度区（认 `stream_id`：同 id 拼进同一个块）
-3. 需要刷新时 `location.reload()`，触发条件是**三者之一发生变化**：
-   `job.status_version`、`revision`、`artifact_ready`。**刷新后把新值记为本地基线**
+3. 需要刷新时 `location.reload()`，触发条件是**四者之一发生变化**：
+   **`job.id`**、`job.status_version`、`revision`、`artifact_ready`。
+   **刷新后把新值记为本地基线**
 4. `job.status` 是终态（`succeeded` / `rejected` / `failed` / `cancelled`）时
    **停止轮询**；`reset_required` 为 true 时也 reload 一次
 
@@ -595,6 +697,12 @@ CLI 里 `_resolve_candidate_key()` 那整块「大小写兜底」逻辑（连同
 reload——每秒一次，页面永远刷不停，用户连错误信息都读不完。同理 `running` 由 true 变
 false 也只是 `status_version` 变化的一个特例，单独判断反而漏掉「running → 另一个
 running」这类情况。改成单调版本号 + 终态停轮询，两个毛病一起消掉。
+
+**但光有 `status_version` 不够，必须连 `job.id` 一起比**：`status_version` 只在一个 job
+内部单调，新 job 从 1 重来，「老 job 的 running(1)」和「新 job 的 running(1)」看起来
+完全一样——后台标签页因此会漏掉整整一次命令（完整推演见 §4.1.1）。`revision` 也补不上
+这个洞，因为 `failed` / `rejected` / `cancelled` 三种终态根本不改 revision。二元组变了
+就刷新，是唯一不漏的判据。
 
 **前端不需要知道任何业务状态怎么渲染**，它只判断「要不要刷新」。所有渲染在服务端
 Jinja2。这也让下期接 SSE 时前端改动面极小。
@@ -654,7 +762,7 @@ Jinja2。这也让下期接 SSE 时前端改动面极小。
 | 命令 | 说明 |
 |---|---|
 | `trip web` | 启动服务。参数：`--host`（默认 `127.0.0.1`）、`--port`（默认 8000）、`--trips-dir`（默认 `trips`） |
-| `trip render <dir>` | 从 `state.json` 重新生成产物，不碰 LLM。CLI 接口原样保留（含 `--format`），内部改调 `artifacts.stage_artifacts()` + `publish()`，与 Web 共用同一条原子发布路径（§3.2 / §4.1） |
+| `trip render <dir>` | 从 `state.json` 重新生成产物，不碰 LLM。CLI 接口原样保留（含 `--format`），内部改调 `artifacts.stage_artifacts()` + `publish()`，与 Web 共用同一条原子发布路径（§3.2 / §4.1）。它现生成自己的 `stage_id`，因此**与正在跑的 Web job 共存也不会互相踩暂存文件**——这是 §4.1 要求按 job 隔离暂存目录的直接原因 |
 
 删除：`plan`、`resume`、`terminal_ask()`、交互版 `drive()`、`_resolve_candidate_key()`。
 
@@ -720,6 +828,24 @@ web = ["flask", "waitress"]
 21. **线程异常不留永久 running**（§4.1.1）—— 让 `advance` 抛一个设计里没预料的异常
     （例如 `KeyError`），job 最终停在 `failed` 而不是 `running`，且 `events.jsonl` 里
     有对应的终态事件
+22. **错过终态也不会把新 job 当成旧 job**（§4.1.1 / §6.3）—— 模拟一个「错过中间终态」的
+    标签页：job A 跑到 `running`（取一次轮询响应），随后让 A 进 `failed`，再为同一 trip
+    起 job B 并停在 `running`；下一次轮询响应里的 `(job.id, job.status_version)` 必须与
+    第一次不同（即前端会刷新）。**只比 `status_version` 会相等**，这条测试就是守着这一点；
+    同时断言 `revision` 在这一串里没变（证明 revision 兜不住）
+23. **`cancelling` 仍占名额、仍挡住同 trip**（§4.2）—— 取消后让 job 停在 `cancelling`
+    （线程不退出），此时：同一 trip 再发命令返回 `409`；把全局上限设为 1 时，**另一个**
+    trip 发命令返回 `503`；`POST /trips/<tid>/artifacts` 也返回 `409`。线程真正退出后，
+    三者都恢复正常
+24. **并发写者不串台**（§4.1）—— 两个写者（模拟 Web job 与 `trip render` 两个进程）从
+    **不同的 state** 各自 `stage_artifacts()`，验证它们落在不同的 `.staging/<id>/` 下互不
+    覆盖；让其中一个 `discard()`、另一个 `publish()`，最终 `itinerary.html` 的内容必须
+    来自 `publish()` 那一方，且 `artifacts.json.revision` 与它对得上（不是「revision 对得上
+    但内容是另一份」）。另补一条：`discard()` 只删自己的子目录
+25. **reset 最多刷新一次**（§5.5）—— 构造「被挤出 ring 的是 `durable=False` 事件」的场景
+    （直接往 `EventLog` 写瞬时事件把 ring 挤爆），先确认 `?since=<旧游标>` 返回
+    `reset_required=true`；然后按设计走一次 `snapshot()`，用它返回的 `cursor` 再轮询，
+    这一次**必须** `reset_required=false`。守的是收敛性，不是单次行为
 
 现有 `tests/test_cli.py` 相应删改：交互相关用例（`terminal_ask`、`EOFError` 分支、
 `_resolve_candidate_key`）随代码一起删；`render` 与凭据装配相关的保留。
@@ -740,7 +866,11 @@ web = ["flask", "waitress"]
    状态永远是 `state.json`。
 5. **全局同时只跑 3 个 job**（§4.2），满了直接 503 且不排队。家用场景下这是特性
    不是缺陷，但确实意味着「一次性开十个行程」做不到。
-6. **Web 层必须单进程**（§6.4）。
-7. **局域网明文 HTTP**（§6.5）。session cookie 因此不能设 `Secure`，CSRF token 与
+6. **取消不会立刻还回名额**（§4.2）。`cancelling` 算 active，名额要等线程真正退出才
+   释放，而那受限于第 1 条的时延。这是刻意的：提前释放等于允许两个线程同时对一份
+   state 跑 `advance`，既烧双份钱又让互斥形同虚设。页面文案要能解释「为什么点了取消
+   还不能马上开始下一步」。
+7. **Web 层必须单进程**（§6.4）。
+8. **局域网明文 HTTP**（§6.5）。session cookie 因此不能设 `Secure`，CSRF token 与
    Basic Auth 凭据一样可被同网段嗅探——这条限制的根因和缓解判断都在 §6.5。
-8. **进度信号偏粗**。v1 是阶段级里程碑，不是 token 级。token 级是下一期（§5.3）。
+9. **进度信号偏粗**。v1 是阶段级里程碑，不是 token 级。token 级是下一期（§5.3）。
