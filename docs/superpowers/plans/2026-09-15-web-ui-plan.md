@@ -25,9 +25,22 @@
 7. **`tid` 校验**：必须是单个路径段（不含 `/`、`\`、`..`、`\0`），且 `(trips_root/tid).resolve()` 必须是 `trips_root.resolve()` 的直接子目录（spec §6.0）。这是对局域网暴露的服务的硬要求。
 8. **输入体积上限**：`MAX_CONTENT_LENGTH = 64 KiB`；`request` / `text` 各限 8000 字符；`dir` 限 80 字符；`angle_key` 限 64 字符（spec §6.5）。
 9. **不做的事**：token 级流式输出、SSE、下载按钮、用户体系、HTTPS。但 `Event` 的 `durable` / `stream_id` 字段和 `EventLog.since()` 的 `first_seq` / `stream_epoch` / `reset_required` **这一期就要有**，它们实质影响 v1 的事件模型（spec §5.3）。
-10. **格式化**：每次改完代码跑 `.venv/bin/black src tests`（CLAUDE.md 要求）。虚拟环境是 `/Users/jialiu/Projects/trip-plan/.venv`。
-11. **基线**：当前 `620 passed, 1 deselected`。每个任务结束时，除该任务有意改写的测试外全部保持绿。
-12. **TDD**：先写测试、看它以正确理由失败、再写最小实现、再看它通过、然后提交。
+10. **命令的工作目录与解释器**。下面每一条 `Run:` / bash 块都按这两条执行，任务里不再重复：
+    - **cwd 一律是 worktree 根目录** `/Users/jialiu/Projects/trip-plan/.worktrees/20260915-015213-web-ui`（`src` / `tests` 这些相对参数都从这里算）；
+    - **解释器与 black 一律用主仓库虚拟环境的绝对路径**：
+      `PYTHON=/Users/jialiu/Projects/trip-plan/.venv/bin/python`、
+      `BLACK=/Users/jialiu/Projects/trip-plan/.venv/bin/black`。
+
+    **worktree 下没有也不要建 `.venv`**，所以计划里不出现 `.venv/bin/...` 这种相对写法——照着敲会直接
+    `no such file or directory`。用主仓库的 venv 跑 worktree 的代码是安全的，不是将就：`pyproject.toml` 里
+    `[tool.pytest.ini_options] pythonpath = ["src"]` 是**相对 rootdir** 的，而 cwd 在 worktree 时 rootdir 就是
+    worktree，pytest 会把 `<worktree>/src` 插到 `sys.path[0]`，压过那个 venv 里指向主仓库 `src` 的
+    editable `.pth`。已实测：在 worktree 下用该解释器跑 pytest，`tripplan.__file__` 落在
+    `<worktree>/src/tripplan/__init__.py`，`620 passed, 1 deselected` 与基线一致。**不要脱离 pytest 直接
+    `python -c "import tripplan"`**——那条路没有 pytest 的 pythonpath，会 import 到主仓库的旧代码。
+11. **格式化**：每次改完代码跑 `$BLACK src tests`（CLAUDE.md 要求）。
+12. **基线**：当前 `620 passed, 1 deselected`。每个任务结束时，除该任务有意改写的测试外全部保持绿。
+13. **TDD**：先写测试、看它以正确理由失败、再写最小实现、再看它通过、然后提交。
 
 ---
 
@@ -57,8 +70,9 @@
 | `src/tripplan/orchestrator.py` | `advance` / `_apply` / `_run_to_pause` / `_step_ctx` / `_safe_slot` 一路传 `cancel`；三处宽泛捕获前加 `except Cancelled: raise`；裸 `emit` 换 `safe_emit`；补 5 个 emit 点 |
 | `src/tripplan/validation/diversity.py` | 裸 `emit` 换 `safe_emit` |
 | `src/tripplan/render/requirement_card.py` | `_LABELS` 改名为公开的 `FIELD_LABELS`（只改名，渲染逻辑一个字不动），供 `web/view.py` 复用同一份标签数据 |
-| `src/tripplan/cli.py` | 删 `plan` / `resume` / `terminal_ask` / `drive` / `_resolve_candidate_key` / `write_artifacts`；新增 `trip web`；`render` 改调 `artifacts.*` |
+| `src/tripplan/cli.py` | 先加后删，分两个任务：Task 15 新增 `trip web`（`plan` / `resume` 原样留着），Task 16 才删 `plan` / `resume` / `terminal_ask` / `drive` / `_resolve_candidate_key` / `write_artifacts`；`render` 改调 `artifacts.*`（Task 4） |
 | `pyproject.toml` | `[project.optional-dependencies] web = ["flask", "waitress"]`，`dev` 追加这两项 |
+| `uv.lock` | 跟着 `pyproject.toml` 一起 `uv lock` 重新生成并提交——只改声明不改锁文件，`uv lock --check` / `uv sync --locked` 当场就红（Task 9） |
 
 **测试**
 
@@ -159,10 +173,8 @@ def test_raise_if_cancelled_tolerates_a_missing_token():
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `cd /Users/jialiu/Projects/trip-plan/.worktrees/20260915-015213-web-ui && .venv/bin/python -m pytest tests/agents/test_limits.py -v`
+Run: `cd /Users/jialiu/Projects/trip-plan/.worktrees/20260915-015213-web-ui && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/agents/test_limits.py -v`
 Expected: FAIL，`ImportError: cannot import name 'Cancelled' from 'tripplan.agents.limits'`
-
-（`.venv` 在仓库主目录：如果 worktree 下没有 `.venv`，用 `/Users/jialiu/Projects/trip-plan/.venv/bin/python`。下同。）
 
 - [ ] **Step 3: 写最小实现**
 
@@ -218,14 +230,14 @@ def raise_if_cancelled(token) -> None:
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/agents/test_limits.py -v && .venv/bin/python -m pytest -q`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/agents/test_limits.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
 Expected: `tests/agents/test_limits.py` 全绿；全量 `620 passed`（本任务只改写了一条既有用例并新增四条，净增 4 条 → `624 passed, 1 deselected`）
 
 - [ ] **Step 5: 格式化并提交**
 
 ```bash
 cd /Users/jialiu/Projects/trip-plan/.worktrees/20260915-015213-web-ui
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/agents/limits.py tests/agents/test_limits.py
 git commit -m "feat(limits): 取消改成独立的 Cancelled 信号 + 外部取消令牌"
 ```
@@ -335,7 +347,7 @@ def test_a_throwing_emit_does_not_break_angle_failure_or_diversity_paths(wire):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/agents/test_emit.py tests/test_advance_flow.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/agents/test_emit.py tests/test_advance_flow.py -v`
 Expected: `test_emit.py` 全部 `ModuleNotFoundError: No module named 'tripplan.agents._emit'`；两条 `advance_flow` 用例 FAIL with `RuntimeError`（裸 emit 直接把异常放穿了）
 
 - [ ] **Step 3: 写最小实现**
@@ -390,13 +402,13 @@ from tripplan.agents._emit import safe_emit as _safe_emit
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/agents/test_emit.py tests/test_advance_flow.py tests/test_slot.py tests/validation/test_diversity.py -v && .venv/bin/python -m pytest -q`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/agents/test_emit.py tests/test_advance_flow.py tests/test_slot.py tests/validation/test_diversity.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
 Expected: 全绿，`629 passed, 1 deselected`
 
 - [ ] **Step 5: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/agents/_emit.py src/tripplan/slot.py src/tripplan/orchestrator.py \
         src/tripplan/validation/diversity.py tests/agents/test_emit.py tests/test_advance_flow.py
 git commit -m "fix(emit): 三处裸 emit 改走 safe_emit，进度回调不再能搞歪状态机"
@@ -605,7 +617,7 @@ def test_advance_emits_angles_picked(wire):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/test_cancel.py tests/test_advance_flow.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/test_cancel.py tests/test_advance_flow.py -v`
 Expected: `test_cancel.py` 里 `test_run_slot_lets_cancelled_escape...` FAIL（Cancelled 被 `except LimitExceeded`/`except ProviderError` 之外的路径吞成候选，实际返回 `CandidateSlot` 而非抛出）；`cancel=` 相关的 FAIL with `TypeError: run_slot() got an unexpected keyword argument 'cancel'`；两条 emit 用例 FAIL（事件不存在）
 
 - [ ] **Step 3: 写最小实现**
@@ -790,13 +802,13 @@ def _safe_slot(
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/test_cancel.py tests/test_advance_flow.py tests/test_slot.py -v && .venv/bin/python -m pytest -q`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/test_cancel.py tests/test_advance_flow.py tests/test_slot.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
 Expected: 全绿，`636 passed, 1 deselected`
 
 - [ ] **Step 5: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/slot.py src/tripplan/orchestrator.py tests/test_cancel.py tests/test_advance_flow.py
 git commit -m "feat(cancel): 取消令牌贯穿 advance/run_slot，并补齐阶段级 emit 点"
 ```
@@ -820,7 +832,7 @@ git commit -m "feat(cancel): 取消令牌贯穿 advance/run_slot，并补齐阶�
   - `def discard(staged: Staged | None) -> None`
   - `def artifact_ready(trip_dir, revision: int) -> bool`
   - `def sweep_stale_staging(trips_root, max_age_s: float = 3600.0) -> int`
-  - 常量 `ARTIFACTS_JSON = "artifacts.json"`、`STAGING_DIR = ".staging"`
+  - 常量 `ARTIFACTS_JSON = "artifacts.json"`、`STAGING_DIR = ".staging"`、`FINAL_HTML = "itinerary.html"`
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -947,6 +959,45 @@ def test_artifact_ready_survives_a_corrupt_manifest(tmp_path):
     assert not artifact_ready(tmp_path, 1)
 
 
+def test_an_empty_manifest_is_not_ready(tmp_path):
+    """`all([])` 是 True —— 照 spec §4.1 的字面写法，一个 files 为空的
+    manifest 会拿到假绿灯，详情页于是亮出一个指向不存在文件的成稿链接
+    （spec §6.1「不给死链」）。"""
+    s = TripState.new("去京都", run_id="r1")
+    s.revision = 3
+    publish(stage_artifacts(s, tmp_path, FakeProvider(), "job-1"))
+
+    assert json.loads((tmp_path / ARTIFACTS_JSON).read_text(encoding="utf-8"))["files"] == []
+    assert not (tmp_path / "itinerary.html").exists()
+    assert not artifact_ready(tmp_path, 3)
+
+
+def test_a_markdown_only_manifest_is_not_ready(tmp_path):
+    """`trip render <dir> --format md`（§7 支持的第二个写者）发布的 manifest
+    里压根没有 HTML。revision 对得上、列出的文件也都在，但成稿页给不出东西。"""
+    state = _done_state(rev=7)
+    publish(stage_artifacts(state, tmp_path, FakeProvider(), "job-1", fmt="md"))
+
+    assert (tmp_path / "itinerary.md").exists()
+    assert not artifact_ready(tmp_path, 7)
+
+
+def test_a_markdown_only_manifest_does_not_bless_a_leftover_html(tmp_path):
+    """这条是上一条里真正危险的那一半，必须单独钉住：`--format md` **不会删掉**
+    上一版留下的 itinerary.html。若就绪判定只看「files 里的都在」，它会给出
+    一份 rev 7 的旧成稿，却宣称这是 rev 9 —— manifest 的 revision 与 state.json
+    严丝合缝对得上，没有任何报错，谁也查不出来。"""
+    publish(stage_artifacts(_done_state(rev=7, title="上一版的成稿"), tmp_path, FakeProvider(), "job-a"))
+    assert "上一版的成稿" in (tmp_path / "itinerary.html").read_text(encoding="utf-8")
+
+    publish(stage_artifacts(_done_state(rev=9, title="新版成稿"), tmp_path, FakeProvider(), "job-b", fmt="md"))
+
+    assert (tmp_path / "itinerary.html").exists()          # 旧文件还在
+    assert "上一版的成稿" in (tmp_path / "itinerary.html").read_text(encoding="utf-8")
+    assert json.loads((tmp_path / ARTIFACTS_JSON).read_text(encoding="utf-8"))["revision"] == 9
+    assert not artifact_ready(tmp_path, 9)                 # ★ 绝不能放行
+
+
 def test_publish_and_discard_tolerate_none(tmp_path):
     publish(None)
     discard(None)
@@ -1004,7 +1055,7 @@ def test_sweep_tolerates_a_missing_trips_root(tmp_path):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/test_artifacts.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/test_artifacts.py -v`
 Expected: FAIL，`ModuleNotFoundError: No module named 'tripplan.artifacts'`
 
 - [ ] **Step 3: 写最小实现**
@@ -1129,10 +1180,40 @@ def discard(staged: Staged | None) -> None:
     shutil.rmtree(staged.stage_dir, ignore_errors=True)
 
 
+FINAL_HTML = "itinerary.html"
+
+
 def artifact_ready(trip_dir, revision: int) -> bool:
     """详情页不靠 `stage is DONE` 决定要不要给链接，靠这个（spec §4.1）。
 
     崩溃恢复、旧版本产物残留、手工删文件，三种情况共用这一条判定。
+
+    **它回答的是一个很具体的问题：「`/trips/<tid>/itinerary` 现在点进去，
+    拿到的是不是这一版 revision 的成稿？」** 所以 manifest 里必须**明确列出**
+    `itinerary.html` 且该文件真的在——`revision` 对得上 + `files` 里的东西都在，
+    这两条加起来并不蕴含它。
+
+    spec §4.1 的字面表述是「`artifacts.json` 存在且 revision 相等且文件都在」，
+    照字面写成 `all(files 都存在)` 有一个致命的空集陷阱：**`all([])` 是 `True`**。
+    于是两种 manifest 会拿到假绿灯，而两种都是现实路径：
+
+    - **空 manifest**：`stage_artifacts()` 在没有可发布候选时返回 `names=()`
+      （非 DONE、或 chosen 那条候选 `itinerary`/`facts` 是 None），`publish()`
+      照样写下 `{"revision": N, "files": []}`；
+    - **只有 Markdown 的 manifest**：`trip render <dir> --format md`（§7 明确
+      支持的第二个写者）发布 `{"revision": N, "files": ["plan-A.md",
+      "itinerary.md"]}`，压根没碰 HTML。
+
+    两种情况下 `artifact_ready` 若返回 `True`，详情页就会亮出成稿链接（spec §6.1
+    那张表的 `DONE + artifact_ready` 行），而点进去只有两种结局：**(a)** 文件不在 →
+    成稿页 409「产物需要重建」，详情页刚刚才承诺过它就绪，自相矛盾；**(b)** 更糟，
+    上一版的 `itinerary.html` 还躺在目录里没人删 —— `--format md` 不会清理它 ——
+    于是**静默给出一份过期成稿**，manifest 的 revision 还和 `state.json` 严丝合缝
+    对得上，谁也查不出来。这正是 spec §6.1「**不给死链**」和 §9 回归 15 要堵的洞。
+
+    所以这里比 §4.1 的字面表述**更严**一档：强制要求 `itinerary.html` 在册。
+    宁可多显示一次「产物待重建」（点一下重建按钮就好，不碰 LLM），也不要给一个
+    404 或一份看不出来的旧成稿。
     """
     trip_dir = Path(trip_dir)
     path = trip_dir / ARTIFACTS_JSON
@@ -1143,7 +1224,9 @@ def artifact_ready(trip_dir, revision: int) -> bool:
     if not isinstance(data, dict) or data.get("revision") != revision:
         return False
     files = data.get("files")
-    if not isinstance(files, list):
+    if not isinstance(files, list) or FINAL_HTML not in files:
+        # ★ 空 manifest 与「只有 md」的 manifest 都到此为止：all([]) 是 True，
+        #   少了这一行它们全都是假绿灯。
         return False
     return all(isinstance(n, str) and (trip_dir / n).exists() for n in files)
 
@@ -1188,8 +1271,8 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/test_artifacts.py -v`
-Expected: PASS（15 条）
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/test_artifacts.py -v`
+Expected: PASS（17 条）
 
 - [ ] **Step 5: 让 `trip render` 改走同一条路径**
 
@@ -1211,7 +1294,7 @@ from tripplan.artifacts import publish, stage_artifacts
     )
 ```
 
-`_drive_and_report` 里那一行 `write_artifacts(state, repo.dir, deps.provider)` 暂时改成同样的 stage+publish（Task 15 会连同 `drive` 一起删掉，这里只为保持中间态可跑）：
+`_drive_and_report` 里那一行 `write_artifacts(state, repo.dir, deps.provider)` 暂时改成同样的 stage+publish（Task 16 会连同 `drive` 一起删掉，这里只为保持中间态可跑）：
 
 ```python
     publish(stage_artifacts(state, repo.dir, deps.provider, uuid.uuid4().hex))
@@ -1225,18 +1308,18 @@ from tripplan.artifacts import publish, stage_artifacts
 `test_write_artifacts_is_safe_before_any_candidates`、
 `test_write_artifacts_never_embeds_a_fake_placeholder_map`、
 `test_write_artifacts_embeds_the_real_map_when_a_provider_is_given`、
-`test_drive_and_report_skips_artifacts_when_final_save_loses_the_cas_race`（Task 15 会用 `run_command` 的等价回归接管；本任务先删）、
+`test_drive_and_report_skips_artifacts_when_final_save_loses_the_cas_race`（Task 16 会用 `run_command` 的等价回归接管；本任务先删）、
 以及 `from tripplan.cli import ... write_artifacts` 这一行里的 `write_artifacts`。
 
 `test_render_*` 全部保留——它们走的是 `main(["render", ...])`，正好验证新路径端到端没坏。
 
-Run: `.venv/bin/python -m pytest -q`
-Expected: `645 passed, 1 deselected`（636 − 7 + 16）。特别确认 `test_render_twice_produces_identical_files`、`test_render_format_md_only_does_not_write_html`、`test_render_uses_no_provider_and_skips_maps_when_amap_key_is_absent` 仍绿
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: `646 passed, 1 deselected`（636 − 7 + 17）。特别确认 `test_render_twice_produces_identical_files`、`test_render_format_md_only_does_not_write_html`、`test_render_uses_no_provider_and_skips_maps_when_amap_key_is_absent` 仍绿
 
 - [ ] **Step 7: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/artifacts.py src/tripplan/cli.py tests/test_artifacts.py tests/test_cli.py
 git commit -m "refactor(artifacts): 抽出 stage/publish/discard，产物改成先暂存后原子发布"
 ```
@@ -1458,7 +1541,7 @@ def test_store_creates_the_trip_directory_lazily_on_first_write(tmp_path):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_events.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_events.py -v`
 Expected: FAIL，`ModuleNotFoundError: No module named 'tripplan.web'`
 
 - [ ] **Step 3: 写最小实现**
@@ -1681,13 +1764,13 @@ class EventLogStore:
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/web/test_events.py -v && .venv/bin/python -m pytest -q`
-Expected: `tests/web/test_events.py` 17 条全绿；全量 `662 passed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_events.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: `tests/web/test_events.py` 17 条全绿；全量 `663 passed, 1 deselected`
 
 - [ ] **Step 5: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/web/__init__.py src/tripplan/web/events.py tests/web/__init__.py tests/web/test_events.py
 git commit -m "feat(web): EventLog —— 磁盘 durable 历史 + 内存 live ring，游标失效可检测"
 ```
@@ -2055,7 +2138,7 @@ def test_rebuild_artifacts_publishes_without_touching_state(tmp_path):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_jobs_run_command.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_jobs_run_command.py -v`
 Expected: FAIL，`ModuleNotFoundError: No module named 'tripplan.web.jobs'`
 
 - [ ] **Step 3: 写最小实现**
@@ -2229,13 +2312,13 @@ def rebuild_artifacts(
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/web/test_jobs_run_command.py -v && .venv/bin/python -m pytest -q`
-Expected: 13 条全绿；全量 `675 passed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_jobs_run_command.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: 13 条全绿；全量 `676 passed, 1 deselected`
 
 - [ ] **Step 5: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/web/jobs.py tests/web/test_jobs_run_command.py
 git commit -m "feat(web): run_command —— load/advance/暂存/CAS/发布 的唯一一份提交纪律"
 ```
@@ -2480,7 +2563,7 @@ def test_snapshot_has_the_wire_shape_the_polling_endpoint_expects(tmp_path):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_jobs_registry.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_jobs_registry.py -v`
 Expected: FAIL，`ImportError: cannot import name 'JobRegistry' from 'tripplan.web.jobs'`
 
 - [ ] **Step 3: 写最小实现**
@@ -2688,13 +2771,13 @@ class JobRegistry:
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/web/test_jobs_registry.py -v && .venv/bin/python -m pytest -q`
-Expected: 17 条全绿；全量 `692 passed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_jobs_registry.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: 17 条全绿；全量 `693 passed, 1 deselected`
 
 - [ ] **Step 5: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/web/jobs.py tests/web/test_jobs_registry.py
 git commit -m "feat(web): TripJob/JobRegistry —— 终态必达、cancelling 算 active、满载即拒"
 ```
@@ -2874,7 +2957,7 @@ def test_event_text_degrades_gracefully_on_malformed_payloads():
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_view.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_view.py -v`
 Expected: FAIL，`ModuleNotFoundError: No module named 'tripplan.web.view'`
 
 - [ ] **Step 3: 先把标签常量改成公开名**
@@ -3100,13 +3183,13 @@ def event_text(ev: dict) -> str:
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/web/test_view.py tests/render/test_requirement_card.py -v && .venv/bin/python -m pytest -q`
-Expected: 10 条新用例绿，`render` 的既有用例不受影响；全量 `702 passed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_view.py tests/render/test_requirement_card.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: 10 条新用例绿，`render` 的既有用例不受影响；全量 `703 passed, 1 deselected`
 
 - [ ] **Step 6: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/web/view.py src/tripplan/render/requirement_card.py tests/web/test_view.py
 git commit -m "feat(web): 结构化 view model —— 模板只吃对象，不碰 Markdown 串"
 ```
@@ -3124,6 +3207,7 @@ git commit -m "feat(web): 结构化 view model —— 模板只吃对象，不�
 - Create: `tests/web/conftest.py`
 - Create: `tests/web/test_app_auth.py`
 - Modify: `pyproject.toml`
+- Modify: `uv.lock`（**和 `pyproject.toml` 一起改、一起提交**，理由见 Step 1）
 
 **Interfaces:**
 - Consumes: Task 5 的 `EventLogStore`、Task 7 的 `JobRegistry`、Task 8 的 `trip_rows`
@@ -3134,7 +3218,7 @@ git commit -m "feat(web): 结构化 view model —— 模板只吃对象，不�
   - 路由 `GET /`（endpoint 名 `index`）
   - `app.extensions["tripplan"]` 里挂 `{"trips_root", "deps", "registry", "store", "run_command_fn", "rebuild_fn"}`，供后续任务的路由取用
 
-- [ ] **Step 1: 加依赖并装上**
+- [ ] **Step 1: 加依赖、更新锁文件、装上**
 
 `pyproject.toml`：
 
@@ -3145,11 +3229,38 @@ web = ["flask>=3", "waitress>=3"]
 dev = ["pytest>=8", "pytest-cov>=5", "black>=24", "openai>=3.13", "flask>=3", "waitress>=3"]
 ```
 
+**仓库里有一份 `uv.lock`（35 个包，当前 `uv lock --check` 是过的），它必须跟着一起改。**
+只动 `pyproject.toml` 会让锁文件和声明当场对不上：`uv lock --check` 立刻报
+`The lockfile at uv.lock needs to be updated`，`uv sync --locked` / `uv sync --frozen` 直接失败，
+全新检出的人复现不出这个环境，而 `uv pip install 'flask>=3'` 这种命令是**绕过锁文件**的——它只
+改了本机这一个 venv，锁文件依旧不知道 flask 的存在。锁文件是这个仓库对「依赖到底是哪几个、
+哪些版本」的唯一权威记录，漏掉它等于把本机 venv 当成了事实来源。
+
 ```bash
-cd /Users/jialiu/Projects/trip-plan/.worktrees/20260915-015213-web-ui
+# ① 重新解析并写回 uv.lock（只动锁文件，不建任何 venv）
+uv lock
+
+# ② 验收：锁文件与 pyproject 一致（这条命令在 ① 之前必然失败，之后必然通过）
+uv lock --check
+
+# ③ 装进主仓库的 venv（Global Constraint 10：本项目的开发 venv 就是它，
+#    worktree 下不建 .venv，所以这里用 uv pip install --python 指名道姓，
+#    而不是会在 cwd 新建 .venv 的 uv sync）
 uv pip install --python /Users/jialiu/Projects/trip-plan/.venv/bin/python 'flask>=3' 'waitress>=3'
-.venv/bin/python -c "import flask, waitress; print(flask.__version__, waitress.__version__)"
+/Users/jialiu/Projects/trip-plan/.venv/bin/python -c "import flask, waitress; print(flask.__version__, waitress.__version__)"
 ```
+
+预期：`uv lock` 输出 `Added flask / waitress / werkzeug / jinja2 / markupsafe / itsdangerous /
+blinker / ...`（35 → 42 个包），随后 `uv lock --check` 静默通过。
+
+**验收（三条都要过，缺一条这一步就没做完）**：
+- `uv lock --check` 退出码 0；
+- `git status --porcelain` 里 `uv.lock` 与 `pyproject.toml` **同时**出现（Step 7 会一起 `git add`）；
+- `import flask, waitress` 打印出版本号。
+
+（旁人换一台机器复现时走 `uv sync --extra web --extra dev`，它读的就是这份锁文件——
+这也是「必须把 `uv.lock` 一起提交」的落点。Task 15 还会让 `trip web` 在没装这个 extra 时
+打印一句可读的安装提示，而不是甩一个 `ModuleNotFoundError` 堆栈。）
 
 - [ ] **Step 2: 写失败的测试**
 
@@ -3400,7 +3511,7 @@ def test_no_template_uses_safe_or_markup():
 
 - [ ] **Step 3: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_app_auth.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_app_auth.py -v`
 Expected: FAIL，`ModuleNotFoundError: No module named 'tripplan.web.app'`
 
 - [ ] **Step 4: 写 `web/app.py`**
@@ -3663,19 +3774,19 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
 
 - [ ] **Step 6: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/web/test_app_auth.py -v && .venv/bin/python -m pytest -q`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_app_auth.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
 Expected: 除 `test_a_chinese_directory_name_works` / `test_an_unknown_trip_is_404` / `test_an_oversized_body_is_refused_by_flask` / `test_auth_is_checked_before_csrf` 四条（依赖 Task 10/11 的路由）外全绿
 
 **把这四条先标成 `@pytest.mark.xfail(reason="路由在 Task 10/11", strict=True)`**，Task 10、11 完成时把标记摘掉——这是刻意的：让它们以「确实还没实现」的方式红，而不是被悄悄删掉又忘了补。
 
-Run: `.venv/bin/python -m pytest -q`
-Expected: `717 passed, 4 xfailed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: `718 passed, 4 xfailed, 1 deselected`
 
 - [ ] **Step 7: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
-git add pyproject.toml src/tripplan/web/app.py src/tripplan/web/templates src/tripplan/web/static \
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
+git add pyproject.toml uv.lock src/tripplan/web/app.py src/tripplan/web/templates src/tripplan/web/static \
         tests/web/conftest.py tests/web/test_app_auth.py
 git commit -m "feat(web): Flask 应用工厂 —— Basic Auth、默认全拦的 CSRF、tid 校验、列表页"
 ```
@@ -3811,7 +3922,7 @@ def test_a_full_server_still_keeps_the_trip_and_says_so(make_app, trips_root):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_create_trip.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_create_trip.py -v`
 Expected: 全部 FAIL，`405 METHOD NOT ALLOWED`（`/trips` 还没注册）
 
 - [ ] **Step 3: 把 `slugify` 搬出 `cli.py`**
@@ -3956,13 +4067,13 @@ def _start_command(cfg, tid: str, cmd):
 
 摘掉 `tests/web/test_app_auth.py` 里 `test_an_oversized_body_is_refused_by_flask` 与 `test_auth_is_checked_before_csrf` 的 `xfail` 标记。
 
-Run: `.venv/bin/python -m pytest tests/web/ -v && .venv/bin/python -m pytest -q`
-Expected: `tests/web/test_create_trip.py` 12 条全绿；全量 `731 passed, 2 xfailed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/ -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: `tests/web/test_create_trip.py` 12 条全绿；全量 `732 passed, 2 xfailed, 1 deselected`
 
 - [ ] **Step 6: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/naming.py src/tripplan/cli.py src/tripplan/web/app.py \
         src/tripplan/web/templates tests/web/test_create_trip.py tests/web/test_app_auth.py
 git commit -m "feat(web): POST /trips —— 建目录、起首次 job，满载也不丢用户敲的需求"
@@ -4199,7 +4310,7 @@ def test_a_corrupt_trip_shows_a_readable_page_not_a_500(client, trips_root):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_detail.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_detail.py -v`
 Expected: 全部 FAIL，`404 NOT FOUND`
 
 - [ ] **Step 3: 写路由**
@@ -4459,13 +4570,13 @@ def _detail_with_notice(cfg, tid: str, message: str, status: int):
 
 摘掉 `tests/web/test_app_auth.py` 里剩下两条的 `xfail` 标记。
 
-Run: `.venv/bin/python -m pytest tests/web/ -v && .venv/bin/python -m pytest -q`
-Expected: `tests/web/test_detail.py` 13 条全绿；全量 `744 passed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/ -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: `tests/web/test_detail.py` 13 条全绿；全量 `745 passed, 1 deselected`
 
 - [ ] **Step 6: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/web/app.py src/tripplan/web/templates src/tripplan/web/static tests/web/
 git commit -m "feat(web): 详情页按 stage 渲染 —— 结构化卡片、出路兜底、进度区与轮询基线"
 ```
@@ -4816,7 +4927,7 @@ def test_every_post_route_refuses_a_missing_or_wrong_csrf_token(
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_commands.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_commands.py -v`
 Expected: 绝大多数 FAIL，`501 NOT IMPLEMENTED`
 
 - [ ] **Step 3: 写实现**
@@ -4948,13 +5059,13 @@ def _start_command(cfg, tid: str, cmd, *, busy_page=None):
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/web/test_commands.py -v && .venv/bin/python -m pytest -q`
-Expected: 全绿；全量约 `775 passed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_commands.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: 全绿；全量约 `776 passed, 1 deselected`
 
 - [ ] **Step 5: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/web/app.py tests/web/test_commands.py
 git commit -m "feat(web): commands/cancel/artifacts 三个动作路由，cancelling 一律挡住"
 ```
@@ -5183,7 +5294,7 @@ def test_the_events_endpoint_refuses_path_traversal(client):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_events_endpoint.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_events_endpoint.py -v`
 Expected: FAIL，`501 NOT IMPLEMENTED`
 
 - [ ] **Step 3: 写路由**
@@ -5307,13 +5418,13 @@ Expected: FAIL，`501 NOT IMPLEMENTED`
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/web/test_events_endpoint.py -v && .venv/bin/python -m pytest -q`
-Expected: 10 条全绿；全量约 `785 passed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_events_endpoint.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: 10 条全绿；全量约 `786 passed, 1 deselected`
 
 - [ ] **Step 6: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/web/app.py src/tripplan/web/static/app.js tests/web/test_events_endpoint.py
 git commit -m "feat(web): 轮询接口与前端 —— 二元组判据、终态停轮询、游标失效必刷新"
 ```
@@ -5435,7 +5546,7 @@ def test_the_itinerary_route_refuses_path_traversal(client):
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/web/test_itinerary_page.py -v`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_itinerary_page.py -v`
 Expected: FAIL，`501 NOT IMPLEMENTED`
 
 - [ ] **Step 3: 写路由**
@@ -5472,32 +5583,50 @@ Expected: FAIL，`501 NOT IMPLEMENTED`
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/web/test_itinerary_page.py -v && .venv/bin/python -m pytest -q`
-Expected: 5 条全绿；全量约 `790 passed, 1 deselected`
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/web/test_itinerary_page.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: 5 条全绿；全量约 `791 passed, 1 deselected`
 
 - [ ] **Step 5: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/web/app.py tests/web/test_itinerary_page.py
 git commit -m "feat(web): 成稿页 —— 秒开已发布的 HTML，未就绪给 409 + 重建入口而非死链"
 ```
 
 ---
 
-## Task 15: CLI 收口 —— 删交互命令、新增 `trip web`
+## Task 15: 新增 `trip web`（交互命令这一任务里**原样留着**）
 
 **Files:**
-- Modify: `src/tripplan/cli.py`
-- Modify: `tests/test_cli.py`
+- Modify: `src/tripplan/cli.py`（**只加不删**）
 - Create: `tests/test_cli_web.py`
+
+**为什么「加 `trip web`」和「删 `plan`/`resume`」拆成两个任务**
+
+这两件事没有技术上的耦合：`_cmd_web` 不碰 `_cmd_plan` 的任何一行，删掉后者也不会让前者
+多出或少掉任何能力。合成一个任务只会带来两个坏处：
+
+- **回滚粒度太粗**。真实闭环（Step 5）是这一期唯一一次人眼验收，它一旦不过——中文输入花屏、
+  进度区不动、取消点不动——要退回去时，`git revert` 退掉的是「新增 `trip web`」和
+  「删掉旧 CLI」打包在一起的一个提交，于是**连唯一能用的旧入口也一并没了**。拆开之后，
+  Task 15 的提交可以留着继续调，Task 16 压根还没发生。
+- **定位变难**。合并提交里同时有 ~250 行新增和 ~400 行删除，全量测试红了要先分清是新代码
+  的问题还是删多了。
+
+代价是显式的、而且很小：Task 15 结束时 `plan` / `resume` / `terminal_ask` / `drive` 和它们那
+~24 条测试还在仓库里活着（多留一个任务的周期），全量测试数因此比最终态高一截。这不是遗漏，
+是刻意的中间态——Task 16 的职责就是把它清掉，`grep` 清单在最后的「收尾检查」里。
+
+**验收关口：Task 15 的 Step 5（真实中文输入闭环）不过，就不要开始 Task 16。**
 
 **Interfaces:**
 - Consumes: Task 9 的 `create_app`、Task 4 的 `sweep_stale_staging`、既有的 `build_deps`
 - Produces:
+  - `def _serve(app, host, port) -> None`
+  - `def _require_web_deps() -> None`
   - `def _cmd_web(args) -> int`
   - `trip web --host 127.0.0.1 --port 8000 --trips-dir trips`
-  - 删除：`plan`、`resume`、`terminal_ask()`、`drive()`、`_resolve_candidate_key()`、`_drive_and_report()`、`_print_event()`、`_cmd_plan`、`_cmd_resume`
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -5575,28 +5704,36 @@ def test_missing_credentials_are_reported_at_startup_not_inside_a_job(tmp_path, 
     assert "Traceback" not in err
 
 
-def test_the_interactive_subcommands_are_gone():
-    """spec §7：只剩 web 与 render 两个子命令。"""
-    import tripplan.cli as cli
+def test_a_missing_web_extra_is_reported_readably_not_as_a_traceback(
+    tmp_path, capsys, monkeypatch, served
+):
+    """flask / waitress 是 **optional-dependency**（Task 9 写进 pyproject +
+    uv.lock 的 `[project.optional-dependencies].web`）。只装了基础依赖的人跑
+    `trip web`，撞上的是 `ModuleNotFoundError: No module named 'flask'` 一段
+    堆栈——它既不说要装什么，也不说怎么装。`trip render` 不需要这两个包，所以
+    「没装」是完全正常的状态，不是用户犯错。
+    """
+    def missing():
+        raise ModuleNotFoundError("No module named 'flask'", name="flask")
 
-    for name in ("terminal_ask", "drive", "_resolve_candidate_key", "write_artifacts",
-                 "_cmd_plan", "_cmd_resume", "_drive_and_report"):
-        assert not hasattr(cli, name), name
+    monkeypatch.setattr("tripplan.cli._require_web_deps", missing)
 
-    with pytest.raises(SystemExit):
-        main(["plan", "去京都"])
-    with pytest.raises(SystemExit):
-        main(["resume", "trips/kyoto"])
+    code = main(["web", "--trips-dir", str(tmp_path)])
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "flask" in err
+    assert "uv sync --extra web" in err
+    assert "Traceback" not in err
+    assert served == []          # 没装依赖就别假装起过服务
 ```
 
 - [ ] **Step 2: 跑测试确认它失败**
 
-Run: `.venv/bin/python -m pytest tests/test_cli_web.py -v`
-Expected: FAIL（`web` 子命令不存在 → `SystemExit: 2`；`test_the_interactive_subcommands_are_gone` 断言 `terminal_ask` 仍在而失败）
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/test_cli_web.py -v`
+Expected: 全部 FAIL（`web` 子命令不存在 → argparse `SystemExit: 2`；
+`_require_web_deps` 不存在 → `monkeypatch.setattr` 抛 `AttributeError`）
 
-- [ ] **Step 3: 改 `cli.py`**
-
-删除：`_resolve_candidate_key`、`terminal_ask`、`_print_event`、`drive`、`_drive_and_report`、`_cmd_plan`、`_cmd_resume`，以及随之无用的 import（`render_candidates`、`render_requirement_card`、`Done`、`NeedInput`、`Rejected`、`InputKind`、`AmendRequirements`、`ChooseCandidate`、`ConfirmRequirements`、`GiveFeedback`、`Stage`、`TripState`、`TripExists`、`_advance`）。
+- [ ] **Step 3: 改 `cli.py`（只新增，不删任何东西）**
 
 新增：
 
@@ -5613,12 +5750,28 @@ def _serve(app, host: str, port: int) -> None:
     serve(app, host=host, port=port, threads=8)
 
 
+def _require_web_deps() -> None:
+    """提前把 flask / waitress 的缺席撞出来，好在 `_cmd_web` 里翻译成人话。
+
+    单独一个函数只为两件事：**(a)** 在真正 import `tripplan.web.app`（它会连带
+    拉起整个 Flask 应用模块）之前就失败；**(b)** 测试能 monkeypatch 它来模拟
+    「这台机器没装 web extra」——总不能为了测一句提示语真去卸载 flask。
+    """
+    import waitress  # noqa: F401 —— 真正用它在 _serve 里，这里只探测存在性
+    from tripplan.web.app import create_app  # noqa: F401
+
+
+_WEB_EXTRA_HINT = (
+    "错误：网页界面需要额外依赖，但没装上（缺 {missing}）。\n"
+    "请执行 `uv sync --extra web` 装上 flask 与 waitress（开发环境用 `uv sync --extra dev`）；\n"
+    "它们是可选依赖，`trip render` 用不到，所以默认不装。"
+)
+
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def _cmd_web(args) -> int:
     from tripplan.artifacts import sweep_stale_staging
-    from tripplan.web.app import create_app
 
     token = os.environ.get("TRIPPLAN_WEB_TOKEN")
     if args.host not in _LOCAL_HOSTS and not token:
@@ -5631,6 +5784,14 @@ def _cmd_web(args) -> int:
             file=sys.stderr,
         )
         return 1
+
+    try:
+        _require_web_deps()
+    except ModuleNotFoundError as e:
+        print(_WEB_EXTRA_HINT.format(missing=e.name or "flask / waitress"), file=sys.stderr)
+        return 1
+
+    from tripplan.web.app import create_app
 
     trips_root = Path(args.trips_dir)
     trips_root.mkdir(parents=True, exist_ok=True)
@@ -5650,7 +5811,99 @@ def _cmd_web(args) -> int:
     return 0
 ```
 
-`main()` 的 parser 改成：
+`main()` 的 parser 里**追加**（`plan` / `resume` / `render` 三个子命令这一任务里一个不动）：
+
+```python
+    w = sub.add_parser("web", help="启动网页界面")
+    w.add_argument("--host", default="127.0.0.1", help="绑定地址；0.0.0.0 需要设 TRIPPLAN_WEB_TOKEN")
+    w.add_argument("--port", type=int, default=8000)
+    w.add_argument("--trips-dir", default="trips", help="行程目录的父目录")
+    w.set_defaults(func=_cmd_web)
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/test_cli_web.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: 6 条全绿；全量约 `797 passed, 1 deselected`（旧交互命令与它那 ~24 条测试**仍然在**，
+这是 Task 16 之前的正常中间态）
+
+- [ ] **Step 5: 手动跑一遍真实闭环（人眼验收关口）**
+
+```bash
+cd /Users/jialiu/Projects/trip-plan/.worktrees/20260915-015213-web-ui
+/Users/jialiu/Projects/trip-plan/.venv/bin/python -m tripplan.cli web --trips-dir /tmp/trip-smoke --port 8765
+```
+
+先验两条不需要凭据的：
+
+- 故意不 `uv sync --extra web` 的机器上（或临时 `monkeypatch` 不到的场景下）应打印那句
+  「请执行 `uv sync --extra web`」并退出 1，**不是堆栈**；
+- 缺 `AMAP_KEY` 时应打印可读的中文提示并退出 1。两条都是有效验证。
+
+有凭据时打开 `http://127.0.0.1:8765/`，**用中文在 textarea 里敲一段真实需求**，逐条确认：
+
+- [ ] 输入不花屏、不吞字、长句折行正常（这正是整期要解决的问题，spec §1）
+- [ ] 能建行程，跳到详情页
+- [ ] 进度区每秒有新条目，文案是中文、看得懂
+- [ ] 取消按钮可点，点完状态变「已请求停止…」，且**盘上没有多出一份候选全失败的行程**（spec §4.3）
+- [ ] 确认需求 → 出候选 → 选一个 → 定稿，全程不需要碰终端
+- [ ] 成稿页秒开、有地图
+
+**这一步任意一条不过，就停在 Task 15 修，不要进 Task 16**——旧 CLI 还在，随时可以退回去用。
+
+- [ ] **Step 6: 格式化并提交**
+
+```bash
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
+git add src/tripplan/cli.py tests/test_cli_web.py
+git commit -m "feat(cli): 新增 trip web；裸奔到局域网与漏装 web extra 都被挡在可读提示后面"
+```
+
+---
+
+## Task 16: CLI 收口 —— 删掉交互命令
+
+**前置：Task 15 的 Step 5 已经人眼验收通过。**
+
+**Files:**
+- Modify: `src/tripplan/cli.py`（这一次只删）
+- Modify: `tests/test_cli.py`
+- Modify: `tests/test_cli_web.py`（追加一条「确实删干净了」）
+
+**Interfaces:**
+- Consumes: Task 15 的 `trip web`
+- Produces:
+  - 删除：`plan`、`resume`、`terminal_ask()`、`drive()`、`_resolve_candidate_key()`、`_drive_and_report()`、`_print_event()`、`_cmd_plan`、`_cmd_resume`
+
+- [ ] **Step 1: 写失败的测试**
+
+在 `tests/test_cli_web.py` 末尾追加：
+
+```python
+def test_the_interactive_subcommands_are_gone():
+    """spec §7：只剩 web 与 render 两个子命令。"""
+    import tripplan.cli as cli
+
+    for name in ("terminal_ask", "drive", "_resolve_candidate_key", "write_artifacts",
+                 "_cmd_plan", "_cmd_resume", "_drive_and_report"):
+        assert not hasattr(cli, name), name
+
+    with pytest.raises(SystemExit):
+        main(["plan", "去京都"])
+    with pytest.raises(SystemExit):
+        main(["resume", "trips/kyoto"])
+```
+
+- [ ] **Step 2: 跑测试确认它失败**
+
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/test_cli_web.py -v`
+Expected: `test_the_interactive_subcommands_are_gone` FAIL（`terminal_ask` 仍在），其余 6 条仍绿
+
+- [ ] **Step 3: 改 `cli.py`**
+
+删除：`_resolve_candidate_key`、`terminal_ask`、`_print_event`、`drive`、`_drive_and_report`、`_cmd_plan`、`_cmd_resume`，以及随之无用的 import（`render_candidates`、`render_requirement_card`、`Done`、`NeedInput`、`Rejected`、`InputKind`、`AmendRequirements`、`ChooseCandidate`、`ConfirmRequirements`、`GiveFeedback`、`Stage`、`TripState`、`TripExists`、`_advance`）。
+
+`main()` 的 parser 里删掉 `plan` 与 `resume` 两个子命令，只留：
 
 ```python
     w = sub.add_parser("web", help="启动网页界面")
@@ -5711,7 +5964,7 @@ Web 层是 orchestrator 的第二个 driver，与本模块平级（spec §1 / §
 以及全部 `terminal_ask` 相关的 8 条（`test_terminal_ask_*`、
 `test_a_lowercase_angle_key_no_longer_livelocks_the_choice_prompt`、`_choice_need`、`_typed`）。
 
-把三条只依赖子命令入口的用例改成走 `render`（等价覆盖，且是现存路径）：
+把三条只依赖子命令入口的用例改成走 `web`（等价覆盖，且是现存路径）：
 
 ```python
 def test_config_error_from_bad_toml_is_readable(tmp_path, monkeypatch, capsys):
@@ -5736,35 +5989,26 @@ def test_config_error_from_bad_toml_is_readable(tmp_path, monkeypatch, capsys):
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `.venv/bin/python -m pytest tests/test_cli.py tests/test_cli_web.py -v && .venv/bin/python -m pytest -q`
-Expected: 全绿。全量最终约 `775 passed, 1 deselected`（删掉 ~24 条交互用例、新增 6 条）
+Run: `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest tests/test_cli.py tests/test_cli_web.py -v && /Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q`
+Expected: 全绿。全量最终约 `774 passed, 1 deselected`（在 Task 15 的 ~797 基础上删掉 ~24 条交互用例、新增 1 条）
 
-- [ ] **Step 6: 手动跑一遍真实闭环**
-
-```bash
-cd /Users/jialiu/Projects/trip-plan/.worktrees/20260915-015213-web-ui
-.venv/bin/python -m tripplan.cli web --trips-dir /tmp/trip-smoke --port 8765
-```
-
-（缺 `AMAP_KEY` 时应打印可读的中文提示并退出 1——这本身就是一次有效验证。
-有凭据时打开 `http://127.0.0.1:8765/`，用中文在 textarea 里敲一段需求，确认：
-输入不花屏、能建行程、进度区每秒有新条目、取消按钮可点、定稿后成稿页有地图。）
-
-- [ ] **Step 7: 格式化并提交**
+- [ ] **Step 6: 格式化并提交**
 
 ```bash
-.venv/bin/black src tests
+/Users/jialiu/Projects/trip-plan/.venv/bin/black src tests
 git add src/tripplan/cli.py tests/test_cli.py tests/test_cli_web.py
-git commit -m "feat(cli): 删掉交互命令，新增 trip web；裸奔到局域网被硬性拒绝"
+git commit -m "refactor(cli): 删掉交互命令 plan/resume，入口只剩 web 与 render"
 ```
 
 ---
 
-## 收尾检查（不是一个任务，是 Task 15 之后的确认清单）
+## 收尾检查（不是一个任务，是 Task 16 之后的确认清单）
 
 - [ ] `grep -rn "terminal_ask\|_resolve_candidate_key\|write_artifacts" src/` 无结果
 - [ ] `grep -rn "|safe\|Markup" src/tripplan/web/templates/` 无结果
 - [ ] `grep -rn "status == .running.\|status != .running." src/tripplan/web/` 只在 `TripJob.request_cancel` 里出现一处（那里判的是「能不能从 running 迁到 cancelling」，不是 active 谓词）
 - [ ] `grep -rn "import flask\|from flask" src/tripplan/web/jobs.py src/tripplan/web/events.py src/tripplan/web/view.py` 无结果
-- [ ] `.venv/bin/python -m pytest -q` 全绿
-- [ ] `.venv/bin/black --check src tests` 无改动
+- [ ] `uv lock --check` 退出码 0（`pyproject.toml` 与 `uv.lock` 没跑偏）
+- [ ] `git status --porcelain` 干净：`uv.lock` 已经跟着 `pyproject.toml` 一起提交了，不是留在工作区里
+- [ ] `/Users/jialiu/Projects/trip-plan/.venv/bin/python -m pytest -q` 全绿
+- [ ] `/Users/jialiu/Projects/trip-plan/.venv/bin/black --check src tests` 无改动
