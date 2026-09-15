@@ -106,3 +106,24 @@ def test_a_missing_web_extra_is_reported_readably_not_as_a_traceback(
     assert "uv sync --extra web" in err
     assert "Traceback" not in err
     assert served == []  # 没装依赖就别假装起过服务
+
+
+def test_the_interactive_subcommands_are_gone():
+    """spec §7：只剩 web 与 render 两个子命令。"""
+    import tripplan.cli as cli
+
+    for name in (
+        "terminal_ask",
+        "drive",
+        "_resolve_candidate_key",
+        "write_artifacts",
+        "_cmd_plan",
+        "_cmd_resume",
+        "_drive_and_report",
+    ):
+        assert not hasattr(cli, name), name
+
+    with pytest.raises(SystemExit):
+        main(["plan", "去京都"])
+    with pytest.raises(SystemExit):
+        main(["resume", "trips/kyoto"])

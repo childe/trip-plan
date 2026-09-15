@@ -1,142 +1,30 @@
-"""CLI driver。阻塞发生在这一层，orchestrator 内部不阻塞。
+"""CLI。只剩两个非交互子命令：`trip web` 与 `trip render`。
 
-纪律：调 advance 之前记下盘上的 revision，之后拿它作 expected 提交。
-advance 在暂停时会自增 revision，拿自增后的值去 CAS 必然失败。
+交互全部搬到浏览器：终端 IME 输入错乱（光标位置算错、退格删掉半个字、
+长句折行后彻底花掉）在 readline 里绕不过去，而 <textarea> 天然没有这个问题。
+Web 层是 orchestrator 的第二个 driver，与本模块平级（spec §1 / §3）。
 """
 
 import argparse
 import logging
 import os
-import re
 import sys
 import uuid
 from pathlib import Path
 
 from tripplan.agents.limits import LimitExceeded
-from tripplan.deps import Deps
-from tripplan.orchestrator import advance as _advance
-from tripplan.providers.base import ProviderError
 from tripplan.artifacts import publish, stage_artifacts
+from tripplan.deps import Deps
 from tripplan.naming import (
     slugify,
 )  # noqa: F401  （重新导出，保持 trip.cli.slugify 可用）
-from tripplan.render.candidates import render_candidates
-from tripplan.render.requirement_card import render_requirement_card
-from tripplan.repo import FileRepo, TripCorrupt, TripExists, TripNotFound
-from tripplan.state import (
-    AmendRequirements,
-    ChooseCandidate,
-    ConfirmRequirements,
-    Done,
-    GiveFeedback,
-    InputKind,
-    NeedInput,
-    Rejected,
-    Stage,
-    TripState,
-)
+from tripplan.providers.base import ProviderError
+from tripplan.repo import FileRepo, TripCorrupt, TripNotFound
 
 from tripplan.llm.errors import ConfigError, MissingCredential  # noqa: F401
 
 # MissingCredential 从 llm.errors 重新导出：tests/test_cli.py 与下面的
 # except 都从 tripplan.cli 拿它，必须是同一个类对象。
-
-# ---------- 交互 ----------
-
-
-def _resolve_candidate_key(typed: str, slots) -> str:
-    """把用户敲的东西对回**真实存在的**候选 key，大小写不敏感。
-
-    原来这里是无条件 `.upper()`。角度 key 由 LLM 自己取名（Angle 的
-    docstring：「由 LLM 自己想，不写死枚举」，prompts/angle.md 里对 key
-    一个字都没提），所以它完全可能是 `foodie`。界面照原样打印
-    `选一份（foodie/…）`，用户照抄 `foodie`，CLI 却送出 `FOODIE` ——
-    `UNKNOWN_CANDIDATE`，而且这个提示下**没有任何输入能成功**：重试多少
-    次都一样，用户已经为一整轮三候选的规划付过钱，唯一出路是 Ctrl-C。
-    （CJK key 侥幸没事，因为 upper() 对它是恒等。）
-
-    修法取「大小写不敏感地匹配真实 key」而不是「在 prompt 里约束 key」：
-    后者依赖模型守规矩，这个项目一路上反复被这个假设打脸；前者不依赖
-    任何人守规矩。对不上就原样传下去——那时 UNKNOWN_CANDIDATE 是一句
-    诚实的话，而不是一个由 CLI 自己制造出来的谎。
-    """
-    folded = typed.casefold()
-    for slot in slots or []:
-        key = getattr(getattr(slot, "angle", None), "key", None)
-        if isinstance(key, str) and key.casefold() == folded:
-            return key  # 回填真实 key，大小写以候选为准
-    return typed
-
-
-def terminal_ask(need: NeedInput):
-    if need.kind is InputKind.CONFIRM_REQUIREMENTS:
-        print(render_requirement_card(need.payload))
-        answer = input("\n回车确认，或直接说要改什么> ").strip()
-        return (
-            ConfirmRequirements(need.revision)
-            if not answer
-            else AmendRequirements(need.revision, answer)
-        )
-
-    print(render_candidates(need.payload))
-    raw = input("\n输入方案号定稿（如 A），或「A 第2天太赶了」提意见> ").strip()
-    if not raw:
-        return ConfirmRequirements(need.revision)  # 会被拒，重新问
-    head, _, rest = raw.partition(" ")
-    key = _resolve_candidate_key(head.strip(), need.payload)
-    return (
-        ChooseCandidate(need.revision, key)
-        if not rest.strip()
-        else GiveFeedback(need.revision, key, rest.strip())
-    )
-
-
-def _print_event(event) -> None:
-    print(f"  · {event}", file=sys.stderr)
-
-
-# ---------- driver ----------
-
-
-def drive(state, repo, deps, ask, out, persisted: int, advance_fn=None):
-    """plan 与 resume 共用。persisted 跟踪的是「盘上是什么」。"""
-    advance_fn = advance_fn or _advance
-    outcome = advance_fn(state, deps, None, _print_event)
-
-    while True:
-        if isinstance(outcome, Done):
-            if not repo.save_if_revision(state, persisted):
-                out("⚠️ 另一个进程改动了这个行程，已放弃写入。")
-                return None
-            return outcome.itinerary
-
-        # 到这里 outcome 必然是一个 NeedInput，且相对 persisted 有实打实的
-        # 新内容——要么是最开头那次调用，要么是上一轮成功推进后落到的暂停点。
-        # 必须先落盘再去问人：万一问完就崩，刚花掉的 LLM/网络成本不会白费。
-        if not repo.save_if_revision(state, persisted):
-            out("⚠️ 另一个进程改动了这个行程，请重新 resume。")
-            return None
-        persisted = state.revision  # ★ 提交后才更新
-
-        outcome = advance_fn(state, deps, ask(outcome), _print_event)
-        while isinstance(outcome, Rejected):
-            out(f"⚠️ {outcome.reason.value}")
-            if outcome.current is None:
-                # 这个阶段压根不在等人（工作态被塞了一条命令）。走不到这里
-                # 才是常态——drive 只在收到 NeedInput 之后才发命令——但真到了
-                # 这一步，重新问是问不出来的：没有问题可问。说清楚并退出，
-                # 强过对着一个编出来的问题空转。
-                out(
-                    "⚠️ 当前阶段并不在等待输入，无法继续交互；"
-                    "请用 `trip resume <行程目录>` 重新接上。"
-                )
-                return None
-            # 状态未变、revision 未变——advance 的校验分支保证了这一点。
-            # 不能再走上面那次 save_if_revision：那是一次没有意义的重写，
-            # 只会白白占用一次 CAS 窗口，让本来什么都没做错的这次调用在
-            # 撞上并发写者时被误杀。直接拿 outcome.current 重新问即可。
-            outcome = advance_fn(state, deps, ask(outcome.current), _print_event)
-
 
 # ---------- 依赖装配 ----------
 
@@ -210,70 +98,6 @@ def build_deps(dry_run: bool = False) -> Deps:
 
 
 # ---------- 子命令 ----------
-
-
-def _cmd_plan(args) -> int:
-    trip_dir = Path(args.dir or Path("trips") / slugify(args.request))
-    repo = FileRepo(trip_dir)
-    state = TripState.new(args.request, run_id=uuid.uuid4().hex[:12])
-    try:
-        repo.create(state)
-    except TripExists:
-        print(
-            f"错误：{trip_dir} 已存在。换个 --dir，或用 "
-            f"`trip resume {trip_dir}` 继续。",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(f"行程目录：{trip_dir}")
-    if args.dry_run:
-        return 0
-    return _drive_and_report(state, repo, args)
-
-
-def _cmd_resume(args) -> int:
-    repo = FileRepo(Path(args.dir))
-    try:
-        state = repo.load()
-    except TripNotFound:
-        print(f"错误：找不到 {args.dir}/state.json", file=sys.stderr)
-        return 1
-    except TripCorrupt as e:
-        print(f"错误：{e}", file=sys.stderr)
-        return 1
-    print(f"已载入 rev {state.revision}，阶段 {state.stage.value}")
-    if args.dry_run:
-        # 与 _cmd_plan 的早返回对称。没有这一句的话，Deps(client=None) 会被
-        # 交给 advance()。已经推进到 COLLECT 及之后的行程会在 LLM 步骤炸出
-        # AttributeError: 'NoneType' object has no attribute 'chat'——一条
-        # 不在 main() except 元组里的裸 traceback，比 argparse 干净拒绝更糟。
-        # （停在 AWAIT_REQ_CONFIRM 的行程走的是另一条路：advance 在①校验
-        # 阶段就短路返回 _pending(state)，根本碰不到 deps.client；drive 转去
-        # terminal_ask()，非交互下 input() 撞 EOF，被 main() 的 EOFError 分支
-        # 接住返回 1。本文件的回归测试用的正是这种状态，它守住的是「退出码
-        # 不为 0」，不是这条 AttributeError——AttributeError 那条链要到
-        # COLLECT 阶段才成立，值得留着但不能算在这条测试头上。）
-        # 而 §6.2 的凭据错误消息正好把用户指向这条 --dry-run 逃生口。
-        return 0
-    return _drive_and_report(state, repo, args)
-
-
-def _drive_and_report(state, repo, args) -> int:
-    deps = build_deps(dry_run=getattr(args, "dry_run", False))
-    itinerary = drive(state, repo, deps, terminal_ask, print, persisted=state.revision)
-    if itinerary is None:
-        # drive() 返回 None 的主因是某次 save_if_revision 输掉了 CAS：盘上的
-        # state 已经被别的进程改动，我们手上这份内存中的 state 不再权威。
-        # （另一个来源是拒绝循环拿到 current=None——那种情况同样没有可用的
-        # 结局可写。）这时候绝不能拿它去写 write_artifacts——那会让
-        # itinerary.md/html 描述的是「我们这边以为的结局」，而 state.json
-        # 里记的是赢得那场 CAS 的另一个进程的结局，两者对不上。
-        return 1
-    publish(stage_artifacts(state, repo.dir, deps.provider, uuid.uuid4().hex))
-    print(f"\n✅ 已定稿：{repo.dir / 'itinerary.md'}")
-    print(f"   网页版：{repo.dir / 'itinerary.html'}")
-    return 0
 
 
 def _cmd_render(args) -> int:
@@ -399,19 +223,6 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="trip", description="旅行规划")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("plan", help="开始一次新的规划")
-    p.add_argument("request", help="自然语言需求")
-    p.add_argument("--dir", help="行程目录，默认按需求生成")
-    p.add_argument("--dry-run", action="store_true", help="只建目录，不调 LLM 与高德")
-    p.set_defaults(func=_cmd_plan)
-
-    r = sub.add_parser("resume", help="接着上次的进度继续")
-    r.add_argument("dir")
-    r.add_argument(
-        "--dry-run", action="store_true", help="只载入并报告状态，不调 LLM 与高德"
-    )
-    r.set_defaults(func=_cmd_resume)
-
     w = sub.add_parser("web", help="启动网页界面")
     w.add_argument(
         "--host",
@@ -431,19 +242,10 @@ def main(argv=None) -> int:
     try:
         return args.func(args)
     except (ProviderError, LimitExceeded) as e:
-        # advance() 在这两种情形下会原样往外抛（见 orchestrator.py 顶部注释）：
-        # 高德/LLM 传输层故障，或某条候选线撞了资源额度。两者都是环境/资源
-        # 问题，不是程序 bug——不能让原始 traceback 糊到用户脸上。
-        # state 只在 advance() 正常返回之后才落盘（drive() 的 CAS 纪律），
-        # 所以中断前最后一次成功的进度还在磁盘上，可以直接 resume；正在跑的
-        # 这一步没有存下来，说没存下来就够了，不要承诺更多。
+        # 现在只有 `trip render` 会走到这里（Web 侧的运行期错误由 job 转成
+        # JobOutcome，不冒到这一层）。
         kind = "高德或大模型服务" if isinstance(e, ProviderError) else "资源额度"
-        print(
-            f"错误：{kind}出了问题，本次操作已中断：{e}\n"
-            "上一步已经保存到磁盘的进度还在，行程目录没有损坏；"
-            "可以用 `trip resume <行程目录>` 接着跑（正在进行的这一步需要重来）。",
-            file=sys.stderr,
-        )
+        print(f"错误：{kind}出了问题，本次操作已中断：{e}", file=sys.stderr)
         return 1
     except ConfigError as e:
         # 配置读不懂是用户的输入问题，不是程序 bug——给一句人话，
@@ -454,27 +256,12 @@ def main(argv=None) -> int:
         print(f"错误：{e}", file=sys.stderr)
         return 1
     except TripNotFound as e:
-        # _cmd_resume / _cmd_render 只在启动时的 repo.load() 外侧兜住了这两个
-        # 类型，可是 save_if_revision 内部同样会检查存在性、同样会 _decode()
-        # 盘上的文件 —— 会话**中途**被另一个进程删掉/改坏时，异常是从
-        # drive() 的 CAS 循环里抛出来的，此前一路裸奔到用户脸上。repo.py 的
-        # 文档明说这两个类型存在的意义就是「给一句读得懂的话，而不是一截
-        # JSON 栈回溯」；这里把那两句话复用过来即可。
+        # repo.py 的文档明说这两个类型存在的意义就是「给一句读得懂的话，
+        # 而不是一截 JSON 栈回溯」；这里把那两句话复用过来即可。
         print(f"错误：找不到 {e}", file=sys.stderr)
         return 1
     except TripCorrupt as e:
         print(f"错误：{e}", file=sys.stderr)
-        return 1
-    except EOFError:
-        # `trip resume dir < /dev/null`、管道输入、或者在提示上按 Ctrl-D：
-        # input() 抛 EOFError，此前一路裸奔成 traceback。这不是程序出错，
-        # 是没有人可问了；进度的处境和 ProviderError 那条一样，说清楚即可。
-        print(
-            "错误：标准输入已结束（Ctrl-D 或非交互式输入），本次操作已中断。\n"
-            "上一步已经保存到磁盘的进度还在，行程目录没有损坏；"
-            "可以在交互式终端里用 `trip resume <行程目录>` 接着跑。",
-            file=sys.stderr,
-        )
         return 1
 
 
