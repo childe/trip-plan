@@ -16,9 +16,8 @@ from tripplan.agents.limits import LimitExceeded
 from tripplan.deps import Deps
 from tripplan.orchestrator import advance as _advance
 from tripplan.providers.base import ProviderError
+from tripplan.artifacts import publish, stage_artifacts
 from tripplan.render.candidates import render_candidates
-from tripplan.render.itinerary_html import render_itinerary_html
-from tripplan.render.itinerary_md import render_itinerary_md
 from tripplan.render.requirement_card import render_requirement_card
 from tripplan.repo import FileRepo, TripCorrupt, TripExists, TripNotFound
 from tripplan.state import (
@@ -34,9 +33,6 @@ from tripplan.state import (
     TripState,
 )
 
-# fetch_day_maps 触网（调用 provider），所以它住在 tripplan.maps 而不是
-# render/ 下——render/ 里的模块一律不许碰网络（详见 tripplan/maps.py 的说明）。
-from tripplan.maps import fetch_day_maps
 from tripplan.llm.errors import ConfigError, MissingCredential  # noqa: F401
 
 # MissingCredential 从 llm.errors 重新导出：tests/test_cli.py 与下面的
@@ -146,56 +142,6 @@ def drive(state, repo, deps, ask, out, persisted: int, advance_fn=None):
             # 只会白白占用一次 CAS 窗口，让本来什么都没做错的这次调用在
             # 撞上并发写者时被误杀。直接拿 outcome.current 重新问即可。
             outcome = advance_fn(state, deps, ask(outcome.current), _print_event)
-
-
-# ---------- 产物 ----------
-
-
-def write_artifacts(state, trip_dir: Path, provider, fmt: str = "both") -> None:
-    """provider=None 表示「跳过地图」，不是「用假地图顶替」——见 build_provider
-    的说明：FakeProvider 的占位图结构合法但与目的地毫无关系，混进这份最终要
-    转发给同行者的 HTML 里比压根没有图更糟，所以这里绝不会拿它当默认值。
-
-    fmt 控制到底写哪些文件：md-only 不该连 itinerary.html 也一起写出来，
-    反过来也一样——校验在 _cmd_render 里做过，这里只管照办。
-    """
-    trip_dir = Path(trip_dir)
-    write_md = fmt in ("md", "both")
-    write_html = fmt in ("html", "both")
-
-    if write_md:
-        for slot in state.candidates:
-            if slot.itinerary is None or slot.facts is None:
-                continue
-            (trip_dir / f"plan-{slot.angle.key}.md").write_text(
-                render_itinerary_md(slot.itinerary, slot.facts, state.requirements),
-                encoding="utf-8",
-            )
-
-    if state.stage is not Stage.DONE:
-        return
-    slot = state.chosen()
-    if slot is None or slot.itinerary is None:
-        return
-    facts = slot.facts
-    if facts is None:
-        return
-
-    if write_md:
-        (trip_dir / "itinerary.md").write_text(
-            render_itinerary_md(slot.itinerary, facts, state.requirements),
-            encoding="utf-8",
-        )
-    if write_html:
-        day_maps = (
-            fetch_day_maps(slot.itinerary, facts, provider)
-            if provider is not None
-            else {}
-        )
-        (trip_dir / "itinerary.html").write_text(
-            render_itinerary_html(slot.itinerary, facts, state.requirements, day_maps),
-            encoding="utf-8",
-        )
 
 
 # ---------- 依赖装配 ----------
@@ -330,7 +276,7 @@ def _drive_and_report(state, repo, args) -> int:
         # itinerary.md/html 描述的是「我们这边以为的结局」，而 state.json
         # 里记的是赢得那场 CAS 的另一个进程的结局，两者对不上。
         return 1
-    write_artifacts(state, repo.dir, deps.provider)
+    publish(stage_artifacts(state, repo.dir, deps.provider, uuid.uuid4().hex))
     print(f"\n✅ 已定稿：{repo.dir / 'itinerary.md'}")
     print(f"   网页版：{repo.dir / 'itinerary.html'}")
     return 0
@@ -353,7 +299,17 @@ def _cmd_render(args) -> int:
     # 有 AMAP_KEY 就用真实 provider 补地图；没有就跳过地图——绝不能拿
     # FakeProvider 的占位图顶替。render 从不需要 LLM 凭据，所以走
     # build_provider 而不是 build_deps，连 LLM 客户端都不必构造。
-    write_artifacts(state, repo.dir, build_provider(dry_run=False), fmt=args.format)
+    # 与 Web job 共用同一条原子发布路径（spec §7）：自己现生成一个 stage_id，
+    # 所以与正在跑的 Web job 共存也不会互相踩暂存文件。
+    publish(
+        stage_artifacts(
+            state,
+            repo.dir,
+            build_provider(dry_run=False),
+            uuid.uuid4().hex,
+            fmt=args.format,
+        )
+    )
     print(f"已写入 {repo.dir}")
     return 0
 

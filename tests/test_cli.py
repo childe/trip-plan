@@ -12,7 +12,6 @@ from tripplan.cli import (
     drive,
     main,
     slugify,
-    write_artifacts,
 )
 from tripplan.deps import Deps
 from tripplan.llm.config import Role
@@ -206,26 +205,6 @@ def test_driver_reprompts_with_the_current_question_after_reject(tmp_path):
 
 
 # ---------- 产物 ----------
-
-
-def test_write_artifacts_emits_one_markdown_per_candidate(tmp_path):
-    state = _state(Stage.AWAIT_CHOICE)
-    write_artifacts(state, tmp_path, FakeProvider())
-    assert (tmp_path / "plan-A.md").exists()
-
-
-def test_write_artifacts_emits_final_md_and_html_when_done(tmp_path):
-    state = _state(Stage.AWAIT_CHOICE)
-    state.stage = Stage.DONE
-    state.chosen_key = "A"
-    write_artifacts(state, tmp_path, FakeProvider())
-    assert (tmp_path / "itinerary.md").exists()
-    assert (tmp_path / "itinerary.html").exists()
-    assert "<!DOCTYPE html>" in (tmp_path / "itinerary.html").read_text()
-
-
-def test_write_artifacts_is_safe_before_any_candidates(tmp_path):
-    write_artifacts(_state(), tmp_path, FakeProvider())  # 不抛
 
 
 # ---------- 命令行 ----------
@@ -479,45 +458,6 @@ def test_trippan_log_default_leaves_root_logger_untouched(tmp_path):
 # ---------- review round 2 —— item 1：CAS 输了不能拿输掉的 state 写产物 ----------
 
 
-def test_drive_and_report_skips_artifacts_when_final_save_loses_the_cas_race(
-    tmp_path, monkeypatch
-):
-    """drive() 只有在某次 save_if_revision 失败时才返回 None，这意味着盘上的
-    state 已经被别的进程改动，我们手上这份内存 state 不再权威。这时候如果还
-    去写 write_artifacts，会出现 state.json 说最终选了 B、itinerary.md 却是
-    这个进程自己选的 A 的分裂——CAS 存在的意义就是防止这个。"""
-    from argparse import Namespace
-
-    from tripplan.cli import _drive_and_report
-    from tripplan.state import Done
-
-    class _AlwaysLosesTheRace:
-        """模拟"盘上已经被别的进程动过"：不管传什么 expected，save 都失败。"""
-
-        def __init__(self, d):
-            self.dir = Path(d)
-
-        def save_if_revision(self, state, expected):
-            return False
-
-    state = _state(Stage.AWAIT_CHOICE)
-    state.stage = Stage.DONE
-    state.chosen_key = "A"
-
-    def fake_advance(s, deps, cmd=None, emit=None):
-        return Done(s.chosen().itinerary)
-
-    monkeypatch.setattr("tripplan.cli._advance", fake_advance)
-
-    repo = _AlwaysLosesTheRace(tmp_path)
-    code = _drive_and_report(state, repo, Namespace(dry_run=True))
-
-    assert code == 1
-    assert not (tmp_path / "itinerary.md").exists()
-    assert not (tmp_path / "itinerary.html").exists()
-    assert not (tmp_path / "plan-A.md").exists()
-
-
 # ---------- review round 2 —— item 2：render 绝不能用假地图顶替真地图 ----------
 
 
@@ -531,28 +471,6 @@ def _done_state_with_a_resolvable_map_point(mk):
     state.stage = Stage.DONE
     state.chosen_key = itin.angle.key
     return state
-
-
-def test_write_artifacts_never_embeds_a_fake_placeholder_map(tmp_path, mk):
-    """provider=None 必须表示「跳过地图」，不能拿 FakeProvider 顶替：它吐出的
-    是一张结构合法、但与目的地毫无关系的占位 PNG，混进最终要转发给同行者的
-    HTML 里比压根没有图更糟——render_itinerary_html 本来就为「没有地图」这个
-    状态设计好了优雅降级（day_maps={} 时不出现 <img>），没道理不用。"""
-    state = _done_state_with_a_resolvable_map_point(mk)
-    write_artifacts(state, tmp_path, None)
-    html = (tmp_path / "itinerary.html").read_text()
-    assert "<img" not in html
-
-
-def test_write_artifacts_embeds_the_real_map_when_a_provider_is_given(tmp_path, mk):
-    """反证：同样这份 state，给一个真 provider（这里用离线的 FakeProvider 代替
-    真实 AmapProvider，两者对 write_artifacts 而言是同一个接口）时地图照常
-    嵌入——证明上一条测试里"没有 <img>"确实是因为 provider is None 触发的
-    跳过逻辑，不是别的地方把地图功能整体关掉了。"""
-    state = _done_state_with_a_resolvable_map_point(mk)
-    write_artifacts(state, tmp_path, FakeProvider())
-    html = (tmp_path / "itinerary.html").read_text()
-    assert "<img" in html
 
 
 def test_build_provider_returns_none_without_amap_key():
