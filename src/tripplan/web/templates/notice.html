@@ -3,4 +3,5 @@
 {% block main %}
 <h1>{{ title }}</h1>
 <p>{{ message }}</p>
+{% if link_tid %}<p><a href="/trips/{{ link_tid | urlencode }}">进入这个行程 →</a></p>{% endif %}
 {% endblock %}

@@ -12,11 +12,17 @@ wire.py，引入 pydantic 等于并存两套模型体系；render/itinerary_html
 import hmac
 import os
 import secrets
+import uuid
 from pathlib import Path
+from urllib.parse import quote
 
-from flask import Flask, abort, render_template, request, session
+from flask import Flask, abort, redirect, render_template, request, session
 
+from tripplan.naming import slugify
+from tripplan.repo import FileRepo, TripExists
+from tripplan.state import TripState
 from tripplan.web.events import EventLogStore
+from tripplan.web.jobs import ServerBusy, TripBusy
 from tripplan.web.jobs import JobRegistry, rebuild_artifacts, run_command
 from tripplan.web.view import trip_rows
 
@@ -110,10 +116,124 @@ def create_app(
             error=None,
         )
 
+    @app.post("/trips")
+    def create_trip():
+        cfg = app.extensions["tripplan"]
+        raw = (request.form.get("request") or "").strip()
+        wanted_dir = (request.form.get("dir") or "").strip()
+
+        if not raw:
+            return _index_error(
+                cfg, "请先写点什么——想去哪、什么时候、几个人。", raw, wanted_dir
+            )
+        if len(raw) > MAX_REQUEST_CHARS:
+            return _index_error(
+                cfg,
+                f"需求太长了（{len(raw)} 字，上限 {MAX_REQUEST_CHARS} 字）。",
+                raw,
+                wanted_dir,
+            )
+        if len(wanted_dir) > MAX_DIR_CHARS:
+            return _index_error(
+                cfg, f"目录名太长了（上限 {MAX_DIR_CHARS} 字）。", raw, wanted_dir
+            )
+
+        tid = wanted_dir or slugify(raw)
+        if not _is_single_segment(tid):
+            return _index_error(
+                cfg, "目录名必须是单个名字，不能带 / 或 ..。", raw, wanted_dir
+            )
+
+        repo = FileRepo(cfg["trips_root"] / tid)
+        try:
+            repo.create(TripState.new(raw, run_id=uuid.uuid4().hex[:12]))
+        except TripExists:
+            return (
+                render_template(
+                    "notice.html",
+                    title="行程已存在",
+                    message=f"{tid} 已存在。换个目录名，或者直接进去接着上次的进度。",
+                    link_tid=tid,
+                ),
+                409,
+            )
+
+        # 目录已经建好了。下面这一步就算被拒，用户敲的那段需求也没丢。
+        return _start_command(
+            cfg,
+            tid,
+            None,
+            busy_page=lambda: (
+                render_template(
+                    "notice.html",
+                    title="服务器正忙",
+                    message="同时进行的规划已达上限。行程已经创建好了，稍后进去点「继续」即可。",
+                    link_tid=tid,
+                ),
+                503,
+            ),
+        )
+
     return app
 
 
 # ---------- 共用工具（后续任务的路由都调它们） ----------
+
+
+def _is_single_segment(tid: str) -> bool:
+    return (
+        bool(tid)
+        and tid not in (".", "..")
+        and not any(c in tid for c in ("/", "\\", "\0"))
+    )
+
+
+def _index_error(cfg, message: str, raw: str, wanted_dir: str):
+    return (
+        render_template(
+            "index.html",
+            rows=trip_rows(cfg["trips_root"], cfg["registry"]),
+            form={"request": raw, "dir": wanted_dir},
+            error=message,
+        ),
+        400,
+    )
+
+
+def _start_command(cfg, tid: str, cmd, *, busy_page=None):
+    """起一个后台 job 跑一次 advance。TripBusy → 409，ServerBusy → 503。
+
+    请求线程只负责登记后立刻返回，不占 waitress 线程池（spec §4.2）。
+    """
+    log = cfg["store"].get(tid)
+    run = cfg["run_command_fn"]
+    try:
+        cfg["registry"].start(
+            tid, log, lambda job: run(cfg["trips_root"], tid, cmd, cfg["deps"], job)
+        )
+    except TripBusy:
+        return (
+            render_template(
+                "notice.html",
+                title="行程正忙",
+                message="这个行程正在跑上一步，等它结束再操作。",
+                link_tid=tid,
+            ),
+            409,
+        )
+    except ServerBusy:
+        if busy_page is not None:
+            return busy_page()
+        return (
+            render_template(
+                "notice.html",
+                title="服务器正忙",
+                message="同时进行的规划已达上限，稍后再试。",
+                link_tid=tid,
+            ),
+            503,
+        )
+    return redirect(f"/trips/{quote(tid)}", code=302)
 
 
 def _csrf_token() -> str:

@@ -23,7 +23,7 @@
 </table>
 
 <h2>新建行程</h2>
-<form method="post" action="/trips">
+<form method="post" action="{{ url_for('create_trip') }}">
   <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
   <label for="request">想去哪、什么时候、几个人、有什么讲究——随便写，多长都行。</label>
   <textarea id="request" name="request" rows="8" maxlength="8000" required>{{ form.request }}</textarea>

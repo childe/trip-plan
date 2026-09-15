@@ -17,6 +17,9 @@ from tripplan.deps import Deps
 from tripplan.orchestrator import advance as _advance
 from tripplan.providers.base import ProviderError
 from tripplan.artifacts import publish, stage_artifacts
+from tripplan.naming import (
+    slugify,
+)  # noqa: F401  （重新导出，保持 trip.cli.slugify 可用）
 from tripplan.render.candidates import render_candidates
 from tripplan.render.requirement_card import render_requirement_card
 from tripplan.repo import FileRepo, TripCorrupt, TripExists, TripNotFound
@@ -37,15 +40,6 @@ from tripplan.llm.errors import ConfigError, MissingCredential  # noqa: F401
 
 # MissingCredential 从 llm.errors 重新导出：tests/test_cli.py 与下面的
 # except 都从 tripplan.cli 拿它，必须是同一个类对象。
-
-_SLUG_STRIP = re.compile(r"[^\w一-鿿\s-]", re.U)
-
-
-def slugify(text: str) -> str:
-    cleaned = _SLUG_STRIP.sub("", text).strip()
-    cleaned = re.sub(r"\s+", "-", cleaned)
-    return cleaned[:40] or "trip"
-
 
 # ---------- 交互 ----------
 
