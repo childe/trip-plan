@@ -25,7 +25,13 @@ AWAIT_CHOICE 而不是把异常甩给调用方；run_slot 系的三条候选线�
 """
 
 from tripplan.agents._emit import safe_emit
-from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
+from tripplan.agents.limits import (
+    Cancelled,
+    LimitExceeded,
+    SlotContext,
+    SlotLimits,
+    raise_if_cancelled,
+)
 from tripplan.agents.steps import (
     Scale,
     apply_patch,
@@ -62,7 +68,7 @@ def _noop(_event) -> None:
     pass
 
 
-def advance(state, deps, cmd=None, emit=_noop):
+def advance(state, deps, cmd=None, emit=_noop, cancel=None):
     # ⓪ 终态幂等：已定稿的行程反复查询只回同一个答案，不改状态、不递增 revision。
     #    这个分支必须在 _apply 之前 —— ChooseCandidate 把 stage 推到 DONE 的那一次
     #    仍要走下面的正常路径并递增 revision（否则并发选择又能互相覆盖）。
@@ -81,9 +87,10 @@ def advance(state, deps, cmd=None, emit=_noop):
 
     # ② 过了这道线，状态必然改变
     if cmd is not None:
-        _apply(state, cmd, deps, emit)  # 只有这里能改 stage
-    outcome = _run_to_pause(state, deps, emit)
+        _apply(state, cmd, deps, emit, cancel)  # 只有这里能改 stage
+    outcome = _run_to_pause(state, deps, emit, cancel)
     state.revision += 1  # ★ 唯一的递增点
+    safe_emit(emit, ("paused", state.stage.value, state.revision))
     return outcome
 
 
@@ -142,7 +149,7 @@ def _empty_requirements():
     return Requirements()
 
 
-def _step_ctx(emit) -> SlotContext:
+def _step_ctx(emit, cancel=None) -> SlotContext:
     """给 slot 之外的一次性 LLM 步骤（collect / angle / classify）用的额度。
 
     这些步骤不属于任何候选线，但 run_agent 仍然要一个能记账、能超时的 ctx——
@@ -151,10 +158,11 @@ def _step_ctx(emit) -> SlotContext:
     return SlotContext(
         SlotLimits(max_tool_calls=0, max_output_tokens=20_000, deadline_s=120),
         emit=emit,
+        cancel=cancel,
     )
 
 
-def _apply(state, cmd, deps, emit) -> None:
+def _apply(state, cmd, deps, emit, cancel=None) -> None:
     """只有这里能改 stage。调用前 advance 已校验 revision、阶段与候选 key。"""
     match cmd:
         case ConfirmRequirements():
@@ -167,7 +175,7 @@ def _apply(state, cmd, deps, emit) -> None:
                 state.stage = Stage.COLLECT
             else:  # 定稿前改需求
                 delta = classify_feedback(
-                    text, state.requirements, deps, _step_ctx(emit)
+                    text, state.requirements, deps, _step_ctx(emit, cancel)
                 )
                 if delta.patches_requirements and delta.patch:
                     _patch_requirements(state, delta, emit)
@@ -187,7 +195,9 @@ def _apply(state, cmd, deps, emit) -> None:
             # revision 却没有递增的半吊子改动留在 state 里——逃出了
             # advance「拒绝/修改」的二分律。同时也只分类这一次：两次结果
             # 可能不一致，状态会就此走歪且无人报错。
-            delta = classify_feedback(text, state.requirements, deps, _step_ctx(emit))
+            delta = classify_feedback(
+                text, state.requirements, deps, _step_ctx(emit, cancel)
+            )
             state.chosen_key = key  # 提意见即选定
             if delta.patches_requirements and delta.patch:
                 _patch_requirements(state, delta, emit)
@@ -226,7 +236,9 @@ def _ensure_timezone(state, deps) -> str:
     return state.trip_timezone
 
 
-def _safe_slot(angle, seed, reqs, tz, deps, emit, issues=(), avoid_poi_ids=()):
+def _safe_slot(
+    angle, seed, reqs, tz, deps, emit, issues=(), avoid_poi_ids=(), cancel=None
+):
     """run_slot 自己只兜 LimitExceeded / ProviderError（已知的两种失败模式）。
 
     设计要求候选并发容错覆盖"任何"异常，不止这两种——否则 run_slot 内部
@@ -251,7 +263,10 @@ def _safe_slot(angle, seed, reqs, tz, deps, emit, issues=(), avoid_poi_ids=()):
             issues=issues,
             emit=emit,
             avoid_poi_ids=avoid_poi_ids,
+            cancel=cancel,
         )
+    except Cancelled:
+        raise  # ★ 必须排在 except Exception 前面（spec §4.3）
     except Exception as e:  # noqa: BLE001 — 故意兜底：详见上面的说明
         return CandidateSlot(
             angle,
@@ -262,19 +277,27 @@ def _safe_slot(angle, seed, reqs, tz, deps, emit, issues=(), avoid_poi_ids=()):
         )
 
 
-def _run_to_pause(state, deps, emit):
+def _run_to_pause(state, deps, emit, cancel=None):
     """工作态：一路向前，直到再次需要人或结束。不碰 revision。"""
     while True:
         match state.stage:
             case Stage.COLLECT:
-                state.requirements = collect(state.raw_request, deps, _step_ctx(emit))
+                safe_emit(emit, ("stage_started", "COLLECT"))
+                state.requirements = collect(
+                    state.raw_request, deps, _step_ctx(emit, cancel)
+                )
                 state.stage = Stage.AWAIT_REQ_CONFIRM
                 return _pending(state)
 
             case Stage.GENERATE:
+                safe_emit(emit, ("stage_started", "GENERATE"))
                 tz = _ensure_timezone(state, deps)
                 try:
-                    angles = pick_angles(state.requirements, deps, _step_ctx(emit))
+                    angles = pick_angles(
+                        state.requirements, deps, _step_ctx(emit, cancel)
+                    )
+                except Cancelled:
+                    raise  # ★ 必须排在下面那个元组捕获前面
                 except (ValueError, ProviderError, LimitExceeded) as e:
                     # 三种失败一视同仁地收敛：ValueError 是"一个能解析的
                     # 角度都没有"或"key 重复"（没有安全的默认值可退，不像
@@ -300,12 +323,24 @@ def _run_to_pause(state, deps, emit):
                     state.stage = Stage.AWAIT_CHOICE
                     return _pending(state)
 
-                state.candidates = [
-                    _safe_slot(
-                        a, state.seeds.get(a.key), state.requirements, tz, deps, emit
+                safe_emit(emit, ("angles_picked", [a.key for a in angles]))
+                slots = []
+                for a in angles:
+                    # 检查点之二：候选与候选之间。否则取消要等当前这条线
+                    # 彻底跑完（含 revise + critic）才可能生效（spec §4.3）。
+                    raise_if_cancelled(cancel)
+                    slots.append(
+                        _safe_slot(
+                            a,
+                            state.seeds.get(a.key),
+                            state.requirements,
+                            tz,
+                            deps,
+                            emit,
+                            cancel=cancel,
+                        )
                     )
-                    for a in angles
-                ]
+                state.candidates = slots
                 state.candidates = enforce_diversity(
                     state.candidates,
                     lambda slot, avoid: _safe_slot(
@@ -316,6 +351,7 @@ def _run_to_pause(state, deps, emit):
                         deps,
                         emit,
                         avoid_poi_ids=avoid,
+                        cancel=cancel,
                     ),
                     emit=emit,
                 )
@@ -324,6 +360,7 @@ def _run_to_pause(state, deps, emit):
                 return _pending(state)
 
             case Stage.REFINE:
+                safe_emit(emit, ("stage_started", "REFINE"))
                 tz = _ensure_timezone(state, deps)
                 slot = state.chosen()
                 refreshed = _safe_slot(
@@ -334,6 +371,7 @@ def _run_to_pause(state, deps, emit):
                     deps,
                     emit,
                     issues=state.issues,
+                    cancel=cancel,
                 )
                 state.candidates = [refreshed]
                 state.issues = []

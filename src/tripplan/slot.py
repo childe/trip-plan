@@ -5,7 +5,7 @@
 """
 
 from tripplan.agents._emit import safe_emit as _safe_emit
-from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
+from tripplan.agents.limits import Cancelled, LimitExceeded, SlotContext, SlotLimits
 from tripplan.agents.steps import generate, revise, run_llm_critic
 from tripplan.models.issue import Severity, has_blocking
 from tripplan.providers.base import ProviderError
@@ -28,8 +28,9 @@ def run_slot(
     limits: SlotLimits = SlotLimits(),
     emit=_noop,
     avoid_poi_ids=(),
+    cancel=None,
 ) -> CandidateSlot:
-    ctx = SlotContext(limits, emit=emit)
+    ctx = SlotContext(limits, emit=emit, cancel=cancel)
     itin, facts = seed, None
     issues = list(issues)
     revisions = 0  # 真正调用过 revise 的次数——轮 0 只校验首稿，不一定修订
@@ -64,6 +65,10 @@ def run_slot(
             f"修订 {revisions} 次后仍有 {blocking} 个硬伤",
         )
 
+    except Cancelled:
+        # ★ 必须排在下面两个 except 前面。掉进 except LimitExceeded 就会
+        # 变成一个 EXHAUSTED 候选，取消被静默翻译成「生成失败」（spec §4.3）。
+        raise
     except LimitExceeded as e:
         if itin is not None:
             itin.issues = list(issues)

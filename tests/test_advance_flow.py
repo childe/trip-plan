@@ -710,3 +710,34 @@ def test_a_throwing_emit_does_not_break_angle_failure_or_diversity_paths(wire):
     assert s.stage is Stage.AWAIT_CHOICE
     assert s.revision == 6  # _at_choice 起点是 5
     assert s.candidates[0].status is SlotStatus.FAILED
+
+
+def test_advance_emits_stage_milestones(wire):
+    """spec §5.2：v1 在 _run_to_pause 的阶段边界补 emit 点，不动 agent 内部。"""
+    wire(_Fakes())
+    events = []
+
+    state = TripState.new("去京都", run_id="r1")
+    state.stage, state.revision = Stage.COLLECT, 0
+
+    advance(state, Deps(client=None, provider=FakeProvider()), None, events.append)
+
+    types = [e[0] for e in events]
+    assert "stage_started" in types
+    assert ("stage_started", "COLLECT") in events
+    assert ("paused", "AWAIT_REQ_CONFIRM", 1) in events
+
+
+def test_advance_emits_angles_picked(wire):
+    wire(_Fakes(angles=("A", "B", "C")))
+    events = []
+
+    state = TripState.new("去京都", run_id="r1")
+    state.stage, state.revision, state.requirements = Stage.GENERATE, 2, _reqs()
+    state.trip_timezone = "Asia/Tokyo"
+
+    advance(state, Deps(client=None, provider=FakeProvider()), None, events.append)
+
+    assert ("stage_started", "GENERATE") in events
+    assert ("angles_picked", ["A", "B", "C"]) in events
+    assert ("paused", "AWAIT_CHOICE", 3) in events
