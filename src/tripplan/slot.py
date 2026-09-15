@@ -4,6 +4,7 @@
 都返回一个带 detail 的 CandidateSlot，绝不卡住、也绝不抛异常炸穿。
 """
 
+from tripplan.agents._emit import safe_emit as _safe_emit
 from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
 from tripplan.agents.steps import generate, revise, run_llm_critic
 from tripplan.models.issue import Severity, has_blocking
@@ -15,16 +16,6 @@ from tripplan.validation.rules import run_rule_checks
 
 def _noop(_event) -> None:
     pass
-
-
-def _safe_emit(emit, event) -> None:
-    """进度回调是给外部看的旁路，不是循环的一部分——它自己炸了不能陪葬一整个
-    候选。Task 20 会让三条候选线共享同一个 emit（含多样性重试路径），一个
-    回调里的 bug 不该因此拖垮所有还在跑的候选。"""
-    try:
-        emit(event)
-    except Exception:
-        pass
 
 
 def run_slot(

@@ -24,6 +24,7 @@ AWAIT_CHOICE 而不是把异常甩给调用方；run_slot 系的三条候选线�
 线撞见外部依赖失败不该拖累另外两条。
 """
 
+from tripplan.agents._emit import safe_emit
 from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
 from tripplan.agents.steps import (
     Scale,
@@ -198,7 +199,7 @@ def _apply(state, cmd, deps, emit) -> None:
 def _patch_requirements(state, delta, emit) -> None:
     """delta 由调用方传入 —— 不在这里重新分类。调用前已确认 delta.patch 非空。"""
     state.requirements = apply_patch(state.requirements, delta.patch)
-    emit(("requirements_patched", delta.patch))  # 非阻塞提示，不拦流程
+    safe_emit(emit, ("requirements_patched", delta.patch))  # 非阻塞提示，不拦流程
     state.issues = []  # 旧 issue 基于旧需求，作废
 
     if "destination" in delta.patch:
@@ -286,7 +287,7 @@ def _run_to_pause(state, deps, emit):
                     # 看到的是"生成失败"而不是程序崩溃，还能用
                     # AmendRequirements 补充信息再试一次（若补充触发了真正
                     # 的需求 patch，会重新走到这里重试）。
-                    emit(("angle_generation_failed", str(e)))
+                    safe_emit(emit, ("angle_generation_failed", str(e)))
                     state.candidates = [
                         CandidateSlot(
                             Angle("_error", "角度生成失败", ""),
