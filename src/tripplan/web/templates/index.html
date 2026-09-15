@@ -10,7 +10,7 @@
   <tbody>
   {% for row in rows %}
     <tr>
-      <td>{{ row.tid }}</td>
+      <td>{% if row.corrupt %}{{ row.tid }}{% else %}<a href="{{ url_for('detail', tid=row.tid) }}">{{ row.tid }}</a>{% endif %}</td>
       <td>{% if row.corrupt %}<span class="bad">损坏：{{ row.error }}</span>{% else %}{{ row.summary }}{% endif %}</td>
       <td>{{ row.stage_text }}</td>
       <td>{{ row.revision }}</td>

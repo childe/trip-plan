@@ -14,17 +14,28 @@ import os
 import secrets
 import uuid
 from pathlib import Path
-from urllib.parse import quote
 
-from flask import Flask, abort, redirect, render_template, request, session
+from flask import Flask, abort, redirect, render_template, request, session, url_for
 
 from tripplan.naming import slugify
-from tripplan.repo import FileRepo, TripExists
+from tripplan.repo import FileRepo, TripCorrupt, TripExists, TripNotFound
 from tripplan.state import TripState
 from tripplan.web.events import EventLogStore
-from tripplan.web.jobs import ServerBusy, TripBusy
-from tripplan.web.jobs import JobRegistry, rebuild_artifacts, run_command
-from tripplan.web.view import trip_rows
+from tripplan.web.jobs import (
+    JobRegistry,
+    ServerBusy,
+    TripBusy,
+    rebuild_artifacts,
+    run_command,
+)
+from tripplan.web.view import (
+    artifact_ready,
+    candidate_vms,
+    event_text,
+    req_card_vm,
+    trip_rows,
+)
+from tripplan.wire import UnsupportedVersion
 
 #: 用户名固定，只有口令是秘密（spec §6.5）。
 BASIC_AUTH_USER = "trip"
@@ -174,6 +185,34 @@ def create_app(
             ),
         )
 
+    @app.get("/trips/<tid>")
+    def detail(tid):
+        cfg = app.extensions["tripplan"]
+        return render_template("detail.html", **_detail_context(cfg, tid))
+
+    # 占位：真正的实现分别在 Task 12（commands/cancel/rebuild）、
+    # Task 13（events）、Task 14（itinerary）。留在这里是为了让 detail.html
+    # 的 url_for 现在就解析得了，每个任务都能独立跑测试。
+    @app.post("/trips/<tid>/commands")
+    def commands(tid):
+        abort(501)
+
+    @app.post("/trips/<tid>/cancel")
+    def cancel(tid):
+        abort(501)
+
+    @app.post("/trips/<tid>/artifacts")
+    def rebuild(tid):
+        abort(501)
+
+    @app.get("/trips/<tid>/events")
+    def events(tid):
+        abort(501)
+
+    @app.get("/trips/<tid>/itinerary")
+    def itinerary(tid):
+        abort(501)
+
     return app
 
 
@@ -212,28 +251,66 @@ def _start_command(cfg, tid: str, cmd, *, busy_page=None):
             tid, log, lambda job: run(cfg["trips_root"], tid, cmd, cfg["deps"], job)
         )
     except TripBusy:
-        return (
-            render_template(
-                "notice.html",
-                title="行程正忙",
-                message="这个行程正在跑上一步，等它结束再操作。",
-                link_tid=tid,
-            ),
-            409,
+        return _detail_with_notice(
+            cfg, tid, "这个行程正在跑上一步，等它结束再操作。", 409
         )
     except ServerBusy:
         if busy_page is not None:
             return busy_page()
-        return (
-            render_template(
-                "notice.html",
-                title="服务器正忙",
-                message="同时进行的规划已达上限，稍后再试。",
-                link_tid=tid,
-            ),
-            503,
-        )
-    return redirect(f"/trips/{quote(tid)}", code=302)
+        return _detail_with_notice(cfg, tid, "服务器正忙，稍后再试。", 503)
+    return redirect(url_for("detail", tid=tid), code=302)
+
+
+def _detail_context(cfg, tid: str, notice: str | None = None) -> dict:
+    trip_dir = resolve_trip_dir(cfg["trips_root"], tid)
+    job = cfg["registry"].get(tid)
+    snap = cfg["store"].get(tid).snapshot()
+    base = {
+        "tid": tid,
+        "job": job.snapshot() if job is not None else None,
+        "active": job is not None and job.active,
+        "notice": notice,
+        "events": [
+            {"seq": e.seq, "stream_id": e.stream_id, "text": event_text(e.to_json())}
+            for e in snap.events
+        ],
+        "cursor": snap.cursor,
+        "epoch": snap.stream_epoch,
+    }
+
+    try:
+        state = FileRepo(trip_dir).load()
+    except (TripCorrupt, TripNotFound, UnsupportedVersion) as e:
+        # 一个坏目录不该是 500。给一句读得懂的话（repo.py 的既定承诺）。
+        return {
+            **base,
+            "corrupt": str(e),
+            "state": None,
+            "stage": "",
+            "revision": 0,
+            "req_card": None,
+            "candidates": [],
+            "artifact_ready": False,
+        }
+
+    return {
+        **base,
+        "corrupt": None,
+        "state": state,
+        "stage": state.stage.value,
+        "revision": state.revision,
+        "req_card": req_card_vm(state.requirements) if state.requirements else None,
+        "candidates": candidate_vms(state.candidates),
+        # 详情页不靠 `stage is DONE` 决定要不要给链接（spec §4.1）。
+        "artifact_ready": artifact_ready(trip_dir, state.revision),
+    }
+
+
+def _detail_with_notice(cfg, tid: str, message: str, status: int):
+    return (
+        render_template("detail.html", **_detail_context(cfg, tid, notice=message)),
+        status,
+    )
 
 
 def _csrf_token() -> str:

@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}{{ tid }}{% endblock %}
+{% block main %}
+<h1>{{ tid }}</h1>
+
+{% if corrupt %}
+  <p class="bad">这个行程的 state.json 已损坏：{{ corrupt }}</p>
+{% else %}
+
+{% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+{% if job and job.status == "rejected" %}
+  <p class="notice">上一条命令被拒绝：{{ job.message }}</p>
+{% elif job and job.status == "failed" %}
+  <p class="notice">上一步失败了（{{ job.kind }}）：{{ job.message }}
+    上一次保存到磁盘的进度还在，行程目录没有损坏。</p>
+{% elif job and job.status == "cancelled" %}
+  <p class="notice">已取消。盘上停在上一个暂停点，刷新即回到取消前的样子。</p>
+{% endif %}
+
+<p class="meta">阶段 {{ stage }} · rev {{ revision }}</p>
+<p class="meta">{{ state.raw_request }}</p>
+
+{% if active %}
+  <section class="card">
+    <h2>正在工作</h2>
+    {% if job.status == "cancelling" %}
+      <p>已请求停止，将在当前这一步结束后生效。</p>
+      <button disabled>已请求停止…</button>
+    {% else %}
+      <form method="post" action="{{ url_for('cancel', tid=tid) }}">
+        <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+        <button type="submit">取消</button>
+      </form>
+    {% endif %}
+  </section>
+
+{% elif stage == "AWAIT_REQ_CONFIRM" and req_card %}
+  <section class="card">
+    <h2>需求确认</h2>
+    <dl>
+      {% for f in req_card.fields %}
+        <dt>{{ f.label }}</dt>
+        <dd>{{ f.value }}
+          {% if f.is_inferred %}<span class="inferred">推断{% if f.rationale %}（{{ f.rationale }}）{% endif %}</span>{% endif %}
+        </dd>
+      {% endfor %}
+    </dl>
+    {% if req_card.missing %}
+      <p class="bad">还缺：{{ req_card.missing | join("、") }}。
+        这几项无法推断——猜出来会让整个规划建立在假约束上。</p>
+    {% endif %}
+  </section>
+
+  <form method="post" action="{{ url_for('commands', tid=tid) }}">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="expected_revision" value="{{ revision }}">
+    <button type="submit" name="kind" value="confirm"
+            {% if req_card.missing %}disabled{% endif %}>就按这个来</button>
+  </form>
+
+  <form method="post" action="{{ url_for('commands', tid=tid) }}">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="expected_revision" value="{{ revision }}">
+    <label for="amend-text">要改什么？</label>
+    <textarea id="amend-text" name="text" rows="4" maxlength="8000"></textarea>
+    <button type="submit" name="kind" value="amend">按这个改</button>
+  </form>
+
+{% elif stage == "AWAIT_CHOICE" %}
+  <h2>候选方案</h2>
+  {% for c in candidates %}
+    <section class="card">
+      <h3>{{ c.title }}<span class="meta"> [{{ c.key }}]</span></h3>
+      {% if c.description %}<p class="meta">{{ c.description }}</p>{% endif %}
+      {% if c.selectable %}
+        <p>{{ c.days }} 天 / {{ c.activities }} 项安排</p>
+      {% else %}
+        <p class="bad">未能生成——无法选择</p>
+      {% endif %}
+      {% if c.detail %}<p class="bad">{{ c.detail }}</p>{% endif %}
+      {% if c.issues %}
+        <ul>{% for i in c.issues %}<li>{{ i.mark }} {{ i.message }}</li>{% endfor %}</ul>
+      {% endif %}
+      {% if c.selectable %}
+        <form method="post" action="{{ url_for('commands', tid=tid) }}">
+          <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+          <input type="hidden" name="expected_revision" value="{{ revision }}">
+          <input type="hidden" name="angle_key" value="{{ c.key }}">
+          <button type="submit" name="kind" value="choose">选它</button>
+        </form>
+        <form method="post" action="{{ url_for('commands', tid=tid) }}">
+          <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+          <input type="hidden" name="expected_revision" value="{{ revision }}">
+          <input type="hidden" name="angle_key" value="{{ c.key }}">
+          <label for="fb-{{ loop.index }}">对这一份提意见</label>
+          <textarea id="fb-{{ loop.index }}" name="text" rows="3" maxlength="8000"></textarea>
+          <button type="submit" name="kind" value="feedback">按意见改</button>
+        </form>
+      {% endif %}
+    </section>
+  {% endfor %}
+
+{% elif stage == "DONE" %}
+  <section class="card">
+    <h2>已定稿</h2>
+    {% if artifact_ready %}
+      <p><a href="{{ url_for('itinerary', tid=tid) }}">看成稿（含每天地图） →</a></p>
+    {% else %}
+      <p>产物待重建：成稿文件缺失或与当前 rev 对不上。</p>
+      <form method="post" action="{{ url_for('rebuild', tid=tid) }}">
+        <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+        <button type="submit">重建产物</button>
+      </form>
+    {% endif %}
+  </section>
+
+{% else %}
+  <section class="card">
+    <h2>上一步没有跑完</h2>
+    <p>服务重启、被拒、或者线程意外退出都会停在这里。点「继续」接着跑。</p>
+    <form method="post" action="{{ url_for('commands', tid=tid) }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+      <input type="hidden" name="expected_revision" value="{{ revision }}">
+      <button type="submit">继续</button>
+    </form>
+  </section>
+{% endif %}
+
+<h2>进度</h2>
+<div id="progress"
+     data-tid="{{ tid }}"
+     data-events-url="{{ url_for('events', tid=tid) }}"
+     data-cursor="{{ cursor }}"
+     data-epoch="{{ epoch }}"
+     data-job-id="{{ job.id if job else '' }}"
+     data-status-version="{{ job.status_version if job else 0 }}"
+     data-revision="{{ revision }}"
+     data-artifact-ready="{{ '1' if artifact_ready else '0' }}">
+  <ol id="event-feed">
+    {% for e in events %}<li{% if e.stream_id %} data-stream-id="{{ e.stream_id }}"{% endif %}>{{ e.text }}</li>{% endfor %}
+  </ol>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}<script src="{{ url_for('static', filename='app.js') }}"></script>{% endblock %}

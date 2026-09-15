@@ -90,7 +90,6 @@ def test_path_traversal_is_refused(client, path):
     assert client.get(path).status_code == 404
 
 
-@pytest.mark.xfail(reason="路由在 Task 10/11", strict=True)
 def test_a_chinese_directory_name_works(client, trips_root):
     """中文目录名可正常工作——这一期存在的全部理由就是中文（spec §6.0）。"""
     _seed(trips_root, "十一去京都")
