@@ -308,6 +308,86 @@ def _cmd_render(args) -> int:
     return 0
 
 
+# ---------- 网页界面 ----------
+
+
+def _serve(app, host: str, port: int) -> None:
+    """单独抽出来只为可测：测试要拦住它，不能真的起一个服务器。
+
+    **不用 Flask 自带的开发服务器**：它明确不适合对外提供服务，而本设计
+    要绑 0.0.0.0。waitress 是纯 Python、跨平台、无需编译工具链的生产级
+    WSGI 服务器，而且**单进程多线程**——JobRegistry 天然是一份（spec §3.3 / §6.4）。
+    """
+    from waitress import serve
+
+    serve(app, host=host, port=port, threads=8)
+
+
+def _require_web_deps() -> None:
+    """提前把 flask / waitress 的缺席撞出来，好在 `_cmd_web` 里翻译成人话。
+
+    单独一个函数只为两件事：**(a)** 在真正 import `tripplan.web.app`（它会连带
+    拉起整个 Flask 应用模块）之前就失败；**(b)** 测试能 monkeypatch 它来模拟
+    「这台机器没装 web extra」——总不能为了测一句提示语真去卸载 flask。
+    """
+    import waitress  # noqa: F401 —— 真正用它在 _serve 里，这里只探测存在性
+
+    from tripplan.web.app import create_app  # noqa: F401
+
+
+_WEB_EXTRA_HINT = (
+    "错误：网页界面需要额外依赖，但没装上（缺 {missing}）。\n"
+    "请执行 `uv sync --extra web` 装上 flask 与 waitress（开发环境用 `uv sync --extra dev`）；\n"
+    "它们是可选依赖，`trip render` 用不到，所以默认不装。"
+)
+
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _cmd_web(args) -> int:
+    from tripplan.artifacts import sweep_stale_staging
+
+    token = os.environ.get("TRIPPLAN_WEB_TOKEN")
+    if args.host not in _LOCAL_HOSTS and not token:
+        # 不给「裸奔到局域网」留口子（spec §6.5）。
+        print(
+            f"错误：--host {args.host} 会把服务暴露到局域网，但没有设置访问口令。\n"
+            "请先执行 `export TRIPPLAN_WEB_TOKEN=你自己想的口令` 再启动"
+            "（浏览器会弹出登录框，用户名固定是 trip）；\n"
+            "或者去掉 --host，只在本机 127.0.0.1 上访问。",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        _require_web_deps()
+    except ModuleNotFoundError as e:
+        print(
+            _WEB_EXTRA_HINT.format(missing=e.name or "flask / waitress"),
+            file=sys.stderr,
+        )
+        return 1
+
+    from tripplan.web.app import create_app
+
+    trips_root = Path(args.trips_dir)
+    trips_root.mkdir(parents=True, exist_ok=True)
+    # 启动时扫一次 .staging/ 的孤儿子目录（spec §4.1）。只删够老的：别的
+    # 进程（一个正在跑的 trip render）可能正往自己的子目录里写。
+    sweep_stale_staging(trips_root)
+
+    deps = build_deps(dry_run=False)  # 凭据问题在这里就炸，不拖到 job 里
+    app = create_app(trips_root, deps, token=token)
+
+    where = "本机" if args.host in _LOCAL_HOSTS else "本机与局域网"
+    print(f"行程目录：{trips_root.resolve()}")
+    print(f"服务已启动（{where}）：http://{args.host}:{args.port}/")
+    if token:
+        print("访问需要口令：用户名 trip，密码取自 TRIPPLAN_WEB_TOKEN。")
+    _serve(app, args.host, args.port)
+    return 0
+
+
 def main(argv=None) -> int:
     # 诊断日志默认完全静默。本设计里 backend 的旁路诊断（请求的 token 预算
     # 与实际用量、工具参数解析失败的原文、base_url 形态提示）全部走 logging
@@ -331,6 +411,16 @@ def main(argv=None) -> int:
         "--dry-run", action="store_true", help="只载入并报告状态，不调 LLM 与高德"
     )
     r.set_defaults(func=_cmd_resume)
+
+    w = sub.add_parser("web", help="启动网页界面")
+    w.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="绑定地址；0.0.0.0 需要设 TRIPPLAN_WEB_TOKEN",
+    )
+    w.add_argument("--port", type=int, default=8000)
+    w.add_argument("--trips-dir", default="trips", help="行程目录的父目录")
+    w.set_defaults(func=_cmd_web)
 
     d = sub.add_parser("render", help="从 state.json 重新生成产物")
     d.add_argument("dir")
