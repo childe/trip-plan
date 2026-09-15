@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}全部行程{% endblock %}
+{% block main %}
+<h1>全部行程</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<table class="trips">
+  <thead><tr><th>行程</th><th>需求</th><th>阶段</th><th>rev</th><th>状态</th></tr></thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td>{{ row.tid }}</td>
+      <td>{% if row.corrupt %}<span class="bad">损坏：{{ row.error }}</span>{% else %}{{ row.summary }}{% endif %}</td>
+      <td>{{ row.stage_text }}</td>
+      <td>{{ row.revision }}</td>
+      <td>{% if row.running %}进行中{% endif %}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5">还没有任何行程。</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>新建行程</h2>
+<form method="post" action="/trips">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <label for="request">想去哪、什么时候、几个人、有什么讲究——随便写，多长都行。</label>
+  <textarea id="request" name="request" rows="8" maxlength="8000" required>{{ form.request }}</textarea>
+  <label for="dir">目录名（可留空，自动按需求生成）</label>
+  <input id="dir" name="dir" maxlength="80" value="{{ form.dir }}">
+  <button type="submit">开始规划</button>
+</form>
+{% endblock %}
