@@ -19,7 +19,14 @@ from flask import Flask, abort, redirect, render_template, request, session, url
 
 from tripplan.naming import slugify
 from tripplan.repo import FileRepo, TripCorrupt, TripExists, TripNotFound
-from tripplan.state import TripState
+from tripplan.state import (
+    AmendRequirements,
+    ChooseCandidate,
+    ConfirmRequirements,
+    GiveFeedback,
+    Stage,
+    TripState,
+)
 from tripplan.web.events import EventLogStore
 from tripplan.web.jobs import (
     JobRegistry,
@@ -190,21 +197,59 @@ def create_app(
         cfg = app.extensions["tripplan"]
         return render_template("detail.html", **_detail_context(cfg, tid))
 
-    # 占位：真正的实现分别在 Task 12（commands/cancel/rebuild）、
-    # Task 13（events）、Task 14（itinerary）。留在这里是为了让 detail.html
-    # 的 url_for 现在就解析得了，每个任务都能独立跑测试。
     @app.post("/trips/<tid>/commands")
     def commands(tid):
-        abort(501)
+        cfg = app.extensions["tripplan"]
+        resolve_trip_dir(cfg["trips_root"], tid)  # 越界一律 404
+        cmd, error = _build_command(request.form)
+        if error is not None:
+            return _detail_with_notice(cfg, tid, error, 400)
+        return _start_command(cfg, tid, cmd)
 
     @app.post("/trips/<tid>/cancel")
     def cancel(tid):
-        abort(501)
+        cfg = app.extensions["tripplan"]
+        resolve_trip_dir(cfg["trips_root"], tid)
+        job = cfg["registry"].get(tid)
+        if job is not None:
+            # 幂等：没有 job 在跑、或已经是 cancelling 时都是 no-op，
+            # 重复点不报错也不 +1 status_version（spec §6.2）。
+            job.request_cancel()
+        return redirect(url_for("detail", tid=tid), code=302)
 
     @app.post("/trips/<tid>/artifacts")
     def rebuild(tid):
-        abort(501)
+        cfg = app.extensions["tripplan"]
+        trip_dir = resolve_trip_dir(cfg["trips_root"], tid)
+        try:
+            state = FileRepo(trip_dir).load()
+        except (TripCorrupt, TripNotFound, UnsupportedVersion) as e:
+            return _detail_with_notice(cfg, tid, str(e), 409)
+        if state.stage is not Stage.DONE:
+            return _detail_with_notice(
+                cfg, tid, "行程还没定稿，没有可重建的成稿产物。", 409
+            )
 
+        job_holder = cfg["registry"]
+        rebuild_target = cfg["rebuild_fn"]
+        try:
+            job_holder.start(
+                tid,
+                cfg["store"].get(tid),
+                lambda job: rebuild_target(cfg["trips_root"], tid, cfg["deps"], job),
+            )
+        except TripBusy:
+            # 那个还没退出的线程可能正要 publish()，插一次重建就是两个
+            # 发布者抢同一份最终产物（spec §6.2）。
+            return _detail_with_notice(
+                cfg, tid, "这个行程正在跑上一步，等它结束再重建。", 409
+            )
+        except ServerBusy:
+            return _detail_with_notice(cfg, tid, "服务器正忙，稍后再试。", 503)
+        return redirect(url_for("detail", tid=tid), code=302)
+
+    # 占位：真正的实现分别在 Task 13（events）、Task 14（itinerary）。
+    # 留在这里是为了让 detail.html 的 url_for 现在就解析得了。
     @app.get("/trips/<tid>/events")
     def events(tid):
         abort(501)
@@ -259,6 +304,51 @@ def _start_command(cfg, tid: str, cmd, *, busy_page=None):
             return busy_page()
         return _detail_with_notice(cfg, tid, "服务器正忙，稍后再试。", 503)
     return redirect(url_for("detail", tid=tid), code=302)
+
+
+_KINDS = {"", "confirm", "amend", "choose", "feedback"}
+
+
+def _build_command(form):
+    """把表单摊成 state.py 现成的命令类型。
+
+    顺带消除的一个 bug 面（spec §6.2）：angle_key 来自页面上渲染的按钮 value，
+    是真实 key。CLI 里 _resolve_candidate_key() 那整块「大小写兜底」逻辑
+    （连同它注释里描述的「用户被困死只能 Ctrl-C」的场景）在 Web 下从根上
+    不存在——用户不再手敲 key。
+    """
+    kind = (form.get("kind") or "").strip()
+    if kind not in _KINDS:
+        return None, f"不认识的操作：{kind}"
+
+    raw_rev = (form.get("expected_revision") or "").strip()
+    try:
+        expected = int(raw_rev)
+    except ValueError:
+        return None, "表单已过期，请刷新页面后重试。"
+
+    text = (form.get("text") or "").strip()
+    angle_key = (form.get("angle_key") or "").strip()
+    if len(text) > MAX_REQUEST_CHARS:
+        return None, f"内容太长了（{len(text)} 字，上限 {MAX_REQUEST_CHARS} 字）。"
+    if len(angle_key) > MAX_ANGLE_KEY_CHARS:
+        return None, "候选标识不合法。"
+
+    if kind == "":
+        return None, None  # 「继续」
+    if kind == "confirm":
+        return ConfirmRequirements(expected), None
+    if kind == "amend":
+        if not text:
+            return None, "要改什么？写一句再提交。"
+        return AmendRequirements(expected, text), None
+    if not angle_key:
+        return None, "没有指定是哪一份候选。"
+    if kind == "choose":
+        return ChooseCandidate(expected, angle_key), None
+    if not text:
+        return None, "意见写一句再提交，或者直接点「选它」。"
+    return GiveFeedback(expected, angle_key, text), None
 
 
 def _detail_context(cfg, tid: str, notice: str | None = None) -> dict:
