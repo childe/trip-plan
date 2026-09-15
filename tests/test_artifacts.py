@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from tripplan import artifacts as artifacts_mod
 from tripplan.artifacts import (
     ARTIFACTS_JSON,
     STAGING_DIR,
@@ -110,6 +111,71 @@ def test_two_writers_do_not_clobber_each_other(tmp_path):
         json.loads((tmp_path / ARTIFACTS_JSON).read_text(encoding="utf-8"))["revision"]
         == 9
     )
+
+
+def test_concurrent_publishes_never_mix_a_manifest_with_another_publishs_html(
+    tmp_path, monkeypatch
+):
+    """§9 回归 24 的另一半：按写者隔离暂存目录只挡住了**暂存阶段**互相踩，
+    `publish()` 自己那串「逐个 os.replace + 最后写 artifacts.json」在跨进程
+    并发下仍然不是一个整体。
+
+    强制交错出最坏的那一种（两个写者：Web job 刚 CAS 到 rev 9，另一个进程里
+    早先读到 rev 7 的 `trip render`）：
+
+    1. 新写者把 itinerary.html 换成 rev 9 的内容；
+    2. 新写者**还没写 manifest**；
+    3. 旧写者整轮跑完 —— itinerary.html 被换回 rev 7 的内容，manifest 写成 rev 7；
+    4. 新写者这才写下 manifest rev 9。
+
+    盘上于是是「manifest 说 rev 9、HTML 讲的是 rev 7 那份行程」。state.json
+    正好也是 9，`artifact_ready()` 一路绿灯，详情页亮出成稿链接，用户点进去
+    看到的是上一版——没有任何报错，谁也查不出来。这正是 spec §4.1 点名要
+    杜绝的坏结局 (a)，只是发生在 publish 阶段而不是 staging 阶段。
+
+    不变式：**manifest 里的 revision 与盘上 HTML 的来源必须是同一次 publish。**
+    谁最后落地不重要（落地的是旧版就只是 artifact_ready 判不就绪 → 「产物待
+    重建」，安全且可恢复），混搭才是致命的。
+    """
+    import threading
+
+    old = stage_artifacts(
+        _done_state(rev=7, title="旧版成稿"), tmp_path, FakeProvider(), "job-old"
+    )
+    new = stage_artifacts(
+        _done_state(rev=9, title="新版成稿"), tmp_path, FakeProvider(), "job-new"
+    )
+
+    at_manifest = threading.Event()  # 新写者：replace 做完了，manifest 还没写
+    old_done = threading.Event()  # 旧写者：整轮跑完了
+    real_write = artifacts_mod._atomic_write_json
+
+    def hooked(path, payload):
+        if payload.get("revision") == 9:
+            at_manifest.set()
+            old_done.wait(0.3)  # 加了锁之后旧写者被挡住，这里必然超时——正常
+        real_write(path, payload)
+
+    monkeypatch.setattr(artifacts_mod, "_atomic_write_json", hooked)
+
+    def run_old():
+        at_manifest.wait(5)
+        try:
+            publish(old)
+        finally:
+            old_done.set()
+
+    t = threading.Thread(target=run_old, name="old-writer")
+    t.start()
+    publish(new)
+    t.join(10)
+    assert not t.is_alive()
+
+    data = json.loads((tmp_path / ARTIFACTS_JSON).read_text(encoding="utf-8"))
+    html = (tmp_path / "itinerary.html").read_text(encoding="utf-8")
+    expected = {7: "旧版成稿", 9: "新版成稿"}[data["revision"]]
+    assert expected in html, f"manifest 说 rev {data['revision']}，HTML 却不是那一份"
+    assert artifact_ready(tmp_path, data["revision"])
 
 
 def test_artifact_ready_requires_matching_revision_and_existing_files(tmp_path):

@@ -15,8 +15,18 @@
 管不到另一个进程里的 `trip render`。两种坏结局都是静默的——(a) 发布出去的
 artifacts.json revision 与 state.json 完全对得上，但 HTML 讲的是另一份行程；
 (b) 败者的 discard() 删掉胜者刚放进去的文件，publish() 搬了个空。
+
+按写者隔离只挡住了**暂存阶段**。publish() 那串「逐个 os.replace + 最后写
+artifacts.json」本身还不是一个整体：单个 os.replace 是原子的，一串不是。
+两个写者的 publish 交错一下，同样能凑出上面的坏结局 (a)——新写者换完
+itinerary.html 还没写 manifest 时，旧写者整轮插进来把 HTML 换回上一版并写下
+自己的 manifest，新写者这才写下自己的 → manifest 说 rev 9、HTML 却是 rev 7
+那份，而 state.json 正好也是 9，artifact_ready() 一路绿灯。所以 publish()
+从第一个 os.replace 到 manifest 落地全程握一把**跨进程**的文件锁（进程内的
+per-trip 互斥依然管不到另一个进程里的 trip render）。
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -24,6 +34,12 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+try:  # POSIX
+    import fcntl
+except ModuleNotFoundError:  # pragma: no cover —— Windows
+    fcntl = None
+    import msvcrt
 
 from tripplan.maps import fetch_day_maps
 from tripplan.render.itinerary_html import render_itinerary_html
@@ -33,6 +49,7 @@ from tripplan.state import Stage
 ARTIFACTS_JSON = "artifacts.json"
 STAGING_DIR = ".staging"
 FINAL_HTML = "itinerary.html"
+PUBLISH_LOCK = ".publish.lock"
 
 
 @dataclass(frozen=True)
@@ -99,16 +116,61 @@ def stage_artifacts(
 
 
 def publish(staged: Staged | None) -> None:
-    """提交点。artifacts.json **最后写**——它在就代表整组文件都到位了。"""
+    """提交点。artifacts.json **最后写**——它在就代表整组文件都到位了。
+
+    整段搬运握 `<trip>/.publish.lock`：单个 os.replace 原子，一串不原子，
+    而这个目录下同时可能有第二个写者（另一个进程里的 `trip render`，或对同一
+    `trips/` 起的第二个 `trip web`）。锁只覆盖搬运本身——慢的那截（渲染 + 拉
+    高德图）早在 stage_artifacts() 里做完了，所以持锁时间是几次改名的量级。
+
+    锁没能让两个写者变成一个赢家，它只保证**不混搭**：最后落地的那一份整组
+    一致。落地的若是旧版，manifest 的 revision 与 state.json 对不上，
+    artifact_ready() 判不就绪 → 详情页给「产物待重建」，安全且可恢复。
+    """
     if staged is None:
         return
-    for name in staged.names:
-        os.replace(staged.stage_dir / name, staged.trip_dir / name)
-    _atomic_write_json(
-        staged.trip_dir / ARTIFACTS_JSON,
-        {"revision": staged.revision, "files": list(staged.names)},
-    )
+    with _publish_lock(staged.trip_dir):
+        for name in staged.names:
+            os.replace(staged.stage_dir / name, staged.trip_dir / name)
+        _atomic_write_json(
+            staged.trip_dir / ARTIFACTS_JSON,
+            {"revision": staged.revision, "files": list(staged.names)},
+        )
     shutil.rmtree(staged.stage_dir, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _publish_lock(trip_dir: Path):
+    """按行程目录的跨进程互斥锁（阻塞式）。
+
+    锁文件本身不含任何状态，留在目录里也无所谓——重要的是它**不参与发布**：
+    不进 manifest 的 files，artifact_ready() 也不看它。
+    """
+    trip_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(trip_dir / PUBLISH_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        _flock(fd)
+        try:
+            yield
+        finally:
+            _funlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _flock(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    else:  # pragma: no cover —— Windows
+        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+
+
+def _funlock(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    else:  # pragma: no cover —— Windows
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 def discard(staged: Staged | None) -> None:
