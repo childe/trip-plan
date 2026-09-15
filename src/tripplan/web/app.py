@@ -22,6 +22,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    send_file,
     session,
     url_for,
 )
@@ -304,12 +305,34 @@ def create_app(
             artifact_ready=ready,
         )
 
-    # 占位：真正的实现在 Task 14（itinerary）。
-    # 留在这里是为了让 detail.html 的 url_for 现在就解析得了。
-
     @app.get("/trips/<tid>/itinerary")
     def itinerary(tid):
-        abort(501)
+        cfg = app.extensions["tripplan"]
+        trip_dir = resolve_trip_dir(cfg["trips_root"], tid)
+        try:
+            state = FileRepo(trip_dir).load()
+        except (TripCorrupt, TripNotFound, UnsupportedVersion) as e:
+            return (
+                render_template("notice.html", title="读不出这个行程", message=str(e)),
+                409,
+            )
+
+        path = trip_dir / "itinerary.html"
+        if not artifact_ready(trip_dir, state.revision) or not path.exists():
+            # **不是裸 404**：详情页在这种状态下本来也不会给出这个链接，
+            # 这里是直接输 URL 或用旧书签进来的兜底（spec §6.1）。
+            return (
+                render_template(
+                    "notice.html",
+                    title="产物需要重建",
+                    message="成稿文件缺失，或与当前 rev 对不上。回到行程页点「重建产物」即可。",
+                    link_tid=tid,
+                ),
+                409,
+            )
+        # send_file 一份**完整的独立 HTML 文档**，根本不过模板——转义责任在
+        # render/itinerary_html.py（既有行为，本期不改，spec §6.1）。
+        return send_file(path, mimetype="text/html")
 
     return app
 
