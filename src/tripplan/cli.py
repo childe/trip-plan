@@ -75,16 +75,24 @@ def build_deps(dry_run: bool = False) -> Deps:
     if dry_run:
         return Deps(client=None, provider=FakeProvider())
 
-    # 先查地理 provider 的凭据，再构造任何东西：新用户第一次跑最容易撞见这个——
-    # 裸 KeyError: 'AMAP_KEY' 什么都没告诉他，读得懂的中文提示 + --dry-run
-    # 出路才有用。plan/resume 真的要用 provider 去解析 POI/路线，缺了就是
-    # 硬错误，不像 render 那样可以体面地跳过地图。
+    # 先查地理 provider 的凭据，再构造任何东西：新用户第一次跑 `trip web` 最容易
+    # 撞见这个——裸 KeyError: 'AMAP_KEY' 什么都没告诉他，得给读得懂的中文提示 +
+    # 一条真能走的出路。规划过程真的要用 provider 去解析 POI/路线，缺了就是硬错
+    # 误，不像 render 那样可以体面地跳过地图。
+    #
+    # 出路这句话只能指向**现在还存在**的东西：交互命令 plan/resume 连同它们的
+    # `--dry-run` 已经删掉了，入口只剩 web 与 render，谁都不认这个开关。照着旧
+    # 提示敲 `trip web --dry-run` 收获的是 `unrecognized arguments` + exit 2，
+    # 把人指进死胡同比不给指引更坏。tests/test_cli.py 里有条测试扫这条消息里的
+    # 每个 --flag，逼它和子命令的 --help 对得上。
     provider = build_provider(dry_run=False)
     if provider is None:
         raise MissingCredential(
             "缺少环境变量 AMAP_KEY（高德开放平台的 key，用于路线查询与静态地图）。"
-            "请先执行 `export AMAP_KEY=你的高德key` 再运行；"
-            "如果只是想在没有凭据的情况下试跑工具，加 --dry-run。"
+            "请先执行 `export AMAP_KEY=你的高德key` 再运行。"
+            "网页界面绕不开它：行程里的路线时长与地图都得现查。"
+            "（如果只是想把已有的 state.json 重新渲染一份，用 `trip render`，"
+            "它不需要这个 key，只是产出的 HTML 里不会有地图。）"
         )
 
     from tripplan.llm.config import load_config

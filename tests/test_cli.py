@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -195,7 +196,34 @@ def test_build_deps_missing_amap_key_is_readable_not_keyerror():
         build_deps(dry_run=False)
     message = str(exc_info.value)
     assert "AMAP_KEY" in message
-    assert "--dry-run" in message
+    assert "export AMAP_KEY" in message
+
+
+def _subcommand_help(cmd, capsys):
+    with pytest.raises(SystemExit):
+        main([cmd, "--help"])
+    return capsys.readouterr().out
+
+
+def test_missing_amap_key_hint_never_points_at_a_flag_the_cli_rejects(capsys):
+    """提示里提到的每个 `--flag`，都得真的能被某个子命令接受。
+
+    回归：交互命令 plan/resume 被删掉之后，入口只剩 `web` 与 `render`，两个
+    都没有 `--dry-run`；而这条提示的末尾还写着「加 --dry-run」。用户照着做
+    只会撞上 `trip: error: unrecognized arguments: --dry-run` 并 exit 2——
+    唯一一条逃生指引把人指进死胡同，比不给指引更坏。
+
+    断言写成「扫出消息里所有 --flag，逐个要求出现在某个子命令的 --help 里」
+    而不是「不许出现 --dry-run」：这样以后谁再往凭据提示里塞一个不存在的开
+    关，一样会被这条测试拦下。
+    """
+    with pytest.raises(MissingCredential) as exc_info:
+        build_deps(dry_run=False)
+    message = str(exc_info.value)
+
+    all_help = _subcommand_help("web", capsys) + _subcommand_help("render", capsys)
+    for flag in sorted(set(re.findall(r"--[a-z][a-z0-9-]*", message))):
+        assert flag in all_help, f"凭据提示让用户加 {flag}，但没有任何子命令认这个开关"
 
 
 def test_build_deps_dry_run_works_with_no_env_vars_at_all():
