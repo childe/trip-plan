@@ -4,7 +4,8 @@
 都返回一个带 detail 的 CandidateSlot，绝不卡住、也绝不抛异常炸穿。
 """
 
-from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
+from tripplan.agents._emit import safe_emit as _safe_emit
+from tripplan.agents.limits import Cancelled, LimitExceeded, SlotContext, SlotLimits
 from tripplan.agents.steps import generate, revise, run_llm_critic
 from tripplan.models.issue import Severity, has_blocking
 from tripplan.providers.base import ProviderError
@@ -17,16 +18,6 @@ def _noop(_event) -> None:
     pass
 
 
-def _safe_emit(emit, event) -> None:
-    """进度回调是给外部看的旁路，不是循环的一部分——它自己炸了不能陪葬一整个
-    候选。Task 20 会让三条候选线共享同一个 emit（含多样性重试路径），一个
-    回调里的 bug 不该因此拖垮所有还在跑的候选。"""
-    try:
-        emit(event)
-    except Exception:
-        pass
-
-
 def run_slot(
     angle,
     seed,
@@ -37,8 +28,9 @@ def run_slot(
     limits: SlotLimits = SlotLimits(),
     emit=_noop,
     avoid_poi_ids=(),
+    cancel=None,
 ) -> CandidateSlot:
-    ctx = SlotContext(limits, emit=emit)
+    ctx = SlotContext(limits, emit=emit, cancel=cancel)
     itin, facts = seed, None
     issues = list(issues)
     revisions = 0  # 真正调用过 revise 的次数——轮 0 只校验首稿，不一定修订
@@ -73,6 +65,10 @@ def run_slot(
             f"修订 {revisions} 次后仍有 {blocking} 个硬伤",
         )
 
+    except Cancelled:
+        # ★ 必须排在下面两个 except 前面。掉进 except LimitExceeded 就会
+        # 变成一个 EXHAUSTED 候选，取消被静默翻译成「生成失败」（spec §4.3）。
+        raise
     except LimitExceeded as e:
         if itin is not None:
             itin.issues = list(issues)

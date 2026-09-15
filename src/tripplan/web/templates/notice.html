@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block main %}
+<h1>{{ title }}</h1>
+<p>{{ message }}</p>
+{% if link_tid %}<p><a href="{{ url_for('detail', tid=link_tid) }}">进入这个行程 →</a></p>{% endif %}
+{% endblock %}
