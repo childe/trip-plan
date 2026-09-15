@@ -15,7 +15,16 @@ import secrets
 import uuid
 from pathlib import Path
 
-from flask import Flask, abort, redirect, render_template, request, session, url_for
+from flask import (
+    Flask,
+    abort,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 
 from tripplan.naming import slugify
 from tripplan.repo import FileRepo, TripCorrupt, TripExists, TripNotFound
@@ -248,11 +257,55 @@ def create_app(
             return _detail_with_notice(cfg, tid, "服务器正忙，稍后再试。", 503)
         return redirect(url_for("detail", tid=tid), code=302)
 
-    # 占位：真正的实现分别在 Task 13（events）、Task 14（itinerary）。
-    # 留在这里是为了让 detail.html 的 url_for 现在就解析得了。
     @app.get("/trips/<tid>/events")
     def events(tid):
-        abort(501)
+        cfg = app.extensions["tripplan"]
+        trip_dir = resolve_trip_dir(cfg["trips_root"], tid)
+
+        try:
+            since = int(request.args.get("since", 0))
+        except ValueError:
+            since = 0
+        epoch = request.args.get("epoch") or None
+
+        result = cfg["store"].get(tid).since(since, epoch)
+        job = cfg["registry"].get(tid)
+
+        stage, revision, ready = "", 0, False
+        try:
+            state = FileRepo(trip_dir).load()
+            stage, revision = state.stage.value, state.revision
+            ready = artifact_ready(trip_dir, revision)
+        except (TripCorrupt, TripNotFound, UnsupportedVersion):
+            pass  # 轮询不该因为文件坏了就 500；详情页会把话说清楚
+
+        return jsonify(
+            events=[
+                {**e.to_json(), "text": event_text(e.to_json())} for e in result.events
+            ],
+            first_seq=result.first_seq,
+            last_seq=result.last_seq,
+            stream_epoch=result.stream_epoch,
+            reset_required=result.reset_required,
+            resume_seq=result.resume_seq,
+            job=(
+                job.snapshot()
+                if job is not None
+                else {
+                    "id": None,
+                    "status": "none",
+                    "status_version": 0,
+                    "kind": None,
+                    "message": None,
+                }
+            ),
+            stage=stage,
+            revision=revision,
+            artifact_ready=ready,
+        )
+
+    # 占位：真正的实现在 Task 14（itinerary）。
+    # 留在这里是为了让 detail.html 的 url_for 现在就解析得了。
 
     @app.get("/trips/<tid>/itinerary")
     def itinerary(tid):
