@@ -3,6 +3,7 @@
 from itertools import combinations
 from typing import Callable
 
+from tripplan.agents._emit import safe_emit
 from tripplan.models.facts import FactSnapshot
 from tripplan.models.itinerary import Category, Itinerary
 from tripplan.state import CandidateSlot
@@ -84,7 +85,7 @@ def enforce_diversity(
     for i, j, overlap in overlaps:
         if j in retried:
             continue
-        emit(("diversity_retry", result[j].angle.key, sorted(overlap)))
+        safe_emit(emit, ("diversity_retry", result[j].angle.key, sorted(overlap)))
         retried.add(j)
         result[j] = regenerate(result[j], overlap)
     return result

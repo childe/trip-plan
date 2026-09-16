@@ -7,7 +7,9 @@ from tripplan.models.requirements import (
     missing_required,
 )
 
-_LABELS = {
+#: 字段名 → 中文标签。**是数据不是渲染串**，所以可以被 web/view.py 复用；
+#: 本模块产出的 Markdown 串则不共享（spec §6.1）。
+FIELD_LABELS = {
     "destination": "目的地",
     "dates": "日期",
     "party": "人员",
@@ -25,7 +27,7 @@ _LABELS = {
 
 def render_requirement_card(reqs: Requirements) -> str:
     lines = ["## 需求确认", ""]
-    for name, label in _LABELS.items():
+    for name, label in FIELD_LABELS.items():
         field = getattr(reqs, name)
         if field.value is None:
             continue
@@ -39,7 +41,7 @@ def render_requirement_card(reqs: Requirements) -> str:
     missing = missing_required(reqs)
     if missing:
         lines += ["", "### 待补充（必答）", ""]
-        lines += [f"- **{_LABELS[n]}**：？" for n in missing]
+        lines += [f"- **{FIELD_LABELS[n]}**：？" for n in missing]
         lines += ["", "这几项无法推断——猜出来会让整个规划建立在假约束上。"]
     else:
         lines += ["", "_标 `?` 的是推断值，不对请直接说。_"]

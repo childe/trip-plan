@@ -10,6 +10,27 @@ class LimitExceeded(Exception):
     pass
 
 
+class Cancelled(Exception):
+    """用户主动取消。
+
+    **刻意不继承 LimitExceeded，也不继承任何被现有代码捕获的类型。**
+    继承就等于重新掉进 slot.py:76 的 `except LimitExceeded` 和
+    orchestrator.py:254 `_safe_slot` 的 `except Exception` 里：取消会被
+    静默翻译成「候选生成失败」，`_run_to_pause` 若无其事地把 stage 推到
+    AWAIT_CHOICE，advance 递增 revision，job 体照常 CAS 落盘——用户按了
+    「取消」，系统给他写进盘里一份候选全失败的行程（spec §4.3）。
+    """
+
+
+def raise_if_cancelled(token) -> None:
+    """token 是任何带 is_set() 的对象（threading.Event）；None = 没有取消通道。
+
+    给「LLM turn 之间」以外的检查点用：候选与候选之间、CAS 之前。
+    """
+    if token is not None and token.is_set():
+        raise Cancelled("已取消")
+
+
 @dataclass(frozen=True)
 class SlotLimits:
     max_rounds: int = 3
@@ -33,7 +54,9 @@ class SlotContext:
     """记账 + 取消标记。作用域是一条候选线，不是单次 run_agent ——
     generate + revise×N + critic 共享同一份额度。"""
 
-    def __init__(self, limits: SlotLimits, clock=time.monotonic, emit=_noop) -> None:
+    def __init__(
+        self, limits: SlotLimits, clock=time.monotonic, emit=_noop, cancel=None
+    ) -> None:
         self.limits = limits
         self.emit = emit
         self._clock = clock
@@ -41,6 +64,9 @@ class SlotContext:
         self._usage = Usage(0, 0)
         self._tool_calls = 0
         self._cancelled = False
+        #: 外部取消令牌。SlotContext 是在 orchestrator/slot 内部现场创建的，
+        #: Web 层拿不到它的句柄，只能把一个 threading.Event 一路传进来。
+        self._cancel = cancel
 
     @property
     def spent(self) -> Usage:
@@ -60,8 +86,8 @@ class SlotContext:
         self._cancelled = True
 
     def check(self) -> None:
-        if self._cancelled:
-            raise LimitExceeded("已取消")
+        if self._cancelled or (self._cancel is not None and self._cancel.is_set()):
+            raise Cancelled("已取消")
         elapsed = self._clock() - self._started
         if elapsed > self.limits.deadline_s:
             raise LimitExceeded(f"超时（{elapsed:.0f}s > {self.limits.deadline_s}s）")

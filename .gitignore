@@ -24,3 +24,4 @@ trips/
 .DS_Store
 .idea/
 .vscode/
+.xdev/

@@ -660,3 +660,84 @@ def test_a_wrongly_typed_angle_key_no_longer_escapes_advance_as_a_typeerror():
     assert isinstance(out, NeedInput)
     assert s.stage is Stage.AWAIT_CHOICE
     assert [c.status for c in s.candidates] == [SlotStatus.FAILED]
+
+
+def test_a_throwing_emit_never_derails_the_state_machine(wire, tmp_path):
+    """spec §5.1.1 / §9 回归 13。
+
+    orchestrator.py:201 的裸 emit 尤其要命：它在 _patch_requirements 里，
+    此刻 state.requirements 已经被 patch 进去、state.revision 还没递增。
+    异常从这里穿出去，留下的是一个既不算「拒绝」也不算「修改」的半吊子
+    state——正是 orchestrator.py 开头那段 docstring 明令不许出现的东西。
+    磁盘满不该有能力把状态机搞歪。
+    """
+
+    def boom(_event):
+        raise RuntimeError("events.jsonl 只读")
+
+    wire(_Fakes(delta=FeedbackDelta(True, {"destination": "巴黎"}, Scale.REWRITE)))
+    s = _at_choice(chosen="A")
+    before = s.revision
+
+    outcome = advance(s, _deps(), GiveFeedback(before, "A", "改去巴黎"), boom)
+
+    assert not isinstance(outcome, Rejected)
+    assert s.revision == before + 1  # 递增照常发生
+    assert s.requirements.destination.value == "巴黎"  # patch 落到位
+    assert s.stage is Stage.AWAIT_CHOICE  # 没有卡在半吊子状态
+
+
+def test_a_throwing_emit_does_not_break_angle_failure_or_diversity_paths(wire):
+    """另外两处裸 emit：orchestrator.py:289（角度生成失败）与
+    validation/diversity.py:87（重跑提示）。"""
+
+    def boom(_event):
+        raise RuntimeError("磁盘满")
+
+    fakes = _Fakes()
+    fakes.pick_angles = lambda reqs, deps, ctx=None, n=3: (_ for _ in ()).throw(
+        ValueError("一个角度都没解析出来")
+    )
+    wire(fakes)
+
+    s = _at_choice()
+    s.stage = Stage.GENERATE
+    s.candidates = []
+
+    outcome = advance(s, _deps(), None, boom)
+
+    assert isinstance(outcome, NeedInput)
+    assert s.stage is Stage.AWAIT_CHOICE
+    assert s.revision == 6  # _at_choice 起点是 5
+    assert s.candidates[0].status is SlotStatus.FAILED
+
+
+def test_advance_emits_stage_milestones(wire):
+    """spec §5.2：v1 在 _run_to_pause 的阶段边界补 emit 点，不动 agent 内部。"""
+    wire(_Fakes())
+    events = []
+
+    state = TripState.new("去京都", run_id="r1")
+    state.stage, state.revision = Stage.COLLECT, 0
+
+    advance(state, Deps(client=None, provider=FakeProvider()), None, events.append)
+
+    types = [e[0] for e in events]
+    assert "stage_started" in types
+    assert ("stage_started", "COLLECT") in events
+    assert ("paused", "AWAIT_REQ_CONFIRM", 1) in events
+
+
+def test_advance_emits_angles_picked(wire):
+    wire(_Fakes(angles=("A", "B", "C")))
+    events = []
+
+    state = TripState.new("去京都", run_id="r1")
+    state.stage, state.revision, state.requirements = Stage.GENERATE, 2, _reqs()
+    state.trip_timezone = "Asia/Tokyo"
+
+    advance(state, Deps(client=None, provider=FakeProvider()), None, events.append)
+
+    assert ("stage_started", "GENERATE") in events
+    assert ("angles_picked", ["A", "B", "C"]) in events
+    assert ("paused", "AWAIT_CHOICE", 3) in events
