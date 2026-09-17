@@ -9,6 +9,7 @@ from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
 from tripplan.agents.steps import (
     Scale,
     _date_preamble,
+    _PARSERS,
     _to_field,
     apply_patch,
     classify_feedback,
@@ -772,6 +773,27 @@ def test_apply_patch_returns_unchanged_when_patch_is_not_a_dict():
     assert out == reqs
 
 
+def test_apply_patch_logs_the_field_it_had_to_drop(caplog):
+    """_to_field 留了痕，apply_patch 没有——而「用户补日期」走的正是
+    apply_patch 这条路。实测模型给的是 start_date/end_date/duration_days，
+    一个键都不匹配 _PARSERS["dates"]，patch 被整个丢掉，需求纹丝不动，
+    线上没有任何一行能解释「用户明明说了日期，怎么还在问」。"""
+    patch = {
+        "dates": {
+            "start_date": "2026-09-26",
+            "end_date": "2026-09-27",
+            "duration_days": 2,
+        }
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="tripplan.agents.steps"):
+        out = apply_patch(Requirements(), patch)
+
+    assert out == Requirements()  # 行为不变：认不出来仍然当没给
+    assert "dates" in caplog.text
+    assert "start_date" in caplog.text  # 原值要留下，否则查不出模型给了什么
+
+
 # ---------- 相对日期：prompt 必须告诉模型今天是几号 ----------
 
 
@@ -844,7 +866,9 @@ def test_classify_prompt_lists_the_patch_fields_apply_patch_accepts():
     classify_feedback("下周末2天", Requirements(), deps, _ctx())
 
     system = deps.client.calls[0].system
-    for name in ("destination", "dates", "party", "budget"):
+    # 逐个字段从 _PARSERS 推出来，不写死名单：以后往 _PARSERS 加一个键却忘了
+    # 写进 prompt，模型就又只能靠猜，这条测试必须当场红。
+    for name in _PARSERS:
         assert name in system, f"patch 的合法字段 {name} 没写进 prompt"
     # dates 的值形状也得说死，否则模型会自创 start_date / end_date
     assert '"start"' in system and '"end"' in system

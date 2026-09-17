@@ -512,6 +512,65 @@ def test_feedback_with_empty_patch_is_treated_as_itinerary_feedback(wire):
     assert any("颜色不喜欢" in i.message for i in fakes.slot_calls[0]["issues"])
 
 
+# ---------- patch 非空、却一个键都应用不上：和空 patch 是同一件事 ----------
+
+#: 模型自创的 dates 形状。apply_patch 只认 {"start","end"}，这三个键一个
+#: 都不匹配，整条 patch 落地为零。
+_INAPPLICABLE = {
+    "dates": {
+        "start_date": "2026-09-26",
+        "end_date": "2026-09-27",
+        "duration_days": 2,
+    }
+}
+
+
+def test_amend_whose_patch_applies_nothing_does_not_wipe_the_candidates(wire):
+    """patch 非空只说明模型想改，不说明改得动。三个候选已经跑出来了，
+    不能因为一次落地为零的"需求变更"被 REWRITE 清空重跑——那和 patch={}
+    的场景后果一模一样，只是更贵。"""
+    fakes = wire(_Fakes(delta=FeedbackDelta(True, _INAPPLICABLE, Scale.REWRITE)))
+    s = _at_choice()
+    before = s.revision
+    before_keys = [c.angle.key for c in s.candidates]
+
+    out = advance(s, _deps(), AmendRequirements(before, "下周末2天"))
+
+    assert not isinstance(out, Rejected)
+    assert s.stage is Stage.AWAIT_CHOICE
+    assert [c.angle.key for c in s.candidates] == before_keys
+    assert all(c.itinerary is not None for c in s.candidates)
+    assert fakes.slot_calls == []
+
+
+def test_feedback_whose_patch_applies_nothing_keeps_the_user_words(wire):
+    """这是本次 bug 的正主：用户答"下周末2天"，需求一个字都没变，而旧路径
+    还把这句话丢了——issue 清空、重跑生成、再问一次同样的问题。落地为零时
+    必须退回"当作对行程的意见"，用户说的话至少还在。"""
+    fakes = wire(_Fakes(delta=FeedbackDelta(True, _INAPPLICABLE, Scale.INCREMENTAL)))
+    s = _at_choice()
+
+    advance(s, _deps(), GiveFeedback(s.revision, "B", "下周末2天"))
+
+    assert s.chosen_key == "B"
+    assert [c["angle"] for c in fakes.slot_calls] == ["B"]
+    assert any("下周末2天" in i.message for i in fakes.slot_calls[0]["issues"])
+
+
+def test_patch_that_does_apply_still_reaches_requirements(wire):
+    """守卫不能宽到把正常补丁也拦掉：能应用的键必须照旧落到需求上，
+    并触发该有的重跑。"""
+    fakes = wire(
+        _Fakes(delta=FeedbackDelta(True, {"destination": "巴黎"}, Scale.REWRITE))
+    )
+    s = _at_choice()
+
+    advance(s, _deps(), AmendRequirements(s.revision, "改去巴黎"))
+
+    assert s.requirements.destination.value == "巴黎"
+    assert [c["angle"] for c in fakes.slot_calls] == ["A", "B", "C"]
+
+
 # ---------- xfail 摘除后的回归 ----------
 
 

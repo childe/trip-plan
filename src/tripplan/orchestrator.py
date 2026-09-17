@@ -183,6 +183,8 @@ def _apply(state, cmd, deps, emit, cancel=None) -> None:
                 # patch={}」不是真正可执行的变更——按它走 REWRITE/清候选只会
                 # 白白丢掉已经跑出来的三个候选。当作没有发生需求变更，原地
                 # 停在当前暂停态（_run_to_pause 会把它当成 no-op 直接返回）。
+                # patch 非空却一个键都应用不上时同理，由 _patch_requirements
+                # 内部识别并整体跳过，落到与这里同一个 no-op 结局。
 
         case ChooseCandidate(angle_key=key):
             state.chosen_key = key
@@ -199,16 +201,32 @@ def _apply(state, cmd, deps, emit, cancel=None) -> None:
                 text, state.requirements, deps, _step_ctx(emit, cancel)
             )
             state.chosen_key = key  # 提意见即选定
-            if delta.patches_requirements and delta.patch:
-                _patch_requirements(state, delta, emit)
-            else:
+            # 注意求值顺序：_patch_requirements 只有在前两个条件成立时才跑，
+            # 而它返回 False（patch 一个键都落不了地）时必须走进 else——否则
+            # 用户这句话既没改到需求、又没留在 issue 里，等于从没说过。
+            patched = (
+                delta.patches_requirements
+                and delta.patch
+                and _patch_requirements(state, delta, emit)
+            )
+            if not patched:
                 state.issues = [Issue.from_human(text)]
                 state.stage = Stage.REFINE
 
 
-def _patch_requirements(state, delta, emit) -> None:
-    """delta 由调用方传入 —— 不在这里重新分类。调用前已确认 delta.patch 非空。"""
-    state.requirements = apply_patch(state.requirements, delta.patch)
+def _patch_requirements(state, delta, emit) -> bool:
+    """delta 由调用方传入 —— 不在这里重新分类。调用前已确认 delta.patch 非空。
+
+    返回「需求是否真的改动了」。patch 非空不等于改得动：apply_patch 只认
+    _PARSERS 里的键、且值得能解析，模型给出 {"dates": {"start_date": ...,
+    "duration_days": 2}} 时一个键都落不了地，需求原样返回。那和 patch={}
+    是同一件事——调用方对空 patch 的判断（不清候选、不重跑）必须同样适用，
+    否则等于拿一次零改动去清 issue、REWRITE 清空三个已跑完的候选、再向
+    用户播报一句假的"需求已更新"。"""
+    patched = apply_patch(state.requirements, delta.patch)
+    if patched == state.requirements:
+        return False
+    state.requirements = patched
     safe_emit(emit, ("requirements_patched", delta.patch))  # 非阻塞提示，不拦流程
     state.issues = []  # 旧 issue 基于旧需求，作废
 
@@ -227,6 +245,7 @@ def _patch_requirements(state, delta, emit) -> None:
         }
 
     state.stage = Stage.GENERATE if state.chosen_key is None else Stage.REFINE
+    return True
 
 
 def _ensure_timezone(state, deps) -> str:

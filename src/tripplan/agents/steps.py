@@ -439,14 +439,24 @@ def apply_patch(reqs: Requirements, patch) -> Requirements:
     patch.items() 就 AttributeError。这里没有什么"部分应用"的余地：
     传进来的不是对象，就当没有任何补丁，原样返回。"""
     if not isinstance(patch, dict):
+        logger.debug("patch 不是对象，整条忽略：%r", patch)
         return reqs
     updates = {}
     for name, raw_value in patch.items():
         if name not in _PARSERS:
-            continue  # 未知字段忽略，不炸
+            # 模型自创字段名是本次 bug 的直接成因（start_date / duration_days
+            # 三个键一个都不在 _PARSERS 里），必须看得见是哪个键被丢了。
+            logger.debug("patch 字段 %s 不认识，已忽略；原值=%r", name, raw_value)
+            continue
         try:
             value = _PARSERS[name](raw_value)
-        except ParseError:
+        except ParseError as e:
+            # 与 _to_field 同样的理由：行为不变（这一键当没给），但不能不留痕。
+            # 「用户补日期」走的正是这条路，静默丢弃时线上没有任何一行能解释
+            # 「用户明明答了，需求怎么纹丝不动」。
+            logger.debug(
+                "patch 字段 %s 解析失败，已忽略：%s；原值=%r", name, e, raw_value
+            )
             continue
         updates[name] = Field(value=value, origin=Origin.USER, confirmed=True)
     return replace(reqs, **updates) if updates else reqs
