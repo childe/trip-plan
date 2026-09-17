@@ -1,5 +1,6 @@
 import json
-from datetime import date
+import logging
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -7,6 +8,8 @@ import pytest
 from tripplan.agents.limits import LimitExceeded, SlotContext, SlotLimits
 from tripplan.agents.steps import (
     Scale,
+    _date_preamble,
+    _to_field,
     apply_patch,
     classify_feedback,
     collect,
@@ -767,3 +770,81 @@ def test_apply_patch_returns_unchanged_when_patch_is_not_a_dict():
     reqs = Requirements(destination=Field("京都", Origin.USER))
     out = apply_patch(reqs, "改成四天")
     assert out == reqs
+
+
+# ---------- 相对日期：prompt 必须告诉模型今天是几号 ----------
+
+
+def test_date_preamble_states_the_absolute_date_and_weekday():
+    """纯函数，给定一个时刻就得到确定的一行字。
+
+    模型要把「下周末」算成绝对日期，光有 ISO 日期不够——还得知道那天是
+    星期几，否则「本周末」和「下周末」分不开。星期几必须自己映射成中文：
+    strftime("%A") 受 locale 影响，在英文环境下会给出 "Thursday"。
+    """
+    line = _date_preamble(datetime(2026, 9, 17, 14, 30, tzinfo=timezone.utc))
+    assert "2026-09-17" in line
+    assert "星期四" in line
+
+
+def test_collect_tells_the_model_what_day_it_is():
+    """根因回归：collect 的 system prompt 从不含当前日期，模型就无法把
+    「下周末」换算成 dates 要求的绝对 ISO 日期，只能留 null——然后界面
+    问用户补，用户再答一次相对日期，无限循环。"""
+    # REQUIREMENTS_SCHEMA 的 required 是 destination/dates/party，三个都得给，
+    # 少一个会触发 run_agent 的 schema 修复重试，把脚本用尽。
+    deps = _deps(
+        _resp(
+            {
+                "destination": {"value": "芜湖"},
+                "dates": {"value": None},
+                "party": {"value": None},
+            }
+        )
+    )
+    collect("我下个周末去芜湖2天骑车咖啡", deps, _ctx())
+
+    system = deps.client.calls[0].system
+    assert date.today().isoformat() in system
+
+
+def test_classify_feedback_tells_the_model_what_day_it_is():
+    """补日期走的是 amend 路径，用的是 classify.md。这条路同样没有日期，
+    所以「问用户补日期」这个出路本身也是死的——两条路必须一起修。"""
+    deps = _deps(_resp({"patches_requirements": True, "patch": {}}))
+    classify_feedback("下周末2天", Requirements(), deps, _ctx())
+
+    system = deps.client.calls[0].system
+    assert date.today().isoformat() in system
+
+
+def test_unparsable_field_value_is_logged(caplog):
+    """模型把「下周末」完整保留在 relative_expression 里，但 _PARSERS
+    只认 {"start","end"}，取不到就静默变成空 Field——用户表达的信息凭空
+    消失，且没有任何一行日志记下来。这类问题在线上永远是黑盒。"""
+    raw = {"value": {"relative_expression": "下个周末", "duration_days": 2}}
+
+    with caplog.at_level(logging.DEBUG, logger="tripplan.agents.steps"):
+        out = _to_field("dates", raw)
+
+    assert out == Field()  # 行为不变：解析不了仍然当没给
+    assert "dates" in caplog.text
+    assert "relative_expression" in caplog.text
+
+
+def test_classify_prompt_lists_the_patch_fields_apply_patch_accepts():
+    """apply_patch 只认 _PARSERS 里的键，其余一律 continue 丢弃。
+
+    classify.md 却从没告诉过模型这些键叫什么，它只能猜——实测它会给出
+    {"start_date": ..., "end_date": ..., "duration_days": 2}，三个键一个
+    都不匹配，patch 被整个丢掉，需求原样不变。于是「问用户补日期」这条
+    出路即使把日期算对了也走不通：用户答一次，需求纹丝不动，再问一次。
+    """
+    deps = _deps(_resp({"patches_requirements": False}))
+    classify_feedback("下周末2天", Requirements(), deps, _ctx())
+
+    system = deps.client.calls[0].system
+    for name in ("destination", "dates", "party", "budget"):
+        assert name in system, f"patch 的合法字段 {name} 没写进 prompt"
+    # dates 的值形状也得说死，否则模型会自创 start_date / end_date
+    assert '"start"' in system and '"end"' in system
