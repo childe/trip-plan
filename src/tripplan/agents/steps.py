@@ -1,6 +1,7 @@
 """把 LLM 的结构化输出转成领域对象。每个步骤一个函数。"""
 
 import json
+import logging
 from dataclasses import dataclass, replace
 from datetime import date as Date
 from datetime import datetime, time
@@ -41,12 +42,47 @@ from tripplan.models.requirements import (
     describe_value,
 )
 
+logger = logging.getLogger(__name__)
+
 _PROMPTS = Path(__file__).parent / "prompts"
 
 
 @lru_cache(maxsize=None)
 def _prompt(name: str) -> str:
     return (_PROMPTS / f"{name}.md").read_text(encoding="utf-8")
+
+
+#: 星期几必须自己映射：strftime("%A") 受 locale 影响，英文环境下会给出
+#: "Thursday"，模型读中文 prompt 时突然冒出个英文词是没必要的噪音。
+_WEEKDAYS = "一二三四五六日"
+
+
+def _date_preamble(now) -> str:
+    """告诉模型今天是几号。这一行是 dates 字段能不能填上的前提。
+
+    `dates` 的解析器是 Date.fromisoformat()，要求绝对日期；而模型是一个
+    从 token 到 token 的纯函数，没有时钟，对"现在"的唯一感知来源就是
+    context 里的字。不给它，"下周末"在原理上就算不出来——collect.md 又
+    明令 dates 不许编造，于是它只能正确地留 null，界面转而问用户补，
+    用户再答一次相对日期……这条路没有出路。
+
+    星期几不是装饰：光有 2026-09-17 分不出"本周末"和"下周末"。
+    """
+    return (
+        f"今天是 {now.date().isoformat()}（星期{_WEEKDAYS[now.weekday()]}）。"
+        "用户说的相对日期（下周末、下个月、明天、国庆）一律按这个日期换算成"
+        "绝对日期再填写；换算不出来时仍然留 null，不要猜。\n\n"
+    )
+
+
+def _now() -> datetime:
+    """本机时区的当前时刻。
+
+    相对日期是按**用户所在地**算的，不是目的地——"下周末"指用户日历上的
+    下周末。所以这里不能用 state.trip_timezone（那是目的地时区，而且常常
+    是 None），本机时区对一个自用工具才是对的。
+    """
+    return datetime.now().astimezone()
 
 
 class Scale(Enum):
@@ -174,7 +210,19 @@ def _to_field(name: str, raw) -> Field:
     try:
         value = _PARSERS[name](raw["value"])
         origin = _parse_origin(raw.get("origin"))
-    except ParseError:
+    except ParseError as e:
+        # 行为不变（仍然当没给），但**必须留痕**。模型常常把信息完整地
+        # 保留在一个我们不认识的形状里——比如 dates 给成
+        # {"relative_expression": "下个周末", "duration_days": 2}——
+        # 静默丢弃等于用户表达的东西凭空消失，且线上永远查不出来。
+        # 走 debug 级：这不是错误，是"模型给的形状我不认识"，
+        # 用 TRIPPLAN_LOG=debug 才需要看见。
+        logger.debug(
+            "字段 %s 解析失败，按未提供处理：%s；原始 value=%r",
+            name,
+            e,
+            raw.get("value"),
+        )
         return Field()  # 解析不了就当没给，不要塞个坏值进去
     return Field(
         value=value,
@@ -189,7 +237,7 @@ def _to_field(name: str, raw) -> Field:
 
 def collect(raw_request: str, deps, ctx) -> Requirements:
     data = run_agent(
-        system_prompt=_prompt("collect"),
+        system_prompt=_date_preamble(_now()) + _prompt("collect"),
         user_prompt=raw_request,
         tools=None,
         output_schema=REQUIREMENTS_SCHEMA,
@@ -365,7 +413,7 @@ def run_llm_critic(itin, reqs: Requirements, deps, ctx) -> list[Issue]:
 
 def classify_feedback(text: str, reqs: Requirements, deps, ctx) -> FeedbackDelta:
     data = run_agent(
-        system_prompt=_prompt("classify"),
+        system_prompt=_date_preamble(_now()) + _prompt("classify"),
         user_prompt=f"{_describe_requirements(reqs)}\n\n用户反馈：{text}",
         tools=None,
         output_schema=FEEDBACK_SCHEMA,
@@ -391,14 +439,24 @@ def apply_patch(reqs: Requirements, patch) -> Requirements:
     patch.items() 就 AttributeError。这里没有什么"部分应用"的余地：
     传进来的不是对象，就当没有任何补丁，原样返回。"""
     if not isinstance(patch, dict):
+        logger.debug("patch 不是对象，整条忽略：%r", patch)
         return reqs
     updates = {}
     for name, raw_value in patch.items():
         if name not in _PARSERS:
-            continue  # 未知字段忽略，不炸
+            # 模型自创字段名是本次 bug 的直接成因（start_date / duration_days
+            # 三个键一个都不在 _PARSERS 里），必须看得见是哪个键被丢了。
+            logger.debug("patch 字段 %s 不认识，已忽略；原值=%r", name, raw_value)
+            continue
         try:
             value = _PARSERS[name](raw_value)
-        except ParseError:
+        except ParseError as e:
+            # 与 _to_field 同样的理由：行为不变（这一键当没给），但不能不留痕。
+            # 「用户补日期」走的正是这条路，静默丢弃时线上没有任何一行能解释
+            # 「用户明明答了，需求怎么纹丝不动」。
+            logger.debug(
+                "patch 字段 %s 解析失败，已忽略：%s；原值=%r", name, e, raw_value
+            )
             continue
         updates[name] = Field(value=value, origin=Origin.USER, confirmed=True)
     return replace(reqs, **updates) if updates else reqs
